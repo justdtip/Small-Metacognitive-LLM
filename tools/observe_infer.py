@@ -14,14 +14,17 @@ Emits one JSON line with:
 Usage:
   python tools/observe_infer.py --prompt "Factor 12345" --visible-cot true --jsonl logs/obs.jsonl
 """
-import argparse, json, time, uuid
+import argparse, json, time, uuid, sys
 from pathlib import Path
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, StoppingCriteria, StoppingCriteriaList
 
-from tokenizer_utils import ensure_reasoning_tokens
+from tina.tokenizer_utils import ensure_reasoning_tokens
 try:
-    from serve import _extract_answer  # reuse canonical extraction
+    from tina.serve import _extract_answer  # reuse canonical extraction
 except Exception:
     def _extract_answer(body: str, include_think: bool = False) -> str:
         def _slice(s, open_t, close_t):
@@ -34,7 +37,7 @@ except Exception:
         return ans.strip()
 
 try:
-    from metacog_heads import MetacogHeads
+    from tina.metacog_heads import MetacogHeads
 except Exception:
     MetacogHeads = None  # optional
 
@@ -260,4 +263,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

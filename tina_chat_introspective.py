@@ -123,6 +123,8 @@ def parse_args():
     p.add_argument("--visible-cot", action="store_true", help="Show <think> content in output")
     p.add_argument("--budget-cap", type=int, default=256)
     p.add_argument("--no-dynamic-budget", action="store_true")
+    # optional observation record passthrough
+    p.add_argument("--observe", action="store_true", help="Emit one JSON observation record per turn (stdout)")
     return p.parse_args()
 
 def iso_now():
@@ -369,6 +371,73 @@ def main():
             f"[{ts}] ASSISTANT: {asst_log}\n\n"
         )
         write_transcript(loggers["transcript"], transcript_line, rotate=(args.log_max_bytes, args.log_backups))
+
+        # Optional: emit observe-style JSON record (similar to tools/observe_infer.py)
+        if args.observe:
+            try:
+                # device string
+                try:
+                    dev = next(model.parameters()).device.type
+                except Exception:
+                    dev = str(getattr(model, "device", "cpu"))
+                # sections count based on assistant text only (hidden mode → zero think tokens)
+                def _count_sections(tokenizer, text: str) -> dict:
+                    try:
+                        tids = {t: tokenizer.convert_tokens_to_ids(t) for t in ["<think>","</think>","<answer>","</answer>"]}
+                        ids = tokenizer(text, return_tensors="pt", add_special_tokens=False)["input_ids"][0].tolist()
+                        def spans(open_id, close_id):
+                            S, i, n = [], 0, len(ids)
+                            while i < n:
+                                if ids[i] == open_id:
+                                    j = i + 1
+                                    while j < n and ids[j] != close_id:
+                                        j += 1
+                                    S.append((i, j))
+                                    i = j + 1
+                                else:
+                                    i += 1
+                            return S
+                        th = spans(tids["<think>"], tids["</think>"])
+                        an = spans(tids["<answer>"], tids["</answer>"])
+                        th_len = sum(max(0, e - s - 1) for s, e in th)
+                        an_len = sum(max(0, e - s - 1) for s, e in an)
+                        return {"think_tokens": th_len, "answer_tokens": an_len}
+                    except Exception:
+                        return {"think_tokens": None, "answer_tokens": None}
+
+                obs = {
+                    "request_id": rid,
+                    "ts_ms": int(time.time()*1000),
+                    "model": str(Path(args.models_root) / args.base),
+                    "device": dev,
+                    "decode": {"temperature": args.temperature, "top_p": args.top_p, "max_new_tokens": args.max_new_tokens},
+                    "timing": {
+                        "latency_s": round(time.time() - t0, 4),
+                        "tokens_per_sec": rec.get("tokens_per_sec"),
+                    },
+                    "io": {
+                        "input_tokens": input_tok,
+                        "output_tokens": out_tok,
+                        "visible_cot": bool(engine.cfg.visible_cot),
+                        "prompt_preview": text if args.log_raw else (text[:64] + ("..." if len(text) > 64 else "")),
+                    },
+                    "sections": _count_sections(tok, assistant_text),
+                    "heads": {"error": "heads_unavailable_in_cli"},
+                    "activations": {"layer_last_token_norms": None, "attn_entropies_last_token": None},
+                    "gates": {"num_gated_modules": None, "mean_gate_activity": stats.get("gate_activity_mean")},
+                    "logprobs": None,
+                    "text": {
+                        "full": assistant_text if (args.log_raw or engine.cfg.visible_cot) else None,
+                        "answer": assistant_text if not engine.cfg.visible_cot else assistant_text,
+                    },
+                }
+                print(json.dumps(obs, ensure_ascii=False))
+            except Exception as _e:
+                # Keep CLI resilient; observation is optional
+                try:
+                    sys.stderr.write(f"observe_emit_failed: {type(_e).__name__}: {_e}\n")
+                except Exception:
+                    pass
 
         print(f"[took {time.time()-t0:.2f}s]")
 
