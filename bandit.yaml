@@ -1,0 +1,12 @@
+tests:
+  # Enable all tests by default
+  - any
+skips:
+  - B101  # assert_used (allow in tests)
+  - B404  # subprocess module (not used, but keep noise low)
+  - B603  # subprocess_without_shell_equals_true (N/A here)
+exclude:
+  - model
+  - .venv
+  - venv
+

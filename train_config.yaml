@@ -1,0 +1,22 @@
+model:
+  base: model/Base
+  adapter_dir: model/Tina/checkpoint-2000
+  tap_layers: [6, 10, 14]
+loss:
+  answer_ce: 1.0
+  think_ce: 0.0
+  gate_reg: 1e-4
+eval:
+  stop_on: "</answer>"
+phases:
+  anneal_think_from: 0.0
+  anneal_think_to: 0.5
+  steps: 10000
+training:
+  phases:
+    phase_c:
+      enabled: false
+      algo: "DPO"  # or GRPO/PPO/KTO
+      budget_cap: 256
+      alpha: 0.01
+      format_bonus: 0.5

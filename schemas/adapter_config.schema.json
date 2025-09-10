@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/adapter_config.schema.json",
+  "title": "PeftAdapterConfig",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "base_model_name_or_path": {"type": "string"},
+    "peft_type": {"type": "string", "enum": ["LORA"]},
+    "task_type": {"type": "string", "enum": ["CAUSAL_LM"]},
+    "r": {"type": "integer", "minimum": 1},
+    "lora_alpha": {"type": "integer", "minimum": 1},
+    "lora_dropout": {"type": "number", "minimum": 0, "maximum": 1},
+    "inference_mode": {"type": "boolean"},
+    "target_modules": {
+      "type": "array",
+      "items": {"type": "string"},
+      "minItems": 1
+    }
+  },
+  "required": ["peft_type", "task_type", "r", "lora_alpha", "lora_dropout", "inference_mode", "target_modules"]
+}
+

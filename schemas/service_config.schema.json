@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/service_config.schema.json",
+  "title": "ServiceConfig",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "host": {"type": "string"},
+    "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+    "bearer_token": {"type": "string"},
+    "input_tokens_cap": {"type": "integer", "minimum": 1},
+    "max_new_tokens_cap": {"type": "integer", "minimum": 1},
+    "rate_limit_per_min": {"type": "integer", "minimum": 0},
+    "visible_cot_default": {"type": "boolean"}
+  },
+  "required": ["host", "port", "input_tokens_cap", "max_new_tokens_cap", "rate_limit_per_min", "visible_cot_default"]
+}
+

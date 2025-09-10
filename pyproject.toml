@@ -1,0 +1,38 @@
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+select = [
+  "E",  # pycodestyle errors
+  "F",  # pyflakes
+  "I",  # isort
+  "B",  # bugbear
+  "C4", # comprehensions
+  "UP", # pyupgrade
+  "SIM",# flake8-simplify
+  "ANN",# annotations (lightweight)
+  "RUF",# ruff-specific
+]
+ignore = [
+  "ANN101",  # missing type self
+  "ANN102",  # missing type cls
+]
+
+[tool.ruff.format]
+quote-style = "preserve"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unreachable = true
+show_error_codes = true
+pretty = true
+exclude = [
+  "^model/",
+]
+

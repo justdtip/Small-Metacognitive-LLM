@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/generation_config.schema.json",
+  "title": "GenerationConfig",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "_from_model_config": {"type": "boolean"},
+    "bos_token_id": {"type": "integer", "minimum": 0},
+    "eos_token_id": {"type": "integer", "minimum": 0},
+    "do_sample": {"type": "boolean"},
+    "temperature": {"type": "number", "minimum": 0},
+    "top_p": {"type": "number", "minimum": 0, "maximum": 1},
+    "transformers_version": {"type": "string"}
+  },
+  "required": ["bos_token_id", "eos_token_id"]
+}
+

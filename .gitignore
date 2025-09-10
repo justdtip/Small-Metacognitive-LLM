@@ -1,0 +1,43 @@
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+.venv-*/
+venv/
+.env/
+.venv-backups/
+
+# Logs and transcripts
+logs/
+*.log
+*.log.jsonl
+*.jsonl
+*.transcript.txt
+*transcript*.txt
+
+ti_introspect.log.jsonl
+ti_introspect.transcript.txt
+
+# Backups and artifacts
+backup/
+backup.tar.gz
+submission/
+*.tar.gz
+
+# Model weights (keep configs)
+model/**/*.safetensors
+model/**/*.bin
+
+# HF cache
+.hf_home/
+
+# OS files
+.DS_Store
+Thumbs.db
