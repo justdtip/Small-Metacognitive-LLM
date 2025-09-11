@@ -167,7 +167,10 @@ def aggregate(
             sub = [r for r in records if r.get(key) == v]
             if sub:
                 try:
-                    out["slices"][key][str(v)] = compute_fn(sub)
+                    metrics = compute_fn(sub)
+                    out["slices"][key][str(v)] = metrics
+                    # Also expose a flattened convenience key for simple assertions/tests
+                    out[f"slice:{key}={v}"] = metrics
                 except Exception:
                     out["slices"][key][str(v)] = {}
     return out

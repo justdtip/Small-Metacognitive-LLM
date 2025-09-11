@@ -112,6 +112,17 @@ def _coherence_checks() -> list[str]:
         allowed = {"q_proj","k_proj","v_proj","o_proj","up_proj","gate_proj","down_proj"}
         if not tmods.issubset(allowed):
             errs.append("adapter target_modules contain entries not typical for Qwen2")
+    # Service config stop-rule guardrails
+    try:
+        svc_cfg = _load_json(ROOT / "config/service_config.json")
+        stops = svc_cfg.get("stop_sequences") or []
+        t_stops = svc_cfg.get("think_stop_sequences") or []
+        if "</answer>" not in stops:
+            errs.append("service_config.stop_sequences must include '</answer>'")
+        if "</think>" not in t_stops:
+            errs.append("service_config.think_stop_sequences must include '</think>'")
+    except Exception as e:
+        errs.append(f"service_config validation error: {type(e).__name__}: {e}")
     return errs
 
 def main() -> int:

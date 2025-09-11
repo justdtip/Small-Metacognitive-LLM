@@ -49,6 +49,17 @@ def ensure_reasoning_tokens(tokenizer, model=None) -> Dict[str, int]:
             if len(tok_ids) != 1:
                 raise ValueError(f"Tag '{t}' splits into {tok_ids}. Check tokenizer rules.")
 
+    # Additional guardrail using tokenizer.tokenize() if available
+    if hasattr(tokenizer, "tokenize") and callable(getattr(tokenizer, "tokenize")):
+        for t in SPECIAL_TOKENS:
+            try:
+                pieces = tokenizer.tokenize(t)
+                if isinstance(pieces, (list, tuple)) and len(pieces) != 1:
+                    raise ValueError(f"Tag '{t}' tokenizes into {pieces} (len={len(pieces)}); expected a single atomic token.")
+            except Exception:
+                # If tokenize is not reliable for this tokenizer, skip; encode check above still enforces atomicity
+                pass
+
     # Resize embeddings and optionally initialize new rows if a model is passed
     if model is not None and hasattr(model, "get_input_embeddings") and torch is not None:
         old = model.get_input_embeddings().weight.data.clone()

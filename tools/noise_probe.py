@@ -93,15 +93,21 @@ def main():
 
     outp = Path(args.out)
     outp.parent.mkdir(parents=True, exist_ok=True)
+    # Determine if records carry explicit per-record temperatures
+    has_temp = any("temperature" in r for r in records)
+    rows = []
+    for T in temps:
+        sub = [r for r in records if (not has_temp) or (abs(float(r.get("temperature", 0.0)) - float(T)) < 1e-9)]
+        if not sub:
+            continue
+        mean_think, acc = compute_metrics(sub)
+        rows.append({"temperature": T, "mean_think_tokens": mean_think, "accuracy": acc})
     with outp.open("w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["temperature", "mean_think_tokens", "accuracy"])
         w.writeheader()
-        for T in temps:
-            # Note: in this offline probe we reuse the same records; live decoding would vary with T
-            mean_think, acc = compute_metrics(records)
-            w.writerow({"temperature": T, "mean_think_tokens": mean_think, "accuracy": acc})
+        for r in rows:
+            w.writerow(r)
 
 
 if __name__ == "__main__":
     main()
-
