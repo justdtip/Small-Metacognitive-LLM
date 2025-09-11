@@ -11,8 +11,18 @@
     "input_tokens_cap": {"type": "integer", "minimum": 1},
     "max_new_tokens_cap": {"type": "integer", "minimum": 1},
     "rate_limit_per_min": {"type": "integer", "minimum": 0},
-    "visible_cot_default": {"type": "boolean"}
+    "visible_cot_default": {"type": "boolean"},
+    "confidence_calibration_path": {"type": "string"},
+    "stop_sequences": {
+      "type": "array",
+      "items": {"type": "string"},
+      "minItems": 1
+    },
+    "think_stop_sequences": {
+      "type": "array",
+      "items": {"type": "string"},
+      "minItems": 1
+    }
   },
   "required": ["host", "port", "input_tokens_cap", "max_new_tokens_cap", "rate_limit_per_min", "visible_cot_default"]
 }
-

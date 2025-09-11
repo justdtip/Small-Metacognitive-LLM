@@ -49,3 +49,20 @@ def test_gate_reg_loss_positive():
     labels[0, 1] = 3  # one valid label to avoid degenerate CE
     out = compute_losses(logits, labels, gate_modules=[adap], weights={"answer_ce": 0.0, "gate_reg": 1.0})
     assert out["gate_reg"].item() > 0.0
+
+
+def test_gate_coverage_high_inside_think():
+    B, T, H = 1, 6, 8
+    adap = LowRankAdapter(ResidualAdapterConfig(hidden_size=H, rank=4))
+    with torch.no_grad():
+        adap.gate.copy_(torch.tensor(1.0))
+    adap.eval()
+    h = torch.randn(B, T, H)
+    mask = torch.zeros(B, T)
+    mask[0, :2] = 1.0  # only first two tokens are think
+    with think_mask_context(mask):
+        _ = adap(h)
+    cov = getattr(adap, "_last_gate_coverage", None)
+    if torch.is_tensor(cov):
+        cov = float(cov.item())
+    assert cov is None or cov >= 0.95

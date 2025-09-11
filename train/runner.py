@@ -14,6 +14,7 @@ from train.reward import reward_fn, dry_run_mocked
 import time, uuid, json
 from train.hooks import think_mask_context
 from side_adapters import LowRankAdapter, ResidualAdapterConfig
+from train.schedules import build_loss_schedules, quiet_star_schedule, quiet_star_context
 
 
 @dataclass
@@ -174,7 +175,89 @@ def adapter_gate_step_smoke() -> Dict[str, Any]:
         gate_modules=[adap],
         weights={"answer_ce": 1.0, "gate_reg": 1e-4},
     )
-    return {"gate_reg": float(out["gate_reg"].item())}
+    coverage = getattr(adap, "_last_gate_coverage", None)
+    cov_val = float(coverage.item()) if torch.is_tensor(coverage) else None
+    return {"gate_reg": float(out["gate_reg"].item()), "coverage": cov_val}
+
+
+def _train_step(model: nn.Module, batch: Dict[str, Any], *, step: int = 0, total_steps: int = 1000,
+                final_aux_weights: Dict[str, float] | None = None) -> Dict[str, Any]:
+    """
+    Minimal training step that wires metacog auxiliaries into compute_losses.
+    Uses a simple annealing schedule for {plan_ce, budget_reg, conf_cal} weights.
+    """
+    sched = build_loss_schedules(total_steps, warmup_steps=max(0, int(0.1 * total_steps)), final_weights=final_aux_weights)
+    W = sched(step)
+    q_sched = quiet_star_schedule(total_steps, start=0.1, end=0.0, end_ratio=0.5)
+
+    input_ids = batch["input_ids"]
+    # Teacher forcing labels masked to answer tokens
+    labels = input_ids.clone()
+    labels[:, :-1] = input_ids[:, 1:]
+    labels[:, -1] = -100
+    labels = torch.where(batch["loss_mask"].bool(), labels, torch.full_like(labels, -100))
+
+    # Forward under think mask context to ensure adapters (if any) only affect think tokens
+    with think_mask_context(batch["think_mask"].float() if hasattr(batch["think_mask"], 'float') else batch["think_mask"]):
+        logits = model(input_ids)
+
+    B = input_ids.shape[0]
+    # Placeholder head outputs (a real trainer would compute these from metacog heads)
+    plan_logits = torch.randn(B, 4, device=logits.device)
+    plan_targets = batch.get("plan_targets") if isinstance(batch.get("plan_targets"), torch.Tensor) else None
+    budget_pred = torch.randn(B, 1, device=logits.device) * 128.0
+    budget_target = batch.get("target_budget") if isinstance(batch.get("target_budget"), torch.Tensor) else None
+    # Confidence labels from correctness if available; otherwise zeros
+    conf_logits = torch.randn(B, 1, device=logits.device)
+    conf_labels = batch.get("correctness") if isinstance(batch.get("correctness"), torch.Tensor) else torch.zeros(B, 1, device=logits.device, dtype=torch.long)
+
+    weights = {"answer_ce": 1.0, "gate_reg": 0.0, "aux_mix": float(q_sched(step)),
+               "plan_ce": float(W.get("plan_ce", 0.0)),
+               "budget_reg": float(W.get("budget_reg", 0.0)),
+               "conf_cal": float(W.get("conf_cal", 0.0))}
+    # Enable Quiet-Star auxiliary on think tokens if weight>0
+    if weights["aux_mix"] > 0.0:
+        with quiet_star_context(batch["think_mask"].float() if hasattr(batch["think_mask"], 'float') else batch["think_mask"],
+                                tau=2.0, sample_ratio=0.5):
+            out = compute_losses(
+                logits, labels,
+                gate_modules=None,
+                weights=weights,
+                plan_logits=plan_logits if plan_targets is not None else None,
+                plan_targets=plan_targets,
+                budget_pred=budget_pred if budget_target is not None else None,
+                budget_target=budget_target,
+                conf_logits=conf_logits,
+                conf_labels=conf_labels,
+            )
+    else:
+        out = compute_losses(
+            logits, labels,
+            gate_modules=None,
+            weights=weights,
+            plan_logits=plan_logits if plan_targets is not None else None,
+            plan_targets=plan_targets,
+            budget_pred=budget_pred if budget_target is not None else None,
+            budget_target=budget_target,
+            conf_logits=conf_logits,
+            conf_labels=conf_labels,
+        )
+
+    return {"losses": {k: (float(v.item()) if hasattr(v, 'item') else float(v)) for k, v in out.items()},
+            "weights": weights}
+
+
+def _log_losses(log: Dict[str, Any], *, step: int) -> None:
+    """Lightweight logger for auxiliary losses and weights."""
+    try:
+        rec = {
+            "step": int(step),
+            **{f"loss_{k}": v for k, v in log.get("losses", {}).items()},
+            **{f"w_{k}": v for k, v in log.get("weights", {}).items()},
+        }
+        print(json.dumps(rec))
+    except Exception:
+        pass
 
 
 def main():

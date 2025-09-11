@@ -107,7 +107,7 @@ class IntrospectiveEngine:
         # Move adapter params as well (the wrapped model's params stay where they are)
         self.scaffold.to(device=model_device, dtype=model_dtype)
 
-        # Resolve visible_cot default from service config if not explicitly provided
+        # Resolve visible_cot default, stop sequences, and calibration path from service config if not explicitly provided
         try:
             if self.cfg.visible_cot is None:
                 root = Path(__file__).resolve().parents[1]
@@ -118,6 +118,14 @@ class IntrospectiveEngine:
                         svc_cfg = json.load(f)
                         if isinstance(svc_cfg.get("visible_cot_default"), bool):
                             vis_default = bool(svc_cfg["visible_cot_default"])
+                        # Stop sequences (answer and think)
+                        self._stop_answer_tags = tuple(svc_cfg.get("stop_sequences") or ["</answer>"])
+                        self._stop_think_tags = tuple(svc_cfg.get("think_stop_sequences") or ["</think>"])
+                        # Calibration path if not provided explicitly
+                        if not getattr(self.cfg, "calibration_path", None):
+                            cpath = svc_cfg.get("confidence_calibration_path")
+                            if isinstance(cpath, str) and cpath:
+                                self.cfg.calibration_path = cpath
                 self.cfg.visible_cot = vis_default
                 self.last_stats["visible_cot_default"] = vis_default
             else:
@@ -129,9 +137,12 @@ class IntrospectiveEngine:
                         svc_cfg = json.load(f)
                         if isinstance(svc_cfg.get("visible_cot_default"), bool):
                             self.last_stats["visible_cot_default"] = bool(svc_cfg["visible_cot_default"])
+                        self._stop_answer_tags = tuple(svc_cfg.get("stop_sequences") or ["</answer>"])
+                        self._stop_think_tags = tuple(svc_cfg.get("think_stop_sequences") or ["</think>"])
         except Exception:
             # fallback: keep current value and omit default
-            pass
+            self._stop_answer_tags = ("</answer>",)
+            self._stop_think_tags = ("</think>",)
 
         # Tap registration: cache last-token states from chosen layers
         dec_layers = self.scaffold._get_decoder_layers(self.model)
@@ -152,18 +163,36 @@ class IntrospectiveEngine:
                     return out
                 layer.register_forward_hook(_hook)
 
-        # Load optional calibration blob
+        # Load optional calibration blob (explicit path or from service config)
         try:
+            cal_path: Optional[str] = None
             if cfg.calibration_path:
-                p = Path(cfg.calibration_path)
-                if p.exists():
-                    with p.open("r", encoding="utf-8") as f:
-                        blob = json.load(f)
-                    ct = blob.get("conf_temp")
-                    if isinstance(ct, (int, float)) and ct > 0:
-                        self._conf_temp = float(ct)
+                cal_path = cfg.calibration_path
+            else:
+                root = Path(__file__).resolve().parents[1]
+                svc = root / "config" / "service_config.json"
+                if svc.exists():
+                    with svc.open("r", encoding="utf-8") as f:
+                        svc_cfg = json.load(f)
+                    cpath = svc_cfg.get("confidence_calibration_path")
+                    if isinstance(cpath, str) and cpath:
+                        cal_path = cpath
+            if cal_path:
+                self._load_conf_temp_from_path(cal_path)
         except Exception:
             self._conf_temp = None
+
+        # Parity digest for telemetry
+        try:
+            self.last_stats["parity_digest"] = {
+                "tags": self.reason_ids,
+                "stop_answer": list(getattr(self, "_stop_answer_tags", ("</answer>",))),
+                "stop_think": list(getattr(self, "_stop_think_tags", ("</think>",))),
+                "visible_cot": bool(self.cfg.visible_cot),
+                "conf_temp": self._conf_temp,
+            }
+        except Exception:
+            pass
 
     def _estimate_budget(self, input_ids) -> int:
         # Dry forward to populate taps, then ask metacog for budget
@@ -171,13 +200,11 @@ class IntrospectiveEngine:
             _ = self.model(input_ids=input_ids, attention_mask=torch.ones_like(input_ids),
                            use_cache=False, output_hidden_states=True, return_dict=True)
         out = self.metacog(B_max=self.cfg.budget_cap)
+        out = self._postprocess_heads(out)
         # record metacog head outputs for observability
         try:
             plan_idx = int(torch.argmax(out["plan_logits"], dim=-1)[0].item())
             conf_val = float(out["confidence"][0].item())
-            # Apply temperature calibration on confidence if available
-            if self._conf_temp and self._conf_temp > 0:
-                conf_val = float(self.apply_conf_temperature(conf_val, self._conf_temp))
             raw_budget = float(out["budget"][0].item())
         except Exception:
             plan_idx, conf_val, raw_budget = None, None, None
@@ -190,6 +217,7 @@ class IntrospectiveEngine:
         self.last_stats.update({
             "plan": plan_idx,
             "confidence": conf_val,
+            "conf_prob": conf_val,
             "conf_temp": self._conf_temp,
             "think_budget": b,
         })
@@ -218,6 +246,34 @@ class IntrospectiveEngine:
                 return prob
         except Exception:
             return prob
+
+    def _load_conf_temp_from_path(self, path: str) -> None:
+        try:
+            p = Path(path)
+            if p.exists():
+                with p.open("r", encoding="utf-8") as f:
+                    blob = json.load(f)
+                ct = blob.get("conf_temp")
+                if isinstance(ct, (int, float)) and ct > 0:
+                    self._conf_temp = float(ct)
+        except Exception:
+            self._conf_temp = None
+
+    def _postprocess_heads(self, out: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply any serve-time calibration/transforms to metacog head outputs."""
+        try:
+            if (
+                out is not None
+                and isinstance(out, dict)
+                and "confidence" in out
+                and self._conf_temp is not None
+                and self._conf_temp > 0
+            ):
+                c = out["confidence"]
+                out["confidence"] = self.apply_conf_temperature(c, self._conf_temp)
+        except Exception:
+            pass
+        return out
 
     @staticmethod
     def assemble_cot_output(think_text: str, answer_text: str, visible_cot: bool) -> str:
@@ -253,7 +309,7 @@ class IntrospectiveEngine:
             think_budget = min(think_budget, self.cfg.budget_cap)
 
             # Step 1: THINK — stop at </think> OR budget
-            stop_think = StopOnTags(self.tok, ("</think>",), max_new=None)
+            stop_think = StopOnTags(self.tok, tuple(getattr(self, "_stop_think_tags", ("</think>",))), max_new=None)
             soft_cap = SlackStop(base_len=input_ids.shape[1], budget=think_budget, slack_ratio=0.2)
             text1 = ""
             out1 = None
@@ -358,7 +414,7 @@ class IntrospectiveEngine:
             full_attn = torch.ones_like(full_prompt_ids)
 
             # Step 2: ANSWER — stop at </answer> or max_new_tokens
-            stop_answer = StopOnTags(self.tok, ("</answer>",), max_new=max_new_tokens)
+            stop_answer = StopOnTags(self.tok, tuple(getattr(self, "_stop_answer_tags", ("</answer>",))), max_new=max_new_tokens)
             text2 = ""
             if stream:
                 streamer2 = TextIteratorStreamer(self.tok, skip_prompt=True, skip_special_tokens=True)

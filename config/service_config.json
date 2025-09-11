@@ -5,6 +5,8 @@
   "input_tokens_cap": 8192,
   "max_new_tokens_cap": 1024,
   "rate_limit_per_min": 60,
-  "visible_cot_default": false
+  "visible_cot_default": false,
+  "confidence_calibration_path": "",
+  "stop_sequences": ["</answer>"],
+  "think_stop_sequences": ["</think>"]
 }
-

@@ -75,6 +75,31 @@ def gate_sparsity_regularizer(modules: Iterable[torch.nn.Module], weight: float 
     return torch.tensor(avg * weight)
 
 
+def quiet_star_loss(
+    logits: torch.Tensor,
+    *,
+    mask: torch.Tensor,
+    tau: float = 2.0,
+    sample_ratio: float = 0.5,
+) -> torch.Tensor:
+    """
+    Quiet-Star style auxiliary consistency loss over think positions.
+    Uses temperature-smoothed teacher (no grad) vs student log-softmax KL on logits at positions selected by 'mask'.
+    Returns a scalar loss averaged over selected tokens.
+    """
+    B, T, V = logits.shape
+    m = mask.to(logits.dtype)
+    if sample_ratio < 1.0:
+        samp = (torch.rand_like(m) < float(sample_ratio)).to(logits.dtype)
+        m = m * samp
+    with torch.no_grad():
+        p_teacher = torch.softmax(logits / max(float(tau), 1e-6), dim=-1)
+    p_student = torch.log_softmax(logits, dim=-1)
+    kl = (p_teacher * (torch.log(p_teacher + 1e-8) - p_student)).sum(dim=-1)  # [B,T]
+    denom = m.sum().clamp_min(1.0)
+    return (kl * m).sum() / denom
+
+
 def compute_losses(
     logits: torch.Tensor,
     labels: torch.Tensor,
@@ -129,21 +154,7 @@ def compute_losses(
             tau = float(cfg.get("tau", 2.0))
             sample_ratio = float(cfg.get("sample_ratio", 0.5))
             if isinstance(mask, torch.Tensor) and mask.numel() == logits.shape[0] * logits.shape[1]:
-                B, T, V = logits.shape
-                # sample subset of think tokens
-                m = mask.to(logits.dtype)
-                if sample_ratio < 1.0:
-                    samp = (torch.rand_like(m) < sample_ratio).to(logits.dtype)
-                    m = m * samp
-                # teacher and student distributions
-                with torch.no_grad():
-                    p_teacher = torch.softmax(logits / max(tau, 1e-6), dim=-1)
-                p_student = torch.log_softmax(logits, dim=-1)
-                # per-position KL: sum p * (log p - log q)
-                kl = (p_teacher * (torch.log(p_teacher + 1e-8) - p_student)).sum(dim=-1)  # [B,T]
-                # Mask to sampled tokens
-                denom = m.sum().clamp_min(1.0)
-                aux_loss = (kl * m).sum() / denom
+                aux_loss = quiet_star_loss(logits, mask=mask, tau=tau, sample_ratio=sample_ratio)
                 out["aux_loss"] = aux_loss
                 loss_total = loss_total + aux_w * aux_loss
             else:

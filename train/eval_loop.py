@@ -3,7 +3,9 @@ from typing import List, Dict, Any, Iterable, Callable, Optional
 from pathlib import Path
 import json
 import torch
-from tina.serve import _extract_answer, StopOnTags
+from tina.serve import _extract_answer, StopOnTags, SlackStop
+from pathlib import Path
+import json as _json
 from train.metrics import temperature_fit, ece_binary
 
 
@@ -60,7 +62,7 @@ def compute_eval_metrics(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     n = len(records) or 1
     corrects: List[int] = []
     leakage = 0
-    think_counts: List[int] = []
+    think_counts: List[float] = []
     plan_hits = 0
     plan_total = 0
     b_err_abs = []
@@ -83,7 +85,14 @@ def compute_eval_metrics(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         if "<think>" in ans or "</think>" in ans or "<answer>" in ans or "</answer>" in ans:
             leakage += 1
 
-        think_counts.append(_word_count(_extract_think_span(body)))
+        # Prefer explicit token count if provided; else proxy via words in think span
+        if r.get("think_tokens_used") is not None:
+            try:
+                think_counts.append(float(r.get("think_tokens_used")))
+            except Exception:
+                think_counts.append(float(_word_count(_extract_think_span(body))))
+        else:
+            think_counts.append(float(_word_count(_extract_think_span(body))))
 
         if r.get("plan_true") is not None and r.get("plan_pred") is not None:
             plan_total += 1
@@ -153,3 +162,134 @@ def quality_vs_budget_curve(
             rows = ["budget,accuracy\n"] + [f"{c['budget']},{c['accuracy']}\n" for c in curve]
             p.write_text("".join(rows), encoding="utf-8")
     return out
+
+
+def load_service_config(root: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Load service_config.json to centralize parity behavior (visibility, stop sequences, calibration path).
+    Returns a dict with keys: visible_cot_default, stop_sequences, think_stop_sequences, confidence_calibration_path.
+    """
+    try:
+        base = Path(root) if root else Path(__file__).resolve().parents[1]
+        p = base / "config" / "service_config.json"
+        if not p.exists():
+            return {
+                "visible_cot_default": False,
+                "stop_sequences": ["</answer>"],
+                "think_stop_sequences": ["</think>"],
+                "confidence_calibration_path": "",
+            }
+        d = _json.loads(p.read_text(encoding="utf-8"))
+        return {
+            "visible_cot_default": bool(d.get("visible_cot_default", False)),
+            "stop_sequences": list(d.get("stop_sequences") or ["</answer>"]),
+            "think_stop_sequences": list(d.get("think_stop_sequences") or ["</think>"]),
+            "confidence_calibration_path": str(d.get("confidence_calibration_path") or ""),
+        }
+    except Exception:
+        return {
+            "visible_cot_default": False,
+            "stop_sequences": ["</answer>"],
+            "think_stop_sequences": ["</think>"],
+            "confidence_calibration_path": "",
+        }
+
+
+
+def decode_with_budget(
+    tokenizer,
+    model,
+    input_ids,
+    *,
+    think_budget: int,
+    slack_ratio: float = 0.2,
+    max_new_tokens: int = 512,
+    temperature: float = 0.7,
+    top_p: float = 0.95,
+    repetition_penalty: float = 1.1,
+    ignore_eos: bool = False,
+    visible_cot: bool = False,
+) -> Dict[str, Any]:
+    """
+    Generate using a soft-cap budget for the <think> segment and StopOnTags for </think> and </answer>.
+    Mirrors tina/serve.py stopping criteria to keep train/eval/serve parity.
+    Returns {'text': str, 'think_tokens_used': int} where 'text' respects visible_cot.
+    """
+    import torch
+    from transformers import StoppingCriteriaList
+
+    device = next(model.parameters()).device if hasattr(model, "parameters") else getattr(model, "device", "cpu")
+    input_ids = input_ids.to(device)
+    attention_mask = torch.ones_like(input_ids)
+    eos_id = None if ignore_eos else getattr(tokenizer, "eos_token_id", None)
+
+    # THINK with soft cap + closing tag
+    stop_think = StopOnTags(tokenizer, ("</think>",), max_new=None)
+    soft_cap = SlackStop(base_len=input_ids.shape[1], budget=int(think_budget), slack_ratio=float(slack_ratio))
+
+    with torch.no_grad():
+        out1 = model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=temperature > 0,
+            temperature=temperature,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            eos_token_id=eos_id,
+            pad_token_id=tokenizer.pad_token_id,
+            stopping_criteria=StoppingCriteriaList([stop_think, soft_cap]),
+            use_cache=True,
+            return_dict_in_generate=True,
+            output_hidden_states=False,
+        )
+    seqs1 = getattr(out1, "sequences", out1)
+    gen1 = seqs1[0, input_ids.shape[1]:]
+    text1 = tokenizer.decode(gen1, skip_special_tokens=True)
+
+    # Count think tokens used (before </think> if present)
+    try:
+        close_ids = tokenizer.encode("</think>", add_special_tokens=False)
+        g = gen1.tolist()
+        used = len(g)
+        k = len(close_ids)
+        if k > 0:
+            for i in range(max(0, len(g) - k), -1, -1):
+                if g[i:i + k] == close_ids:
+                    used = i
+                    break
+    except Exception:
+        used = int(gen1.shape[0])
+
+    if "</think>" not in text1:
+        text1 = text1 + "</think>\n"
+
+    # ANSWER until </answer>
+    ans_tok = tokenizer("<answer>", add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+    full_prompt_ids = torch.cat([seqs1, ans_tok], dim=1)
+    full_attn = torch.ones_like(full_prompt_ids)
+    stop_answer = StopOnTags(tokenizer, ("</answer>",), max_new=max_new_tokens)
+    with torch.no_grad():
+        out2 = model.generate(
+            input_ids=full_prompt_ids,
+            attention_mask=full_attn,
+            max_new_tokens=max_new_tokens,
+            do_sample=temperature > 0,
+            temperature=temperature,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            eos_token_id=eos_id,
+            pad_token_id=tokenizer.pad_token_id,
+            stopping_criteria=StoppingCriteriaList([stop_answer]),
+            use_cache=True,
+            return_dict_in_generate=True,
+            output_hidden_states=False,
+        )
+    seqs2 = getattr(out2, "sequences", out2)
+    gen2 = seqs2[0, full_prompt_ids.shape[1]:]
+    text2 = tokenizer.decode(gen2, skip_special_tokens=True)
+
+    body = (text1 or "") + (text2 or "")
+    if visible_cot:
+        return {"text": body.strip(), "think_tokens_used": int(used)}
+    return {"text": _extract_answer(body, include_think=False), "think_tokens_used": int(used)}

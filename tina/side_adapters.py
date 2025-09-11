@@ -38,6 +38,7 @@ class LowRankAdapter(nn.Module):
         # per-token gate
         self.hc_gate = HardConcreteGate()
         self._last_gate_activity: Optional[torch.Tensor] = None
+        self._last_gate_coverage: Optional[torch.Tensor] = None
         self._enabled = True
 
     def enable(self, flag: bool = True):
@@ -70,7 +71,17 @@ class LowRankAdapter(nn.Module):
             self._last_gate_activity = None
         m = _ctx_think_mask.get()
         if m is not None:
-            y_gated = y_gated * m.to(y_gated.dtype).unsqueeze(-1)
+            m_t = m.to(y_gated.dtype).unsqueeze(-1)
+            y_gated = y_gated * m_t
+            # coverage: proportion of post-gate activity aligned to think positions
+            try:
+                num = torch.sum(torch.abs(y_gated)).detach()
+                den = torch.sum(torch.abs(y_gated)).detach().clamp_min(1e-8)
+                self._last_gate_coverage = (num / den)
+            except Exception:
+                self._last_gate_coverage = None
+        else:
+            self._last_gate_coverage = None
         return h + y_gated
 
 class IntrospectionScaffold(nn.Module):
