@@ -21,6 +21,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, StoppingCriteria, StoppingCriteriaList
+import json as _json
 
 from tina.tokenizer_utils import ensure_reasoning_tokens
 try:
@@ -120,6 +121,24 @@ def count_sections(tokenizer, text: str) -> dict:
     return {"think_tokens": th_len, "answer_tokens": an_len}
 
 
+def _resolve_base_from_adapter(adapter_dir: Path) -> Path | None:
+    cfg_path = adapter_dir / "adapter_config.json"
+    if not cfg_path.exists():
+        return None
+    try:
+        cfg = _json.loads(cfg_path.read_text(encoding="utf-8"))
+        base = cfg.get("base_model_name_or_path")
+        if not base:
+            return None
+        # If base is a relative name (e.g., "Base"), resolve under the model root
+        # adapter_dir like model/Tina/checkpoint-2000 → model/<base>
+        root = adapter_dir.parents[1] if len(adapter_dir.parents) >= 2 else adapter_dir.parent
+        candidate = (root / base)
+        return candidate if candidate.exists() else None
+    except Exception:
+        return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B")
@@ -138,22 +157,65 @@ def main():
               "mps"  if (args.device=="auto" and getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available()) else
               args.device if args.device!="auto" else "cpu")
 
-    tok = AutoTokenizer.from_pretrained(args.model, use_fast=True)
-    dtype = torch.bfloat16 if device != "cpu" else torch.float32
-    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype).to(device)
+    model_path = Path(args.model)
+    base_path = None
+    # Prefer local directories if present; otherwise treat as model ID and let from_pretrained handle it.
+    if (model_path / "config.json").exists():
+        base_path = model_path
+        adapter_path = None
+    elif (model_path / "adapter_config.json").exists():
+        adapter_path = model_path
+        base_path = _resolve_base_from_adapter(adapter_path)
+        if base_path is None:
+            raise SystemExit(f"Could not resolve base model for adapter at {adapter_path}")
+    else:
+        # Fallback: pass the string through; unit tests monkeypatch HF loaders to accept arbitrary IDs
+        base_path = args.model
+        adapter_path = None
 
-    # Ensure tags exist and resize embeddings if added
+    tok = AutoTokenizer.from_pretrained(str(base_path), use_fast=True, local_files_only=True)
+    if getattr(tok, "pad_token", None) is None and getattr(tok, "eos_token", None) is not None:
+        tok.pad_token = tok.eos_token
+    dtype = torch.bfloat16 if device != "cpu" else torch.float32
+    model = AutoModelForCausalLM.from_pretrained(str(base_path), torch_dtype=dtype, local_files_only=True).to(device)
+    # Resolve a usable device for tensors
+    try:
+        model_device = next(model.parameters()).device
+    except Exception:
+        model_device = torch.device("cpu")
+    # If adapter path provided, try to load it via PEFT
+    if 'adapter_path' in locals() and adapter_path is not None:
+        try:
+            from peft import PeftModel  # type: ignore
+            model = PeftModel.from_pretrained(model, str(adapter_path))
+        except Exception as e:
+            # proceed without adapter if PEFT not available
+            sys.stderr.write(f"warn: failed to load adapter from {adapter_path}: {type(e).__name__}: {e}\n")
+
+    # Ensure tags exist and resize embeddings if added (safe no-op if already present)
     ensure_reasoning_tokens(tok, model)
 
     seed = args.prompt.strip()
     seed = (seed + "\n<think>\n") if args.visible_cot else (seed + "\n<think>\n</think><answer>")
-    input_ids = tok(seed, return_tensors="pt").input_ids.to(model.device)
+    enc = tok(seed, return_tensors="pt")
+    # Support both dict-style and object-style tokenizer returns
+    if isinstance(enc, dict):
+        input_ids = enc.get("input_ids")
+        attention_mask = enc.get("attention_mask")
+    else:
+        input_ids = getattr(enc, "input_ids", None)
+        attention_mask = getattr(enc, "attention_mask", None)
+    if input_ids is None:
+        raise SystemExit("tokenizer did not return input_ids")
+    input_ids = input_ids.to(model_device)
+    attention_mask = attention_mask.to(model_device) if attention_mask is not None else None
 
     stop = StoppingCriteriaList([StopOnTags(tok, stop_strs=("</answer>",))])
 
     t0 = time.time()
     gen = model.generate(
         input_ids=input_ids,
+        attention_mask=attention_mask,
         do_sample=True,
         temperature=args.temperature,
         top_p=args.top_p,
