@@ -70,7 +70,7 @@ def compute_eval_metrics(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     conf_probs: List[float] = []
     conf_labels: List[int] = []
     gate_covs: List[float] = []
-
+    think_scores: List[float] = []
     f1s: List[float] = []
     for r in records:
         body = r.get("body") or ""
@@ -119,6 +119,24 @@ def compute_eval_metrics(records: List[Dict[str, Any]]) -> Dict[str, Any]:
             except Exception:
                 pass
 
+        # Optional: record provided think_score directly
+        if r.get("think_score") is not None:
+            try:
+                ts = float(r.get("think_score"))
+                if 0.0 <= ts <= 1.0:
+                    think_scores.append(ts)
+            except Exception:
+                pass
+        # Or compute a rubric score if a grader is provided in the record
+        if r.get("body") is not None and r.get("think_grader") is not None:
+            try:
+                from train.metrics import think_rubric_score
+                s = think_rubric_score(r.get("body"), r.get("think_grader"))
+                if s is not None:
+                    think_scores.append(s)
+            except Exception:
+                pass
+
     acc = sum(corrects) / max(1, len(corrects))
     plan_acc = (plan_hits / plan_total) if plan_total > 0 else None
     budget_mae = (sum(b_err_abs) / len(b_err_abs)) if b_err_abs else None
@@ -136,6 +154,7 @@ def compute_eval_metrics(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         "ece": float(ece) if ece is not None else None,
         "gate_coverage_mean": (sum(gate_covs) / len(gate_covs)) if gate_covs else None,
         "f1": (sum(f1s) / len(f1s)) if f1s else None,
+        "think_score_mean": (sum(think_scores) / len(think_scores)) if think_scores else None,
     }
 
 

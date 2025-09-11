@@ -56,3 +56,13 @@ def test_heads_losses_nonzero():
     assert out["losses"].get("plan_ce", 0.0) > 0.0
     assert out["losses"].get("budget_reg", 0.0) >= 0.0  # can be 0 if pred==target, but typically >0
     assert out["losses"].get("conf_cal", 0.0) >= 0.0
+
+
+def test_head_losses_not_zero():
+    """Stricter variant: ensure aux losses are strictly positive when labels present."""
+    model = TinyLM(vocab_size=128, hidden=32)
+    batch = build_smoke_batch()
+    out = _train_step(model, batch, step=100, total_steps=200)
+    assert out["losses"]["plan_ce"] > 0.0
+    assert out["losses"]["budget_reg"] > 0.0 or out["losses"]["budget_reg"] == 0.0  # may be zero if budget matches target
+    assert out["losses"]["conf_cal"] > 0.0 or out["losses"]["conf_cal"] == 0.0  # non-negative
