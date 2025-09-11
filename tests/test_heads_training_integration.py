@@ -2,6 +2,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from train.runner import _train_step, TinyLM
+import types
 from tina.tokenizer_utils import ensure_reasoning_tokens, segment_and_masks
 from train.data import pad_and_stack
 
@@ -66,3 +67,44 @@ def test_head_losses_not_zero():
     assert out["losses"]["plan_ce"] > 0.0
     assert out["losses"]["budget_reg"] > 0.0 or out["losses"]["budget_reg"] == 0.0  # may be zero if budget matches target
     assert out["losses"]["conf_cal"] > 0.0 or out["losses"]["conf_cal"] == 0.0  # non-negative
+
+
+def test_losses_change_with_taps():
+    model = TinyLM(vocab_size=128, hidden=32)
+    batch = build_smoke_batch()
+    out1 = _train_step(model, batch, step=200, total_steps=1000, taps=(6, 10, 14))
+    out2 = _train_step(model, batch, step=200, total_steps=1000, taps=(2, 4, 6))
+    def pick(d):
+        return float(d.get("plan_ce", 0.0)), float(d.get("budget_reg", 0.0)), float(d.get("conf_cal", 0.0))
+    a1, b1, c1 = pick(out1["losses"]) ; a2, b2, c2 = pick(out2["losses"]) 
+    diff = max(abs(a1-a2), abs(b1-b2), abs(c1-c2))
+    assert diff > 1e-3
+
+
+def test_zero_head_mock_drops_losses(monkeypatch):
+    from tina import metacog_heads as tmh
+    model = TinyLM(vocab_size=128, hidden=32)
+    batch = build_smoke_batch()
+
+    # Run with real heads
+    real = _train_step(model, batch, step=200, total_steps=1000)
+    real_plan = float(real["losses"].get("plan_ce", 0.0))
+    real_breg = float(real["losses"].get("budget_reg", 0.0))
+    real_ccal = float(real["losses"].get("conf_cal", 0.0))
+
+    # Monkeypatch heads to output None (disabling aux losses)
+    def _zero_forward(self, B_max: int = 256):
+        return {"plan_logits": None, "budget": None, "confidence": None}
+    monkeypatch.setattr(tmh.MetacogHeads, "forward", _zero_forward)
+
+    mocked = _train_step(model, batch, step=200, total_steps=1000)
+    m_plan = float(mocked["losses"].get("plan_ce", 0.0))
+    m_breg = float(mocked["losses"].get("budget_reg", 0.0))
+    m_ccal = float(mocked["losses"].get("conf_cal", 0.0))
+
+    # With heads mocked out, aux losses should be zero (or extremely close)
+    assert m_plan == 0.0
+    assert m_breg == 0.0
+    assert m_ccal == 0.0
+    # And real run must have had signal (at least one > 0)
+    assert (real_plan > 0.0) or (real_breg > 0.0) or (real_ccal > 0.0)

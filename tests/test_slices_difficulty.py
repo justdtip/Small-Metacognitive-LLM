@@ -16,3 +16,22 @@ def test_slices_difficulty(tmp_path):
     sec_idx = headers.index("section")
     sections = [l.split(",")[sec_idx] for l in lines[1:] if l.strip()]
     assert any(s.startswith("slice:difficulty_bin=") for s in sections)
+
+
+def test_slices_consistency_and_difference():
+    records = [
+        {"correctness": 1, "difficulty_bin": 0, "plan_src": "gold"},
+        {"correctness": 0, "difficulty_bin": 1, "plan_src": "gold"},
+        {"correctness": 1, "difficulty_bin": 1, "plan_src": "gold"},
+    ]
+    result = aggregate(records, compute_eval_metrics, slice_keys=("difficulty_bin",))
+    # Slice accuracies
+    s0 = result["slices"]["difficulty_bin"]["0"]["accuracy"]
+    s1 = result["slices"]["difficulty_bin"]["1"]["accuracy"]
+    assert s0 != s1
+    # Weighted average equals overall
+    n0 = sum(1 for r in records if r.get("difficulty_bin") == 0)
+    n1 = sum(1 for r in records if r.get("difficulty_bin") == 1)
+    overall = result["overall"]["accuracy"]
+    wa = (s0 * n0 + s1 * n1) / (n0 + n1)
+    assert abs(overall - wa) < 1e-8

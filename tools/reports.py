@@ -64,13 +64,28 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Aggregate metrics (overall + provenance slices)
+    # Aggregate metrics (overall + provenance/difficulty slices)
     agg = aggregate(recs, compute_eval_metrics)
+    # Enforce non-empty slices when slice keys are present in records
+    present_slice_keys = [
+        k for k in ("plan_src", "budget_src", "difficulty_bin") if any(k in r for r in recs)
+    ]
+    if present_slice_keys:
+        has_nonempty = any(bool(agg.get("slices", {}).get(k)) for k in present_slice_keys)
+        if not has_nonempty:
+            sys.stderr.write("error: expected non-empty slices in metrics but none were produced\n")
+            return 1
     to_csv_json(agg, out_json=str(out_dir / "metrics.json"), out_csv=str(out_dir / "metrics.csv"))
 
     # Quality-vs-budget curve
     budgets = parse_budgets(args.budgets)
     curve = quality_vs_budget_curve(recs, budgets=budgets)
+    # Enforce that the curve covers exactly the requested budgets
+    if len(curve.get("curve", [])) != len(budgets):
+        sys.stderr.write(
+            f"error: quality_vs_budget curve length {len(curve.get('curve', []))} != requested budgets {len(budgets)}\n"
+        )
+        return 1
     # Save both JSON and CSV
     (out_dir / "quality_vs_budget.json").write_text(json.dumps(curve), encoding="utf-8")
     with (out_dir / "quality_vs_budget.csv").open("w", encoding="utf-8") as f:
@@ -88,4 +103,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

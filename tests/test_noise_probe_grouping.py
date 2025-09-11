@@ -24,7 +24,9 @@ def test_noise_probe_cli_groups_by_temperature(tmp_path):
     lines = out.read_text(encoding="utf-8").splitlines()
     assert len(lines) >= 3  # header + two rows
     header = lines[0].split(",")
-    assert header == ["temperature", "mean_think_tokens", "accuracy"]
+    # New CLI includes additional columns; ensure key metrics are present
+    for col in ("temperature", "mean_think_tokens", "accuracy"):
+        assert col in header
     # Parse rows
     rows = [dict(zip(header, r.split(","))) for r in lines[1:] if r.strip()]
     temps = sorted(float(r["temperature"]) for r in rows)
@@ -36,4 +38,3 @@ def test_noise_probe_cli_groups_by_temperature(tmp_path):
     assert abs(float(row0["accuracy"]) - 0.5) < 1e-6
     assert abs(float(row2["mean_think_tokens"]) - 8.0) < 1e-6
     assert abs(float(row2["accuracy"]) - 1.0) < 1e-6
-

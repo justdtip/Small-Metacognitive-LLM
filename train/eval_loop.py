@@ -84,6 +84,12 @@ def compute_eval_metrics(records: List[Dict[str, Any]]) -> Dict[str, Any]:
                 pass
         elif "correct" in r:
             corrects.append(int(r.get("correct") or 0))
+        elif "correctness" in r:
+            # accept 'correctness' synonym used in training paths
+            try:
+                corrects.append(int(r.get("correctness") or 0))
+            except Exception:
+                corrects.append(0)
         else:
             corrects.append(0)
 
@@ -109,7 +115,7 @@ def compute_eval_metrics(records: List[Dict[str, Any]]) -> Dict[str, Any]:
             b_err_signed.append(bp - bt)
             b_err_abs.append(abs(bp - bt))
 
-        if r.get("conf_prob") is not None and (gold or ("correct" in r)):
+        if r.get("conf_prob") is not None and (gold or ("correct" in r) or ("correctness" in r)):
             conf_probs.append(float(r["conf_prob"]))
             conf_labels.append(int(corrects[-1]))
 
