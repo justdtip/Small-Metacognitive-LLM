@@ -1,6 +1,8 @@
 # tina/serve.py
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any, Sequence
+from pathlib import Path
+import json
 import threading
 import torch
 from transformers import StoppingCriteria, StoppingCriteriaList, TextIteratorStreamer
@@ -10,7 +12,7 @@ from .tokenizer_utils import ensure_reasoning_tokens
 @dataclass
 class EngineConfig:
     # reasoning behavior
-    visible_cot: bool = False
+    visible_cot: Optional[bool] = None
     max_think_tokens: int = 256
     use_dynamic_budget: bool = True
     budget_cap: int = 256
@@ -21,6 +23,8 @@ class EngineConfig:
     adapter_layers: Optional[List[int]] = None   # None → all
     # taps for metacog heads
     taps: Sequence[int] = (6, 10, 14)
+    # optional calibration blob path (JSON): {"conf_temp": float}
+    calibration_path: Optional[str] = None
 
 def _extract_answer(body: str, include_think: bool = False) -> str:
     def _slice(s: str, open_t: str, close_t: str) -> str:
@@ -48,6 +52,21 @@ class StopOnTags(StoppingCriteria):
                 return True
         return False
 
+class SlackStop(StoppingCriteria):
+    """
+    Soft cap for THINK: allow up to budget * (1 + slack_ratio) generated tokens (since base_len)
+    before stopping if the closing tag has not appeared yet.
+    """
+    def __init__(self, *, base_len: int, budget: int, slack_ratio: float = 0.2):
+        self.base_len = int(base_len)
+        self.budget = int(max(0, budget))
+        self.slack_ratio = float(max(0.0, slack_ratio))
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
+        cur_new = int(max(0, input_ids.size(1) - self.base_len))
+        limit = int(self.budget * (1.0 + self.slack_ratio))
+        return cur_new > limit
+
 class IntrospectiveEngine:
     """
     Wrap a (peft) CausalLM with additive scaffolding and serve visible/hidden CoT.
@@ -58,6 +77,7 @@ class IntrospectiveEngine:
         self.cfg = cfg
         self.last_stats: Dict[str, Any] = {}
         self._gen_lock = threading.RLock()
+        self._conf_temp: Optional[float] = None
         # Lazy imports to avoid heavy deps at module import time
         from .side_adapters import attach_residual_adapters, IntrospectionScaffold
         from .metacog_heads import MetacogHeads, MetacogConfig
@@ -87,6 +107,32 @@ class IntrospectiveEngine:
         # Move adapter params as well (the wrapped model's params stay where they are)
         self.scaffold.to(device=model_device, dtype=model_dtype)
 
+        # Resolve visible_cot default from service config if not explicitly provided
+        try:
+            if self.cfg.visible_cot is None:
+                root = Path(__file__).resolve().parents[1]
+                svc = root / "config" / "service_config.json"
+                vis_default = False
+                if svc.exists():
+                    with svc.open("r", encoding="utf-8") as f:
+                        svc_cfg = json.load(f)
+                        if isinstance(svc_cfg.get("visible_cot_default"), bool):
+                            vis_default = bool(svc_cfg["visible_cot_default"])
+                self.cfg.visible_cot = vis_default
+                self.last_stats["visible_cot_default"] = vis_default
+            else:
+                # also expose the configured default for telemetry if available
+                root = Path(__file__).resolve().parents[1]
+                svc = root / "config" / "service_config.json"
+                if svc.exists():
+                    with svc.open("r", encoding="utf-8") as f:
+                        svc_cfg = json.load(f)
+                        if isinstance(svc_cfg.get("visible_cot_default"), bool):
+                            self.last_stats["visible_cot_default"] = bool(svc_cfg["visible_cot_default"])
+        except Exception:
+            # fallback: keep current value and omit default
+            pass
+
         # Tap registration: cache last-token states from chosen layers
         dec_layers = self.scaffold._get_decoder_layers(self.model)
         for i, layer in enumerate(dec_layers):
@@ -106,6 +152,19 @@ class IntrospectiveEngine:
                     return out
                 layer.register_forward_hook(_hook)
 
+        # Load optional calibration blob
+        try:
+            if cfg.calibration_path:
+                p = Path(cfg.calibration_path)
+                if p.exists():
+                    with p.open("r", encoding="utf-8") as f:
+                        blob = json.load(f)
+                    ct = blob.get("conf_temp")
+                    if isinstance(ct, (int, float)) and ct > 0:
+                        self._conf_temp = float(ct)
+        except Exception:
+            self._conf_temp = None
+
     def _estimate_budget(self, input_ids) -> int:
         # Dry forward to populate taps, then ask metacog for budget
         with torch.no_grad():
@@ -116,6 +175,9 @@ class IntrospectiveEngine:
         try:
             plan_idx = int(torch.argmax(out["plan_logits"], dim=-1)[0].item())
             conf_val = float(out["confidence"][0].item())
+            # Apply temperature calibration on confidence if available
+            if self._conf_temp and self._conf_temp > 0:
+                conf_val = float(self.apply_conf_temperature(conf_val, self._conf_temp))
             raw_budget = float(out["budget"][0].item())
         except Exception:
             plan_idx, conf_val, raw_budget = None, None, None
@@ -128,9 +190,34 @@ class IntrospectiveEngine:
         self.last_stats.update({
             "plan": plan_idx,
             "confidence": conf_val,
+            "conf_temp": self._conf_temp,
             "think_budget": b,
         })
         return b
+
+    @staticmethod
+    def apply_conf_temperature(prob: Any, temp: float) -> Any:
+        """Apply temperature to a probability by scaling its logit: sigmoid(logit(p)/T).
+        Supports float or torch.Tensor.
+        """
+        try:
+            import math
+            if isinstance(prob, (int, float)):
+                p = max(1e-8, min(1.0 - 1e-8, float(prob)))
+                logit = math.log(p / (1.0 - p))
+                t = max(float(temp), 1e-6)
+                z = logit / t
+                # sigmoid
+                return 1.0 / (1.0 + math.exp(-z))
+            elif torch.is_tensor(prob):
+                p = prob.clamp(1e-8, 1 - 1e-8)
+                logit = torch.log(p / (1 - p))
+                t = torch.tensor(float(max(temp, 1e-6)), dtype=logit.dtype, device=logit.device)
+                return torch.sigmoid(logit / t)
+            else:
+                return prob
+        except Exception:
+            return prob
 
     @staticmethod
     def assemble_cot_output(think_text: str, answer_text: str, visible_cot: bool) -> str:
@@ -166,7 +253,8 @@ class IntrospectiveEngine:
             think_budget = min(think_budget, self.cfg.budget_cap)
 
             # Step 1: THINK — stop at </think> OR budget
-            stop_think = StopOnTags(self.tok, ("</think>",), max_new=think_budget)
+            stop_think = StopOnTags(self.tok, ("</think>",), max_new=None)
+            soft_cap = SlackStop(base_len=input_ids.shape[1], budget=think_budget, slack_ratio=0.2)
             text1 = ""
             out1 = None
             if stream and self.cfg.visible_cot:
@@ -181,7 +269,7 @@ class IntrospectiveEngine:
                     repetition_penalty=repetition_penalty,
                     eos_token_id=eos_id,
                     pad_token_id=self.tok.pad_token_id,
-                    stopping_criteria=StoppingCriteriaList([stop_think]),
+                    stopping_criteria=StoppingCriteriaList([stop_think, soft_cap]),
                     use_cache=True,
                     return_dict_in_generate=True,
                     output_hidden_states=True,
@@ -232,7 +320,7 @@ class IntrospectiveEngine:
                         repetition_penalty=repetition_penalty,
                         eos_token_id=eos_id,
                         pad_token_id=self.tok.pad_token_id,
-                        stopping_criteria=StoppingCriteriaList([stop_think]),
+                        stopping_criteria=StoppingCriteriaList([stop_think, soft_cap]),
                         use_cache=True,
                         return_dict_in_generate=True,
                         output_hidden_states=True,
@@ -243,7 +331,21 @@ class IntrospectiveEngine:
             out1 = seqs1
             gen1 = seqs1[0, input_ids.shape[1]:]
             text1 = self.tok.decode(gen1, skip_special_tokens=True)
-            
+
+            # Count think tokens actually used (tokens before closing tag if present)
+            try:
+                close_ids = self.tok.encode("</think>", add_special_tokens=False)
+                g = gen1.tolist()
+                used = len(g)
+                k = len(close_ids)
+                if k > 0:
+                    for i in range(max(0, len(g) - k), -1, -1):
+                        if g[i:i + k] == close_ids:
+                            used = i
+                            break
+            except Exception:
+                used = int(gen1.shape[0])
+
             # If we didn't get </think>, forcibly close it
             if "</think>" not in text1:
                 text1 = text1 + "</think>\n"
@@ -326,6 +428,8 @@ class IntrospectiveEngine:
         self.last_stats.update({
             "answer_tokens_max": max_new_tokens,
             "gate_activity_mean": gate_mean,
+            "think_tokens_used": locals().get("used", None),
+            "visible_cot": bool(self.cfg.visible_cot),
         })
         if self.cfg.visible_cot:
             return (text1 + text2).strip()

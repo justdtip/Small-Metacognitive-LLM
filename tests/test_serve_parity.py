@@ -1,5 +1,5 @@
 import pytest
-from tina.serve import StopOnTags
+from tina.serve import StopOnTags, SlackStop
 
 def test_hidden_cot_removed_and_stops_on_answer():
     # Extraction check
@@ -25,3 +25,31 @@ def test_hidden_cot_removed_and_stops_on_answer():
     ids2 = torch.tensor([[5, 1, 2]], dtype=torch.long)
     assert sc(ids2, None) is True
 
+
+def test_slack_stop_soft_cap_and_close_tag_precedence():
+    class DummyTok:
+        def encode(self, s, add_special_tokens=False):
+            # map </think> to [7,8]
+            return [7, 8] if s == "</think>" else [9]
+
+    tok = DummyTok()
+    torch = pytest.importorskip("torch")
+
+    base_len = 5
+    budget = 10
+    slack = 0.2  # allow up to floor(10*1.2)=12 before stopping
+    soft = SlackStop(base_len=base_len, budget=budget, slack_ratio=slack)
+    stop_tag = StopOnTags(tok, ("</think>",))
+
+    # Under soft cap: should not stop
+    ids = torch.tensor([[0] * (base_len + 12)], dtype=torch.long)
+    assert soft(ids, None) is False
+
+    # Exceed soft cap by one: should stop
+    ids_exceed = torch.tensor([[0] * (base_len + 13)], dtype=torch.long)
+    assert soft(ids_exceed, None) is True
+
+    # If closing tag appears, StopOnTags should stop regardless of slack
+    seq = [0] * (base_len + 10) + [7, 8]
+    ids_close = torch.tensor([seq], dtype=torch.long)
+    assert stop_tag(ids_close, None) is True

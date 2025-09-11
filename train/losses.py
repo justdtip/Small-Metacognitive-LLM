@@ -3,6 +3,56 @@ from typing import Iterable, Optional, Dict, Any
 from contextvars import ContextVar
 import torch
 
+# ---- Metacog auxiliary objectives -------------------------------------------------
+
+def plan_ce(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """
+    Cross-entropy over discrete plan classes.
+    - logits: (N, K) or (..., K)
+    - targets: (N,) or matching leading dims; int64 in [0..K-1]
+    Returns a scalar mean loss.
+    """
+    if logits.ndim > 2:
+        K = logits.shape[-1]
+        logits = logits.view(-1, K)
+        targets = targets.view(-1)
+    return torch.nn.functional.cross_entropy(logits, targets)
+
+
+def budget_reg(pred_budget: torch.Tensor, target_budget: torch.Tensor, *, huber_delta: float = 10.0,
+               kind: str = "huber", quantile_alpha: float = 0.5) -> torch.Tensor:
+    """
+    Regression penalty for budget prediction.
+    - Huber (default): robust to outliers; delta controls transition.
+    - Quantile: asymmetric penalty for over/under budgeting.
+    Shapes: pred and target should be broadcastable; reduced by mean.
+    """
+    pred = pred_budget.float()
+    target = target_budget.float()
+    if kind == "quantile":
+        # Pinball (quantile) loss: max(alpha*e, (alpha-1)*e)
+        e = target - pred
+        a = float(quantile_alpha)
+        return torch.maximum(a * e, (a - 1.0) * e).mean()
+    # Default Huber (SmoothL1)
+    return torch.nn.functional.smooth_l1_loss(pred, target, beta=float(huber_delta))
+
+
+def confidence_cal(logits: torch.Tensor, labels: torch.Tensor, *, loss: str = "brier") -> torch.Tensor:
+    """
+    Calibration-oriented loss for a binary confidence signal.
+    - logits: (N,1) or (N,)
+    - labels: (N,1) or (N,) in {0,1}
+    Returns a scalar mean loss using either Brier or NLL (BCE with logits).
+    """
+    x = logits.view(-1).float()
+    y = labels.view(-1).float().clamp(0.0, 1.0)
+    if loss.lower() == "nll":
+        return torch.nn.functional.binary_cross_entropy_with_logits(x, y)
+    # Brier as default on sigmoid probabilities
+    p = torch.sigmoid(x)
+    return torch.mean((p - y) ** 2)
+
 def gate_sparsity_regularizer(modules: Iterable[torch.nn.Module], weight: float = 1e-4) -> torch.Tensor:
     """
     L0-like sparsity: penalize average gate activity across provided modules.
@@ -25,16 +75,33 @@ def gate_sparsity_regularizer(modules: Iterable[torch.nn.Module], weight: float 
     return torch.tensor(avg * weight)
 
 
-def compute_losses(logits: torch.Tensor, labels: torch.Tensor, *, gate_modules=None, weights=None):
+def compute_losses(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    gate_modules=None,
+    weights=None,
+    # metacog auxiliaries (optional)
+    plan_logits: Optional[torch.Tensor] = None,
+    plan_targets: Optional[torch.Tensor] = None,
+    budget_pred: Optional[torch.Tensor] = None,
+    budget_target: Optional[torch.Tensor] = None,
+    conf_logits: Optional[torch.Tensor] = None,
+    conf_labels: Optional[torch.Tensor] = None,
+):
     """
-    Compute masked answer CE and optional regularizers.
+    Compute masked answer CE and optional regularizers/auxiliaries.
     - logits: (B,T,V)
     - labels: (B,T) with -100 where ignored
     - gate_modules: iterable of modules with _last_gate_activity (optional)
-    - weights: dict with keys like 'answer_ce', 'gate_reg'
-    Returns dict with {'answer_ce','gate_reg','total'} where missing parts default to 0.
+    - weights: dict with keys like 'answer_ce','gate_reg','aux_mix','plan_ce','budget_reg','conf_cal'
+    - plan_logits/targets: shapes (N,K) and (N,) for discrete plan classes
+    - budget_pred/target: regression tensors (broadcastable)
+    - conf_logits/labels: binary confidence logits and {0,1} labels
+    Returns dict with {'answer_ce','gate_reg','plan_ce','budget_reg','conf_cal','aux_loss','total'} (zeros if not used).
     """
-    weights = weights or {"answer_ce": 1.0, "gate_reg": 0.0, "aux_mix": 0.0}
+    weights = weights or {"answer_ce": 1.0, "gate_reg": 0.0, "aux_mix": 0.0,
+                          "plan_ce": 0.0, "budget_reg": 0.0, "conf_cal": 0.0}
     loss_total = torch.tensor(0.0, dtype=logits.dtype, device=logits.device)
     out = {}
     # Flatten for CE
@@ -85,6 +152,31 @@ def compute_losses(logits: torch.Tensor, labels: torch.Tensor, *, gate_modules=N
             out["aux_loss"] = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
     else:
         out["aux_loss"] = torch.tensor(0.0)
+
+    # --- Metacog auxiliaries ---
+    # Plan CE
+    if (plan_logits is not None) and (plan_targets is not None) and weights.get("plan_ce", 0.0) > 0:
+        pce = plan_ce(plan_logits, plan_targets)
+        out["plan_ce"] = pce
+        loss_total = loss_total + float(weights.get("plan_ce", 0.0)) * pce
+    else:
+        out["plan_ce"] = torch.tensor(0.0)
+
+    # Budget regression (Huber default)
+    if (budget_pred is not None) and (budget_target is not None) and weights.get("budget_reg", 0.0) > 0:
+        breg = budget_reg(budget_pred, budget_target)
+        out["budget_reg"] = breg
+        loss_total = loss_total + float(weights.get("budget_reg", 0.0)) * breg
+    else:
+        out["budget_reg"] = torch.tensor(0.0)
+
+    # Confidence calibration
+    if (conf_logits is not None) and (conf_labels is not None) and weights.get("conf_cal", 0.0) > 0:
+        ccal = confidence_cal(conf_logits, conf_labels, loss="brier")
+        out["conf_cal"] = ccal
+        loss_total = loss_total + float(weights.get("conf_cal", 0.0)) * ccal
+    else:
+        out["conf_cal"] = torch.tensor(0.0)
 
     out["total"] = loss_total
     return out

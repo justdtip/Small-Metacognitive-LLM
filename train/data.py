@@ -1,9 +1,71 @@
-from typing import List, Dict, Tuple, Any
+from typing import List, Dict, Tuple, Any, Optional, Callable
 
 try:
     import torch  # type: ignore
 except Exception:  # pragma: no cover
     torch = None  # type: ignore
+
+from tina.tokenizer_utils import segment_and_masks
+
+
+class ReasoningDataset:
+    """
+    Minimal in-memory dataset emitting reasoning samples with optional supervision.
+    Each item is a dict with keys:
+      - 'text': '<think>..</think> <answer>..</answer>'
+      - 'plan_class': int | None
+      - 'target_budget': int | None
+      - 'correct': 0/1 | None
+    """
+
+    def __init__(self, examples: List[Dict[str, Any]]):
+        self.examples = examples or []
+
+    def __len__(self) -> int:  # pragma: no cover - trivial
+        return len(self.examples)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        return self.examples[idx]
+
+
+def make_collate_fn(tokenizer, *, loss_on: str = "answer") -> Callable[[List[Dict[str, Any]]], Dict[str, Any]]:
+    """
+    Factory for a collate function that tokenizes 'text', builds masks via segment_and_masks,
+    pads/stacks, and attaches supervision labels as batch tensors/lists.
+    Returns a function suitable for DataLoader(collate_fn=...).
+    """
+
+    def _collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+        items: List[Tuple[List[int], List[int], List[int], List[int], List[int]]] = []
+        plan_targets: List[int] = []
+        target_budget: List[int] = []
+        correctness: List[int] = []
+
+        for ex in batch:
+            text = (ex.get("text") or "").strip()
+            ids, attn, loss_m, think_m, ans_m = segment_and_masks(text, tokenizer, loss_on=loss_on)
+            items.append((ids, attn, loss_m, think_m, ans_m))
+            # Normalize labels; use -1 when missing
+            p = ex.get("plan_class")
+            b = ex.get("target_budget")
+            c = ex.get("correct")
+            plan_targets.append(int(p) if p is not None else -1)
+            target_budget.append(int(b) if b is not None else -1)
+            correctness.append(int(c) if c is not None else -1)
+
+        batch_dict = pad_and_stack(items, pad_id=getattr(tokenizer, "pad_token_id", 0) or 0)
+
+        if torch is not None:
+            batch_dict["plan_targets"] = torch.tensor(plan_targets, dtype=torch.long)
+            batch_dict["target_budget"] = torch.tensor(target_budget, dtype=torch.long)
+            batch_dict["correctness"] = torch.tensor(correctness, dtype=torch.long)
+        else:  # pragma: no cover
+            batch_dict["plan_targets"] = plan_targets
+            batch_dict["target_budget"] = target_budget
+            batch_dict["correctness"] = correctness
+        return batch_dict
+
+    return _collate
 
 def pad_and_stack(items: List[Tuple[List[int], List[int], List[int], List[int], List[int]]], pad_id: int = 0) -> Dict[str, Any]:
     """
@@ -42,4 +104,3 @@ def pad_and_stack(items: List[Tuple[List[int], List[int], List[int], List[int], 
         "think_mask": torch.tensor(think_batch, dtype=torch.long),
         "answer_mask": torch.tensor(ans_batch, dtype=torch.long),
     }
-

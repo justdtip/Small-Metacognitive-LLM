@@ -12,6 +12,8 @@ from train.losses import compute_losses
 from tina.serve import _extract_answer, StopOnTags
 from train.reward import reward_fn, dry_run_mocked
 import time, uuid, json
+from train.hooks import think_mask_context
+from side_adapters import LowRankAdapter, ResidualAdapterConfig
 
 
 @dataclass
@@ -102,15 +104,77 @@ def sft_one_step_smoke() -> Dict[str, Any]:
     loss_mask_t = batch["loss_mask"].bool()
     labels = torch.where(loss_mask_t, labels, torch.full_like(labels, -100))
 
-    logits = model(input_ids)
-    losses = compute_losses(logits, labels, gate_modules=None, weights={"answer_ce": 1.0})
+    # Even if adapters are not wired here, set think context for parity with training path
+    with think_mask_context(batch["think_mask"].float() if hasattr(batch["think_mask"], 'float') else batch["think_mask"]):
+        logits = model(input_ids)
+    # Synthesize metacog supervision to exercise auxiliary losses
+    B = int(input_ids.shape[0])
+    plan_logits = torch.randn(B, 4)
+    plan_targets = torch.randint(low=0, high=4, size=(B,))
+    budget_pred = torch.rand(B, 1) * 128.0
+    budget_target = torch.full((B, 1), 64.0)
+    conf_logits = torch.randn(B, 1)
+    conf_labels = torch.randint(0, 2, (B, 1))
+
+    losses = compute_losses(
+        logits, labels,
+        gate_modules=None,
+        weights={"answer_ce": 1.0, "plan_ce": 0.5, "budget_reg": 0.1, "conf_cal": 0.1},
+        plan_logits=plan_logits, plan_targets=plan_targets,
+        budget_pred=budget_pred, budget_target=budget_target,
+        conf_logits=conf_logits, conf_labels=conf_labels,
+    )
     opt.zero_grad()
     losses["total"].backward()
     opt.step()
 
     # Eval extraction parity
     extracted = _extract_answer(text, include_think=False)
-    return {"loss": float(losses["total"].item()), "extracted": extracted}
+    return {
+        "loss": float(losses["total"].item()),
+        "extracted": extracted,
+        "plan_ce": float(losses.get("plan_ce", torch.tensor(0.0)).item()),
+        "budget_reg": float(losses.get("budget_reg", torch.tensor(0.0)).item()),
+        "conf_cal": float(losses.get("conf_cal", torch.tensor(0.0)).item()),
+    }
+
+
+def adapter_gate_step_smoke() -> Dict[str, Any]:
+    """Training-style forward that applies a side adapter under think_mask_context and penalizes gate activity.
+    Returns the gate regularizer value to verify it's non-zero when gate is active.
+    """
+    tok = DummyTok()
+    ensure_reasoning_tokens(tok)
+    model = TinyLM(vocab_size=max(tok.vocab.values()) + 16, hidden=32)
+    # Synthetic sample with two think tokens and two answer tokens
+    text = "<think> a b </think> <answer> c d </answer>"
+    ids, attn, loss_mask, think_mask, answer_mask = segment_and_masks(text, tok)
+    batch = pad_and_stack([(ids, attn, loss_mask, think_mask, answer_mask)], pad_id=tok.vocab.get("<pad>", 0))
+
+    input_ids = batch["input_ids"]
+    # Compose layers to expose hidden states, then adapter, then head
+    x = model.embed(input_ids)
+    y, _ = model.rnn(x)
+    adap = LowRankAdapter(ResidualAdapterConfig(hidden_size=y.shape[-1], rank=4))
+    with torch.no_grad():
+        adap.gate.copy_(torch.tensor(1.0))
+    adap.train(False)  # deterministic hard-concrete gate for testing
+    with think_mask_context(batch["think_mask"].float() if hasattr(batch["think_mask"], 'float') else batch["think_mask"]):
+        y2 = adap(y)
+    logits = model.lm_head(y2)
+
+    # labels: next token prediction masked to answers
+    labels = input_ids.clone()
+    labels[:, :-1] = input_ids[:, 1:]
+    labels[:, -1] = -100
+    labels = torch.where(batch["loss_mask"].bool(), labels, torch.full_like(labels, -100))
+
+    out = compute_losses(
+        logits, labels,
+        gate_modules=[adap],
+        weights={"answer_ce": 1.0, "gate_reg": 1e-4},
+    )
+    return {"gate_reg": float(out["gate_reg"].item())}
 
 
 def main():
