@@ -72,14 +72,16 @@ class LowRankAdapter(nn.Module):
         m = _ctx_think_mask.get()
         if m is not None:
             m_t = m.to(y_gated.dtype).unsqueeze(-1)
-            y_gated = y_gated * m_t
+            full = y_gated
+            masked = full * m_t
             # coverage: proportion of post-gate activity aligned to think positions
             try:
-                num = torch.sum(torch.abs(y_gated)).detach()
-                den = torch.sum(torch.abs(y_gated)).detach().clamp_min(1e-8)
+                num = torch.sum(torch.abs(masked)).detach()
+                den = torch.sum(torch.abs(full)).detach().clamp_min(1e-8)
                 self._last_gate_coverage = (num / den)
             except Exception:
                 self._last_gate_coverage = None
+            y_gated = masked
         else:
             self._last_gate_coverage = None
         return h + y_gated

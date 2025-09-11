@@ -6,7 +6,7 @@ import torch
 from tina.serve import _extract_answer, StopOnTags, SlackStop
 from pathlib import Path
 import json as _json
-from train.metrics import temperature_fit, ece_binary
+from train.metrics import temperature_fit, ece_binary, f1_token
 
 
 def eval_extract_answers(texts: List[str]) -> List[str]:
@@ -69,13 +69,19 @@ def compute_eval_metrics(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     b_err_signed = []
     conf_probs: List[float] = []
     conf_labels: List[int] = []
+    gate_covs: List[float] = []
 
+    f1s: List[float] = []
     for r in records:
         body = r.get("body") or ""
         gold = (r.get("gold") or "").strip()
         ans = _extract_answer(body, include_think=False)
         if gold:
             corrects.append(1 if ans.strip() == gold else 0)
+            try:
+                f1s.append(float(f1_token(ans, gold)))
+            except Exception:
+                pass
         elif "correct" in r:
             corrects.append(int(r.get("correct") or 0))
         else:
@@ -107,6 +113,12 @@ def compute_eval_metrics(records: List[Dict[str, Any]]) -> Dict[str, Any]:
             conf_probs.append(float(r["conf_prob"]))
             conf_labels.append(int(corrects[-1]))
 
+        if "gate_coverage" in r and r.get("gate_coverage") is not None:
+            try:
+                gate_covs.append(float(r.get("gate_coverage")))
+            except Exception:
+                pass
+
     acc = sum(corrects) / max(1, len(corrects))
     plan_acc = (plan_hits / plan_total) if plan_total > 0 else None
     budget_mae = (sum(b_err_abs) / len(b_err_abs)) if b_err_abs else None
@@ -122,6 +134,8 @@ def compute_eval_metrics(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         "budget_me": budget_me,
         "leakage_rate": leakage_rate,
         "ece": float(ece) if ece is not None else None,
+        "gate_coverage_mean": (sum(gate_covs) / len(gate_covs)) if gate_covs else None,
+        "f1": (sum(f1s) / len(f1s)) if f1s else None,
     }
 
 
@@ -178,6 +192,7 @@ def load_service_config(root: Optional[str] = None) -> Dict[str, Any]:
                 "stop_sequences": ["</answer>"],
                 "think_stop_sequences": ["</think>"],
                 "confidence_calibration_path": "",
+                "soft_cap_slack_ratio": 0.2,
             }
         d = _json.loads(p.read_text(encoding="utf-8"))
         return {
@@ -185,6 +200,7 @@ def load_service_config(root: Optional[str] = None) -> Dict[str, Any]:
             "stop_sequences": list(d.get("stop_sequences") or ["</answer>"]),
             "think_stop_sequences": list(d.get("think_stop_sequences") or ["</think>"]),
             "confidence_calibration_path": str(d.get("confidence_calibration_path") or ""),
+            "soft_cap_slack_ratio": float(d.get("soft_cap_slack_ratio", 0.2)),
         }
     except Exception:
         return {
@@ -192,6 +208,7 @@ def load_service_config(root: Optional[str] = None) -> Dict[str, Any]:
             "stop_sequences": ["</answer>"],
             "think_stop_sequences": ["</think>"],
             "confidence_calibration_path": "",
+            "soft_cap_slack_ratio": 0.2,
         }
 
 
@@ -224,8 +241,10 @@ def decode_with_budget(
     eos_id = None if ignore_eos else getattr(tokenizer, "eos_token_id", None)
 
     # THINK with soft cap + closing tag
+    svc = load_service_config()
     stop_think = StopOnTags(tokenizer, ("</think>",), max_new=None)
-    soft_cap = SlackStop(base_len=input_ids.shape[1], budget=int(think_budget), slack_ratio=float(slack_ratio))
+    ratio = float(svc.get("soft_cap_slack_ratio", slack_ratio))
+    soft_cap = SlackStop(base_len=input_ids.shape[1], budget=int(think_budget), slack_ratio=ratio)
 
     with torch.no_grad():
         out1 = model.generate(

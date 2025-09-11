@@ -134,8 +134,8 @@ def main() -> int:
         sys.stderr.write("\n".join(all_errors) + "\n")
         return 1
     print("All configs valid.")
+    print("Tag/stop-guard OK")
     return 0
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -49,6 +49,7 @@ def make_collate_fn(
         plan_srcs: List[str] = []
         budget_srcs: List[str] = []
         think_lens: List[int] = []
+        diff_bins: List[int] = []
 
         for ex in batch:
             text = (ex.get("text") or "").strip()
@@ -86,16 +87,22 @@ def make_collate_fn(
             c = ex.get("correct")
             correctness.append(int(c) if c is not None else -1)
 
+            # Difficulty bin (optional); default -1 if unknown
+            db = ex.get("difficulty_bin", None)
+            diff_bins.append(int(db) if db is not None else -1)
+
         batch_dict = pad_and_stack(items, pad_id=getattr(tokenizer, "pad_token_id", 0) or 0)
 
         if torch is not None:
             batch_dict["plan_targets"] = torch.tensor(plan_targets, dtype=torch.long)
             batch_dict["target_budget"] = torch.tensor(target_budget, dtype=torch.long)
             batch_dict["correctness"] = torch.tensor(correctness, dtype=torch.long)
+            batch_dict["difficulty_bin"] = torch.tensor(diff_bins, dtype=torch.long)
         else:  # pragma: no cover
             batch_dict["plan_targets"] = plan_targets
             batch_dict["target_budget"] = target_budget
             batch_dict["correctness"] = correctness
+            batch_dict["difficulty_bin"] = diff_bins
         # Attach provenance and diagnostics
         batch_dict["plan_src"] = plan_srcs
         batch_dict["budget_src"] = budget_srcs

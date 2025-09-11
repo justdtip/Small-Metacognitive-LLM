@@ -8,5 +8,6 @@
   "visible_cot_default": false,
   "confidence_calibration_path": "",
   "stop_sequences": ["</answer>"],
-  "think_stop_sequences": ["</think>"]
+  "think_stop_sequences": ["</think>"],
+  "soft_cap_slack_ratio": 0.2
 }

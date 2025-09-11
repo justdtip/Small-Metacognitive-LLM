@@ -78,6 +78,58 @@ def brier_score(probs: torch.Tensor, labels: torch.Tensor) -> float:
     return brier_binary(probs, labels)
 
 
+# --------- Token-level F1 for long-form answers ---------
+
+def _tokenize(s: str) -> List[str]:
+    return [t for t in (s or "").strip().split() if t]
+
+
+def f1_token(pred: str, gold: str) -> float:
+    p, g = _tokenize(pred), _tokenize(gold)
+    if not p and not g:
+        return 1.0
+    if not p or not g:
+        return 0.0
+    from collections import Counter
+    cp, cg = Counter(p), Counter(g)
+    overlap = sum((cp & cg).values())
+    if overlap == 0:
+        return 0.0
+    prec = overlap / max(1, sum(cp.values()))
+    rec = overlap / max(1, sum(cg.values()))
+    return 2 * prec * rec / max(1e-8, (prec + rec))
+
+
+# --------- Rubric/teacher scoring for <think> ---------
+
+def think_rubric_score(body: str, grader: Callable[[str], float] | None = None) -> float | None:
+    """
+    Apply a rubric/teacher grading function to the <think> span only.
+    - grader: callable that returns a score in [0,1]; if None, returns None
+    - body: full text containing <think> ... </think>
+    Returns float in [0,1] or None if no span/grader unavailable.
+    """
+    if grader is None:
+        return None
+    try:
+        i = body.find("<think>")
+        if i == -1:
+            return None
+        j = body.find("</think>", i + len("<think>"))
+        if j == -1:
+            return None
+        span = body[i:j + len("</think>")]
+        s = float(grader(span))
+        # clamp to [0,1]
+        if s < 0.0:
+            s = 0.0
+        if s > 1.0:
+            s = 1.0
+        return s
+    except Exception:
+        return None
+
+
 # --------- Aggregation and export utilities (dashboard support) ---------
 
 def aggregate(
@@ -94,9 +146,13 @@ def aggregate(
     Returns {'overall': metrics, 'slices': {key: {value: metrics}}}.
     """
     out: Dict[str, Any] = {"overall": compute_fn(records), "slices": {}}
-    if not slice_keys:
+    # Determine keys to slice on; include difficulty_bin if present
+    keys = list(slice_keys) if slice_keys else []
+    if any("difficulty_bin" in r for r in records) and "difficulty_bin" not in keys:
+        keys.append("difficulty_bin")
+    if not keys:
         return out
-    for key in slice_keys:
+    for key in keys:
         # Collect unique values
         vals = []
         for r in records:

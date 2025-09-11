@@ -22,7 +22,8 @@
       "type": "array",
       "items": {"type": "string"},
       "minItems": 1
-    }
+    },
+    "soft_cap_slack_ratio": {"type": "number", "minimum": 0.0, "maximum": 1.0}
   },
   "required": ["host", "port", "input_tokens_cap", "max_new_tokens_cap", "rate_limit_per_min", "visible_cot_default"]
 }

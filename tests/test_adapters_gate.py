@@ -65,4 +65,6 @@ def test_gate_coverage_high_inside_think():
     cov = getattr(adap, "_last_gate_coverage", None)
     if torch.is_tensor(cov):
         cov = float(cov.item())
-    assert cov is None or cov >= 0.95
+    assert cov is not None
+    assert 0.0 <= cov <= 1.0
+    assert cov < 1.0

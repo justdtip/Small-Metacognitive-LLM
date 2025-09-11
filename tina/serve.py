@@ -113,6 +113,7 @@ class IntrospectiveEngine:
                 root = Path(__file__).resolve().parents[1]
                 svc = root / "config" / "service_config.json"
                 vis_default = False
+                slack_ratio = 0.2
                 if svc.exists():
                     with svc.open("r", encoding="utf-8") as f:
                         svc_cfg = json.load(f)
@@ -126,8 +127,15 @@ class IntrospectiveEngine:
                             cpath = svc_cfg.get("confidence_calibration_path")
                             if isinstance(cpath, str) and cpath:
                                 self.cfg.calibration_path = cpath
+                        # Soft-cap slack ratio
+                        try:
+                            slack_ratio = float(svc_cfg.get("soft_cap_slack_ratio", 0.2))
+                        except Exception:
+                            slack_ratio = 0.2
                 self.cfg.visible_cot = vis_default
                 self.last_stats["visible_cot_default"] = vis_default
+                self._slack_ratio = float(slack_ratio)
+                self.last_stats["soft_cap_slack_ratio"] = self._slack_ratio
             else:
                 # also expose the configured default for telemetry if available
                 root = Path(__file__).resolve().parents[1]
@@ -139,10 +147,16 @@ class IntrospectiveEngine:
                             self.last_stats["visible_cot_default"] = bool(svc_cfg["visible_cot_default"])
                         self._stop_answer_tags = tuple(svc_cfg.get("stop_sequences") or ["</answer>"])
                         self._stop_think_tags = tuple(svc_cfg.get("think_stop_sequences") or ["</think>"])
+                        try:
+                            self._slack_ratio = float(svc_cfg.get("soft_cap_slack_ratio", 0.2))
+                        except Exception:
+                            self._slack_ratio = 0.2
+                        self.last_stats["soft_cap_slack_ratio"] = self._slack_ratio
         except Exception:
             # fallback: keep current value and omit default
             self._stop_answer_tags = ("</answer>",)
             self._stop_think_tags = ("</think>",)
+            self._slack_ratio = 0.2
 
         # Tap registration: cache last-token states from chosen layers
         dec_layers = self.scaffold._get_decoder_layers(self.model)
@@ -190,6 +204,7 @@ class IntrospectiveEngine:
                 "stop_think": list(getattr(self, "_stop_think_tags", ("</think>",))),
                 "visible_cot": bool(self.cfg.visible_cot),
                 "conf_temp": self._conf_temp,
+                "soft_cap_slack_ratio": float(getattr(self, "_slack_ratio", 0.2)),
             }
         except Exception:
             pass
@@ -310,7 +325,7 @@ class IntrospectiveEngine:
 
             # Step 1: THINK — stop at </think> OR budget
             stop_think = StopOnTags(self.tok, tuple(getattr(self, "_stop_think_tags", ("</think>",))), max_new=None)
-            soft_cap = SlackStop(base_len=input_ids.shape[1], budget=think_budget, slack_ratio=0.2)
+            soft_cap = SlackStop(base_len=input_ids.shape[1], budget=think_budget, slack_ratio=float(getattr(self, "_slack_ratio", 0.2)))
             text1 = ""
             out1 = None
             if stream and self.cfg.visible_cot:

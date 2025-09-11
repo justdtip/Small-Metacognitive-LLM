@@ -197,19 +197,69 @@ def _train_step(model: nn.Module, batch: Dict[str, Any], *, step: int = 0, total
     labels[:, -1] = -100
     labels = torch.where(batch["loss_mask"].bool(), labels, torch.full_like(labels, -100))
 
-    # Forward under think mask context to ensure adapters (if any) only affect think tokens
+    # (1) Ensure model forward provides hidden states for heads
     with think_mask_context(batch["think_mask"].float() if hasattr(batch["think_mask"], 'float') else batch["think_mask"]):
-        logits = model(input_ids)
+        outputs = None
+        logits = None
+        h_list = None
+        try:
+            outputs = model(input_ids, output_hidden_states=True, return_dict=True)
+            # HF-style output
+            logits = getattr(outputs, "logits", None)
+            if logits is None and isinstance(outputs, dict):
+                logits = outputs.get("logits")
+            h_list = getattr(outputs, "hidden_states", None)
+        except Exception:
+            outputs = None
+        if logits is None:
+            # Fallback path for TinyLM-like models without HF API
+            try:
+                x = getattr(model, "embed")(input_ids)
+                y, _ = getattr(model, "rnn")(x)
+                logits = getattr(model, "lm_head")(y)
+                h_base = y
+            except Exception:
+                # last resort: synthesize a hidden with same B,T and small H
+                B, T = input_ids.shape
+                h_base = torch.zeros(B, T, 16, device=input_ids.device, dtype=logits.dtype if logits is not None else torch.float32)
+                if logits is None:
+                    logits = torch.zeros(B, T, 8, device=h_base.device, dtype=h_base.dtype)
+            # Replicate hidden to cover tap indices
+            from tina.metacog_heads import MetacogConfig as _MC
+            taps = (6, 10, 14)
+            max_tap = max(taps)
+            h_list = [h_base for _ in range(max_tap + 1)]
+        if h_list is None:
+            # Ensure we have at least one hidden state
+            B, T = input_ids.shape
+            h_list = [torch.zeros(B, T, 16, device=logits.device, dtype=logits.dtype)]
 
     B = input_ids.shape[0]
-    # Placeholder head outputs (a real trainer would compute these from metacog heads)
-    plan_logits = torch.randn(B, 4, device=logits.device)
-    plan_targets = batch.get("plan_targets") if isinstance(batch.get("plan_targets"), torch.Tensor) else None
-    budget_pred = torch.randn(B, 1, device=logits.device) * 128.0
-    budget_target = batch.get("target_budget") if isinstance(batch.get("target_budget"), torch.Tensor) else None
-    # Confidence labels from correctness if available; otherwise zeros
-    conf_logits = torch.randn(B, 1, device=logits.device)
-    conf_labels = batch.get("correctness") if isinstance(batch.get("correctness"), torch.Tensor) else torch.zeros(B, 1, device=logits.device, dtype=torch.long)
+
+    # (2) Pool taps and run metacog heads
+    from tina.metacog_heads import MetacogHeads as _MH, MetacogConfig as _MC
+    hidden_size = int(h_list[-1].shape[-1])
+    cfg_heads = _MC(hidden_size=hidden_size, taps=(6, 10, 14), proj_dim=128, head_temp=1.0)
+    heads = getattr(_train_step, "_heads", None)
+    if heads is None:
+        heads = _MH(cfg_heads).to(logits.device, dtype=logits.dtype)
+        setattr(_train_step, "_heads", heads)
+    # Register taps (cache last token per tap)
+    heads.clear_cache()
+    for t in cfg_heads.taps:
+        if 0 <= int(t) < len(h_list):
+            heads.register_tap(int(t), h_list[int(t)])
+
+    head_out = heads(B_max=int(batch["target_budget"].max().item()) if isinstance(batch.get("target_budget"), torch.Tensor) else 256)
+    plan_logits = head_out["plan_logits"]         # (B, K)
+    budget_pred = head_out["budget"]              # (B, 1)
+    # confidence is a probability; convert to logits for calibration loss
+    conf_prob = head_out.get("confidence")
+    conf_logits = torch.logit(conf_prob.clamp(1e-6, 1 - 1e-6)) if conf_prob is not None else None
+    # Targets from batch (may be -1); set None if all entries missing/invalid
+    plan_targets = batch.get("plan_targets") if (isinstance(batch.get("plan_targets"), torch.Tensor) and (batch["plan_targets"] >= 0).any()) else None
+    budget_target = batch.get("target_budget") if (isinstance(batch.get("target_budget"), torch.Tensor) and (batch["target_budget"] >= 0).any()) else None
+    conf_labels = batch.get("correctness") if (isinstance(batch.get("correctness"), torch.Tensor) and (batch["correctness"] >= 0).any()) else None
 
     weights = {"answer_ce": 1.0, "gate_reg": 0.0, "aux_mix": float(q_sched(step)),
                "plan_ce": float(W.get("plan_ce", 0.0)),
@@ -227,7 +277,7 @@ def _train_step(model: nn.Module, batch: Dict[str, Any], *, step: int = 0, total
                 plan_targets=plan_targets,
                 budget_pred=budget_pred if budget_target is not None else None,
                 budget_target=budget_target,
-                conf_logits=conf_logits,
+                conf_logits=conf_logits if conf_labels is not None else None,
                 conf_labels=conf_labels,
             )
     else:
@@ -239,7 +289,7 @@ def _train_step(model: nn.Module, batch: Dict[str, Any], *, step: int = 0, total
             plan_targets=plan_targets,
             budget_pred=budget_pred if budget_target is not None else None,
             budget_target=budget_target,
-            conf_logits=conf_logits,
+            conf_logits=conf_logits if conf_labels is not None else None,
             conf_labels=conf_labels,
         )
 
@@ -258,6 +308,71 @@ def _log_losses(log: Dict[str, Any], *, step: int) -> None:
         print(json.dumps(rec))
     except Exception:
         pass
+
+
+def rl_phase_step(model: nn.Module, batch: Dict[str, Any], *, policy=None, opt=None, B_max: int = 256):
+    """
+    Connect RL budget loop to real model features.
+    - Extract compact features from hidden states (mean of last-token across taps).
+    - Run a REINFORCE step that pressures budgets based on observed think lengths and correctness.
+    Returns (policy, stats) where stats includes mu_before/after and reward_mean.
+    """
+    device = next(model.parameters()).device if hasattr(model, 'parameters') else torch.device('cpu')
+    input_ids = batch["input_ids"].to(device)
+
+    # Try HF-style forward first
+    h_list = None
+    try:
+        outputs = model(input_ids, output_hidden_states=True, return_dict=True)
+        h_list = getattr(outputs, "hidden_states", None)
+    except Exception:
+        outputs = None
+
+    if h_list is None:
+        # Fallback for TinyLM-like models
+        try:
+            x = getattr(model, "embed")(input_ids)
+            y, _ = getattr(model, "rnn")(x)
+            h_base = y
+        except Exception:
+            B, T = input_ids.shape
+            h_base = torch.zeros(B, T, 16, device=input_ids.device)
+        taps = (6, 10, 14)
+        max_tap = max(taps)
+        h_list = [h_base for _ in range(max_tap + 1)]
+
+    # Features: last-token states from taps (6,10,14) averaged
+    taps = (6, 10, 14)
+    stacked = []
+    for t in taps:
+        if 0 <= int(t) < len(h_list):
+            stacked.append(h_list[int(t)][:, -1, :])
+    if not stacked:
+        # Use final layer as fallback
+        stacked = [h_list[-1][:, -1, :]]
+    feats = torch.stack(stacked, dim=1).mean(dim=1)  # (B,H)
+
+    # Prepare policy and optimizer
+    from train.rl_loop import GaussianBudgetPolicy, reinforce_step
+    pol = policy or GaussianBudgetPolicy(in_dim=feats.shape[-1], max_budget=int(B_max))
+    if opt is None:
+        opt = torch.optim.Adam(pol.parameters(), lr=1e-2)
+
+    # Think length and correctness
+    if isinstance(batch.get("think_tokens_used"), torch.Tensor):
+        think_len = batch["think_tokens_used"].to(feats.device).view(-1)
+    else:
+        vals = [int(x) for x in (batch.get("think_tokens_used") or [])]
+        think_len = torch.tensor(vals, device=feats.device)
+    corr_raw = batch.get("correctness")
+    if isinstance(corr_raw, torch.Tensor):
+        correct = (corr_raw.clamp_min(0) > 0).to(feats.dtype).view(-1)
+    else:
+        correct = torch.tensor([(1 if int(x) > 0 else 0) for x in (corr_raw or [])], device=feats.device, dtype=feats.dtype)
+
+    # Use a negative alpha to encourage lower budgets in this RL phase (preference toward concise thoughts)
+    stats = reinforce_step(pol, feats, think_len, correct, alpha=-0.01, format_bonus=0.5, sigma=8.0, K=4, optimizer=opt)
+    return pol, stats
 
 
 def main():

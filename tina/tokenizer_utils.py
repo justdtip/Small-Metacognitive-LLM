@@ -31,6 +31,10 @@ def ensure_reasoning_tokens(tokenizer, model=None) -> Dict[str, int]:
 
     # Resolve IDs
     ids = {t: tokenizer.convert_tokens_to_ids(t) for t in SPECIAL_TOKENS}
+    # Log and assert IDs for telemetry & CI guardrails
+    if any(v is None for v in ids.values()):
+        raise ValueError(f"Special tag ID resolution failed: {ids}")
+    # TODO: emit a digest for parity logs via caller's logger if available
 
     # Round-trip atomicity check (only if tokenizer supports encoding calls)
     has_encode = hasattr(tokenizer, "encode") or callable(getattr(tokenizer, "__call__", None))
