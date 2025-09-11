@@ -78,6 +78,8 @@ class IntrospectiveEngine:
         self.last_stats: Dict[str, Any] = {}
         self._gen_lock = threading.RLock()
         self._conf_temp: Optional[float] = None
+        self._plan_thresholds: Optional[Dict[str, float]] = None
+        self._budget_clip: Optional[int] = None
         # Lazy imports to avoid heavy deps at module import time
         from .side_adapters import attach_residual_adapters, IntrospectionScaffold
         from .metacog_heads import MetacogHeads, MetacogConfig
@@ -218,24 +220,63 @@ class IntrospectiveEngine:
         out = self._postprocess_heads(out)
         # record metacog head outputs for observability
         try:
-            plan_idx = int(torch.argmax(out["plan_logits"], dim=-1)[0].item())
-            conf_val = float(out["confidence"][0].item())
-            raw_budget = float(out["budget"][0].item())
+            plan_logits = out.get("plan_logits")
+            conf_val = float(out["confidence"][0].item()) if out.get("confidence") is not None else None
+            raw_budget = float(out["budget"][0].item()) if out.get("budget") is not None else None
+            # Plan selection with optional thresholds
+            plan_idx = None
+            plan_label = None
+            plan_probs = None
+            if plan_logits is not None:
+                probs_t = torch.softmax(plan_logits[0], dim=-1)
+                plan_probs = probs_t.detach().cpu().tolist()
+                labels = getattr(self, "_plan_labels", ["short", "deliberate", "verify", "stop"])
+                if self._plan_thresholds:
+                    chosen = None
+                    best_p = -1.0
+                    for i, p in enumerate(plan_probs):
+                        name = labels[i] if i < len(labels) else str(i)
+                        thr = self._plan_thresholds.get(name)
+                        if thr is not None and p >= float(thr) and p > best_p:
+                            chosen = (i, name, p)
+                            best_p = p
+                    if chosen is not None:
+                        plan_idx, plan_label = int(chosen[0]), str(chosen[1])
+                    else:
+                        plan_idx = int(torch.argmax(probs_t).item())
+                        plan_label = labels[plan_idx] if plan_idx < len(labels) else str(plan_idx)
+                else:
+                    plan_idx = int(torch.argmax(probs_t).item())
+                    plan_label = labels[plan_idx] if plan_idx < len(labels) else str(plan_idx)
         except Exception:
-            plan_idx, conf_val, raw_budget = None, None, None
+            plan_idx, plan_label, conf_val, raw_budget, plan_probs = None, None, None, None, None
         # pick budget
         b = int(raw_budget) if self.cfg.use_dynamic_budget and raw_budget is not None else self.cfg.budget_cap
+        # Optional calibration-time post-hoc budget clip
+        if getattr(self, "_budget_clip", None):
+            try:
+                b = min(b, int(self._budget_clip))
+            except Exception:
+                pass
         b = max(self.cfg.min_think_tokens, min(b, self.cfg.budget_cap))
         # clear taps for next pass
         self.metacog.clear_cache()
         # save stats
-        self.last_stats.update({
+        stats = {
             "plan": plan_idx,
             "confidence": conf_val,
             "conf_prob": conf_val,
             "conf_temp": self._conf_temp,
             "think_budget": b,
-        })
+        }
+        if plan_label is not None:
+            stats["plan_label"] = plan_label
+        if plan_probs is not None:
+            labels = getattr(self, "_plan_labels", ["short", "deliberate", "verify", "stop"])
+            stats["plan_probs"] = {labels[i] if i < len(labels) else str(i): float(plan_probs[i]) for i in range(len(plan_probs))}
+        if getattr(self, "_budget_clip", None):
+            stats["budget_clip"] = int(self._budget_clip)
+        self.last_stats.update(stats)
         return b
 
     @staticmethod
@@ -271,6 +312,12 @@ class IntrospectiveEngine:
                 ct = blob.get("conf_temp")
                 if isinstance(ct, (int, float)) and ct > 0:
                     self._conf_temp = float(ct)
+                th = blob.get("plan_thresholds")
+                if isinstance(th, dict) and th:
+                    self._plan_thresholds = {str(k): float(v) for k, v in th.items() if v is not None}
+                bc = blob.get("budget_posthoc_clip")
+                if isinstance(bc, (int, float)) and bc:
+                    self._budget_clip = int(bc)
         except Exception:
             self._conf_temp = None
 

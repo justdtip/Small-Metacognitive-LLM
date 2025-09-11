@@ -15,6 +15,7 @@ import time, uuid, json
 from train.hooks import think_mask_context
 from side_adapters import LowRankAdapter, ResidualAdapterConfig
 from train.schedules import build_loss_schedules, quiet_star_schedule, quiet_star_context
+from train.eval_loop import decode_with_budget
 
 
 @dataclass
@@ -407,3 +408,42 @@ def main():
 
 if __name__ == "main":  # not executed by default
     main()
+
+
+def onpolicy_sft_and_rl_smoke(steps: int = 2, sample_every: int = 1, budget_cap: int = 16) -> Dict[str, Any]:
+    """
+    Minimal on-policy loop: every 'sample_every' steps, decode a live <think> segment with a small budget,
+    write think_tokens_used into the batch, and immediately run rl_phase_step to adapt the budget policy.
+    Returns {'rl_stats':[...], 'last_batch': batch_dict} for test inspection.
+    """
+    tok = DummyTok()
+    ensure_reasoning_tokens(tok)
+    model = TinyLM(vocab_size=max(tok.vocab.values()) + 32, hidden=32)
+    # Build a tiny batch via collate
+    from train.data import make_collate_fn
+    examples = [{"text": "<think> alpha beta </think> <answer> ok </answer>"}]
+    collate = make_collate_fn(tok, loss_on="answer")
+    batch = collate(examples)
+    rl_stats = []
+    pol = None
+    for t in range(int(steps)):
+        if sample_every > 0 and (t % int(sample_every) == 0):
+            try:
+                # Decode on-policy using the current model if possible; else allow monkeypatched stub in tests
+                out = decode_with_budget(tok, model, batch["input_ids"], think_budget=int(budget_cap), max_new_tokens=16,
+                                         temperature=0.2, visible_cot=False)
+                used = int(out.get("think_tokens_used") or 0)
+            except Exception:
+                used = 0
+            # Inject think length (B copies)
+            B = int(batch["input_ids"].shape[0]) if hasattr(batch["input_ids"], 'shape') else 1
+            import torch as _t
+            batch["think_tokens_used"] = _t.tensor([used for _ in range(B)], dtype=_t.long)
+            # correctness default to 1 (can be arbitrary for smoke)
+            batch["correctness"] = _t.ones((B,), dtype=_t.long)
+            # RL budget adaptation
+            pol, stats = rl_phase_step(model, batch, policy=pol, B_max=int(budget_cap))
+            rl_stats.append(stats)
+        # Supervised step
+        _ = _train_step(model, batch, step=t, total_steps=max(1, steps))
+    return {"rl_stats": rl_stats, "last_batch": batch}

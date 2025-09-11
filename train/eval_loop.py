@@ -14,7 +14,14 @@ def eval_extract_answers(texts: List[str]) -> List[str]:
     return [_extract_answer(t, include_think=False) for t in texts]
 
 
-def fit_confidence_temperature_and_save(conf_logits: torch.Tensor, labels: torch.Tensor, out_path: str) -> Dict[str, Any]:
+def fit_confidence_temperature_and_save(
+    conf_logits: torch.Tensor,
+    labels: torch.Tensor,
+    out_path: str,
+    *,
+    plan_thresholds: Dict[str, float] | None = None,
+    budget_posthoc_clip: int | None = None,
+) -> Dict[str, Any]:
     """
     Fit a scalar confidence temperature on held-out logits and write a calibration blob.
     - conf_logits: (N,) or (N,1) raw logits from the confidence head
@@ -32,6 +39,11 @@ def fit_confidence_temperature_and_save(conf_logits: torch.Tensor, labels: torch
     p1 = torch.sigmoid(x / max(T, 1e-6))
     e1 = ece_binary(p1, y)
     blob = {"conf_temp": float(T), "ece_before": float(e0), "ece_after": float(e1)}
+    if isinstance(plan_thresholds, dict) and plan_thresholds:
+        # sanitize to plain float mapping
+        blob["plan_thresholds"] = {str(k): float(v) for k, v in plan_thresholds.items() if v is not None}
+    if isinstance(budget_posthoc_clip, (int, float)) and budget_posthoc_clip:
+        blob["budget_posthoc_clip"] = int(budget_posthoc_clip)
     p = Path(out_path)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(blob), encoding="utf-8")

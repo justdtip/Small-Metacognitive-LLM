@@ -56,7 +56,8 @@ def make_collate_fn(
             ids, attn, loss_m, think_m, ans_m = segment_and_masks(text, tokenizer, loss_on=loss_on)
             items.append((ids, attn, loss_m, think_m, ans_m))
             # Think length (tokens) from mask
-            th_len = int(sum(think_m))
+            # Prefer on-policy decode count if provided on the example
+            th_len = int(ex.get("think_tokens_used")) if (ex.get("think_tokens_used") is not None) else int(sum(think_m))
             think_lens.append(th_len)
 
             # Plan class with provenance
