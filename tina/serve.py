@@ -360,6 +360,11 @@ class IntrospectiveEngine:
                      ignore_eos: bool = False, stream: bool = False) -> str:
         # serialize per-engine to avoid cross-request hook state issues
         with self._gen_lock:
+            # initialize leakage counter for this request
+            try:
+                self.last_stats["leakage"] = 0
+            except Exception:
+                pass
             # Build chat with "<think>\n" prompt (your tokenizer template already does this if add_generation_prompt=True)
             enc = self.tok.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_tensors="pt")
             input_ids = enc.to(self.model.device)
@@ -551,7 +556,19 @@ class IntrospectiveEngine:
         })
         if self.cfg.visible_cot:
             return (text1 + text2).strip()
-        return _extract_answer((text1 or "") + (text2 or ""), include_think=False)
+        out_text = _extract_answer((text1 or "") + (text2 or ""), include_think=False)
+        # Defensive leakage check: no reasoning tags should remain in hidden mode
+        try:
+            tags = ("<think>", "</think>", "<answer>", "</answer>")
+            if any(t in (out_text or "") for t in tags):
+                # record leakage and hard-strip tags as failsafe
+                self.last_stats["leakage"] = 1
+                for t in tags:
+                    out_text = out_text.replace(t, "") if out_text else out_text
+                out_text = (out_text or "").strip()
+        except Exception:
+            pass
+        return out_text
     
     # ---- Minimal FastAPI app with auth/limits/metrics ----
     @staticmethod

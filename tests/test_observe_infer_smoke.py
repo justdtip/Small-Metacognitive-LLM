@@ -45,15 +45,13 @@ class DummyModel(torch.nn.Module):
 
 
 def test_script_main_monkeypatched(monkeypatch, tmp_path):
-    # Monkeypatch module-level HF bindings
-    monkeypatch.setattr(oi, "AutoTokenizer", types.SimpleNamespace(from_pretrained=lambda *a, **k: DummyTok()))
+    # Monkeypatch model loader to dummy; use real tokenizer from local Base
     monkeypatch.setattr(oi, "AutoModelForCausalLM", types.SimpleNamespace(from_pretrained=lambda *a, **k: DummyModel()))
     # Run main via argv simulation
     import sys
     jsonl = tmp_path / "obs.jsonl"
-    argv = ["x", "--model", "dummy", "--prompt", "hello", "--jsonl", str(jsonl)]
+    argv = ["x", "--model", "model/Base", "--prompt", "hello", "--jsonl", str(jsonl)]
     monkeypatch.setattr(sys, "argv", argv)
     oi.main()
     data = json.loads(jsonl.read_text().splitlines()[0])
     assert "activations" in data and "sections" in data and "text" in data
-

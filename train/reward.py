@@ -30,6 +30,13 @@ def reward_fn(sample: Dict[str, Any], *, budget_cap: int = 256, alpha: float = 0
     reward = correctness (0..1) + format_bonus*is_well_formed - alpha*max(0, think_len - budget_cap)
     Clamped to [-1, +2]. If 'grader' provided, it should return correctness in [0,1].
     The sample dict should include at least {'body': '<think>..</think><answer>..</answer>'}.
+
+    Token counting contract:
+    - If a 'tokenizer' is provided, the number of tokens in the <think> span is computed using
+      tokenizer.encode(think_text, add_special_tokens=False). This token count is authoritative for
+      the budget penalty.
+    - If no tokenizer is given, a fallback word-count is used, which can diverge from true token budgets.
+      Supplying a tokenizer is strongly recommended for faithful budget shaping.
     """
     body = sample.get("body") or ""
     # determine think length in tokens or words

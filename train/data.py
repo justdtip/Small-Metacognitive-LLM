@@ -34,6 +34,7 @@ def make_collate_fn(
     loss_on: str = "answer",
     plan_buckets: Tuple[int, int] = (32, 128),
     budget_alpha: float = 1.0,
+    strict: bool = True,
 ) -> Callable[[List[Dict[str, Any]]], Dict[str, Any]]:
     """
     Factory for a collate function that tokenizes 'text', builds masks via segment_and_masks,
@@ -51,8 +52,30 @@ def make_collate_fn(
         think_lens: List[int] = []
         diff_bins: List[int] = []
 
-        for ex in batch:
-            text = (ex.get("text") or "").strip()
+        def _has_exact_one_pair(s: str, open_t: str, close_t: str) -> bool:
+            return s.count(open_t) == 1 and s.count(close_t) == 1 and (s.find(open_t) < s.rfind(close_t))
+
+        for idx, ex in enumerate(batch):
+            if strict and ("text" not in ex or not (ex.get("text") or "").strip()):
+                raise ValueError(f"Missing 'text' field at record {idx}")
+
+            raw_text = (ex.get("text") or "").strip()
+            # Enforce tag integrity: exactly one <think>..</think> and one <answer>..</answer>
+            if strict:
+                ok_think = _has_exact_one_pair(raw_text, "<think>", "</think>")
+                ok_ans = _has_exact_one_pair(raw_text, "<answer>", "</answer>")
+                if not (ok_think and ok_ans):
+                    raise ValueError(f"Malformed tags at record {idx}: require exactly one <think>..</think> and one <answer>..</answer>")
+                text = raw_text
+            else:
+                # Legacy fallback: wrap content if malformed
+                ok_think = _has_exact_one_pair(raw_text, "<think>", "</think>")
+                ok_ans = _has_exact_one_pair(raw_text, "<answer>", "</answer>")
+                if not (ok_think and ok_ans):
+                    text = f"<think> {raw_text} </think> <answer> </answer>"
+                else:
+                    text = raw_text
+
             ids, attn, loss_m, think_m, ans_m = segment_and_masks(text, tokenizer, loss_on=loss_on)
             items.append((ids, attn, loss_m, think_m, ans_m))
             # Think length (tokens) from mask

@@ -177,11 +177,15 @@ def compute_eval_metrics(records: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def quality_vs_budget_curve(
-    records: List[Dict[str, Any]],
+    records_or_model: Any,
     budgets: Iterable[int],
     *,
     quality_fn: Optional[Callable[[Dict[str, Any], int], float]] = None,
     out_path: Optional[str] = None,
+    # Decode-sweep mode (optional): if provided, runs live decoding per budget
+    tokenizer: Any = None,
+    prompts: Optional[Iterable[Any]] = None,
+    out_csv: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Sweep decoding control (budget caps) and compute quality vs budget curve.
@@ -190,29 +194,78 @@ def quality_vs_budget_curve(
     - out_path: optional JSON/CSV path to save curve
     Returns {'curve': [{'budget': B, 'accuracy': acc}], 'budgets': [...]}.
     """
-    curve = []
     budgets_list = list(int(b) for b in budgets)
-    for B in budgets_list:
-        vals = []
-        for r in records:
-            if quality_fn is None:
-                vals.append(float(r.get("correct", 0)))
-            else:
-                vals.append(float(quality_fn(r, B)))
-        acc = sum(vals) / max(1, len(vals))
-        curve.append({"budget": B, "accuracy": acc})
+    # Dispatch: records-mode vs decode-sweep mode
+    if isinstance(records_or_model, list) and (not records_or_model or isinstance(records_or_model[0], dict)):
+        records = records_or_model
+        curve = []
+        for B in budgets_list:
+            vals = []
+            for r in records:
+                if quality_fn is None:
+                    vals.append(float(r.get("correct", 0)))
+                else:
+                    vals.append(float(quality_fn(r, B)))
+            acc = sum(vals) / max(1, len(vals))
+            curve.append({"budget": B, "accuracy": acc})
 
-    out = {"budgets": budgets_list, "curve": curve}
-    if out_path:
-        p = Path(out_path)
+        out = {"budgets": budgets_list, "curve": curve}
+        if out_path:
+            p = Path(out_path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            if p.suffix.lower() == ".json":
+                p.write_text(json.dumps(out), encoding="utf-8")
+            else:
+                rows = ["budget,accuracy\n"] + [f"{c['budget']},{c['accuracy']}\n" for c in curve]
+                p.write_text("".join(rows), encoding="utf-8")
+        return out
+
+    # Decode-sweep mode
+    model = records_or_model
+    if tokenizer is None or prompts is None:
+        raise ValueError("Decode sweep requires 'tokenizer' and 'prompts'.")
+    rows = []
+    for B in budgets_list:
+        recs: List[Dict[str, Any]] = []
+        for pr in prompts:
+            if isinstance(pr, dict):
+                text = pr.get("prompt") or pr.get("text") or ""
+                gold = pr.get("gold")
+            else:
+                text = str(pr)
+                gold = None
+            # Build input_ids for this prompt
+            try:
+                enc = tokenizer(text, add_special_tokens=False, return_tensors="pt")
+                input_ids = getattr(enc, "input_ids", None) if not isinstance(enc, dict) else enc.get("input_ids")
+            except Exception:
+                input_ids = None
+            if input_ids is None:
+                # Fallback minimal input
+                import torch as _t
+                input_ids = _t.tensor([[1, 2, 3]], dtype=_t.long)
+            d = decode_with_budget(tokenizer, model, input_ids, think_budget=B, max_new_tokens=256, temperature=0.0, visible_cot=False)
+            rec = {"body": d.get("text") or "", "think_tokens_used": int(d.get("think_tokens_used") or 0)}
+            if gold is not None:
+                rec["gold"] = str(gold)
+            recs.append(rec)
+        m = compute_eval_metrics(recs)
+        rows.append({
+            "budget": B,
+            "n": len(recs),
+            "accuracy": float(m.get("accuracy") or 0.0),
+            "f1": float(m.get("f1")) if (m.get("f1") is not None) else None,
+            "mean_think_tokens": float(m.get("think_tokens_mean") or 0.0),
+        })
+    # Optional CSV
+    if out_csv:
+        p = Path(out_csv)
         p.parent.mkdir(parents=True, exist_ok=True)
-        if p.suffix.lower() == ".json":
-            p.write_text(json.dumps(out), encoding="utf-8")
-        else:
-            # CSV header then rows
-            rows = ["budget,accuracy\n"] + [f"{c['budget']},{c['accuracy']}\n" for c in curve]
-            p.write_text("".join(rows), encoding="utf-8")
-    return out
+        with p.open("w", encoding="utf-8", newline="") as f:
+            f.write("budget,n,accuracy,f1,mean_think_tokens\n")
+            for r in rows:
+                f.write(f"{r['budget']},{r['n']},{r['accuracy']},{'' if r['f1'] is None else r['f1']},{r['mean_think_tokens']}\n")
+    return {"budgets": budgets_list, "curve": rows}
 
 
 def load_service_config(root: Optional[str] = None) -> Dict[str, Any]:
@@ -277,9 +330,11 @@ def decode_with_budget(
     attention_mask = torch.ones_like(input_ids)
     eos_id = None if ignore_eos else getattr(tokenizer, "eos_token_id", None)
 
-    # THINK with soft cap + closing tag
+    # THINK with soft cap + closing tag from service config
     svc = load_service_config()
-    stop_think = StopOnTags(tokenizer, ("</think>",), max_new=None)
+    think_tags = tuple((svc.get("think_stop_sequences") or ["</think>"]))
+    ans_tags = tuple((svc.get("stop_sequences") or ["</answer>"]))
+    stop_think = StopOnTags(tokenizer, think_tags, max_new=None)
     ratio = float(svc.get("soft_cap_slack_ratio", slack_ratio))
     soft_cap = SlackStop(base_len=input_ids.shape[1], budget=int(think_budget), slack_ratio=ratio)
 
@@ -303,17 +358,22 @@ def decode_with_budget(
     gen1 = seqs1[0, input_ids.shape[1]:]
     text1 = tokenizer.decode(gen1, skip_special_tokens=True)
 
-    # Count think tokens used (before </think> if present)
+    # Count think tokens used (stop at first configured closing tag if present)
     try:
-        close_ids = tokenizer.encode("</think>", add_special_tokens=False)
         g = gen1.tolist()
         used = len(g)
-        k = len(close_ids)
-        if k > 0:
-            for i in range(max(0, len(g) - k), -1, -1):
-                if g[i:i + k] == close_ids:
-                    used = i
-                    break
+        # search for any configured closing tag; choose earliest match index from the end scan
+        for tag in think_tags:
+            try:
+                close_ids = tokenizer.encode(str(tag), add_special_tokens=False)
+            except Exception:
+                close_ids = tokenizer(str(tag), add_special_tokens=False).input_ids
+            k = len(close_ids)
+            if k > 0:
+                for i in range(max(0, len(g) - k), -1, -1):
+                    if g[i:i + k] == close_ids:
+                        used = min(used, i)
+                        break
     except Exception:
         used = int(gen1.shape[0])
 
@@ -324,7 +384,7 @@ def decode_with_budget(
     ans_tok = tokenizer("<answer>", add_special_tokens=False, return_tensors="pt").input_ids.to(device)
     full_prompt_ids = torch.cat([seqs1, ans_tok], dim=1)
     full_attn = torch.ones_like(full_prompt_ids)
-    stop_answer = StopOnTags(tokenizer, ("</answer>",), max_new=max_new_tokens)
+    stop_answer = StopOnTags(tokenizer, ans_tags, max_new=max_new_tokens)
     with torch.no_grad():
         out2 = model.generate(
             input_ids=full_prompt_ids,
