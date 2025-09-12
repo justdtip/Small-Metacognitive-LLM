@@ -22,7 +22,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from tina.tokenizer_utils import ensure_reasoning_tokens
 from tina.serve import IntrospectiveEngine, EngineConfig, _extract_answer
 from tina.side_adapters import attach_residual_adapters
-from train.hooks import think_mask_context
+from train.hooks import think_mask_context, reset_coverage
 from train.data import make_collate_fn
 from train.losses import compute_losses
 from tina.metacog_heads import MetacogHeads, MetacogConfig
@@ -212,6 +212,8 @@ def run_one_cycle(args) -> Dict[str, Any]:
     labels = torch.where(batch["loss_mask"].to(labels.device).bool(), labels, torch.full_like(labels, -100))
 
     # One forward/backward under think context and adapter think-mode
+    # Reset adapter coverage before forward to ensure fresh measurement
+    reset_coverage(eng.scaffold)
     with think_mask_context(batch["think_mask"].to(model_device).float()):
         with eng.scaffold.think():
             outputs = model(input_ids=input_ids, output_hidden_states=True, return_dict=True, use_cache=False)
@@ -292,11 +294,8 @@ def run_one_cycle(args) -> Dict[str, Any]:
     # After canonical extraction, leakage should be impossible in 'body'
     leakage_detected = False
     # Think tokens from engine stats if available
-    think_used = eng.last_stats.get("think_budget")
-    try:
-        think_used = int(think_used)
-    except Exception:
-        think_used = int(sum(map(int, examples[0].get("think_tokens_used") or [0]))) if isinstance(examples[0].get("think_tokens_used"), list) else 0
+    think_used = int(eng.last_stats.get("think_tokens_used", 0) or 0)
+    think_budget = int(eng.last_stats.get("think_budget", 0) or 0)
 
     # Aggregates
     with torch.no_grad():
@@ -319,16 +318,43 @@ def run_one_cycle(args) -> Dict[str, Any]:
         except Exception:
             pass
 
-    # Gate coverage mean
+    # Decomposition telemetry (token counts and fractions) if masks exist
+    plan_tok = exec_tok = eval_tok = None
+    plan_frac = exec_frac = eval_frac = None
+    try:
+        import torch as _t
+        Tm = batch.get("think_mask")
+        denom = float(Tm.to(dtype=_t.float32).sum().item()) if isinstance(Tm, _t.Tensor) else None
+        def _sum_mask(m):
+            if not isinstance(m, _t.Tensor):
+                return None
+            return float(m.to(dtype=_t.float32).sum().item())
+        if isinstance(batch.get("plan_mask"), _t.Tensor):
+            plan_tok = _sum_mask(batch["plan_mask"])
+            plan_frac = (plan_tok/denom) if (denom and denom>0 and plan_tok is not None) else None
+        if isinstance(batch.get("exec_mask"), _t.Tensor):
+            exec_tok = _sum_mask(batch["exec_mask"])
+            exec_frac = (exec_tok/denom) if (denom and denom>0 and exec_tok is not None) else None
+        if isinstance(batch.get("eval_mask"), _t.Tensor):
+            eval_tok = _sum_mask(batch["eval_mask"])
+            eval_frac = (eval_tok/denom) if (denom and denom>0 and eval_tok is not None) else None
+    except Exception:
+        pass
+
+    # Gate coverage mean across adapters
     gate_cov = None
+    gate_cov_mean = None
     try:
         vals = []
         for m in eng.scaffold.adapters:
             v = getattr(m, "_last_gate_coverage", None)
             if torch.is_tensor(v):
                 vals.append(float(v.item()))
+            elif isinstance(v, (int, float)):
+                vals.append(float(v))
         if vals:
-            gate_cov = sum(vals) / len(vals)
+            gate_cov_mean = sum(vals) / len(vals)
+            gate_cov = gate_cov_mean
     except Exception:
         pass
 
@@ -349,10 +375,19 @@ def run_one_cycle(args) -> Dict[str, Any]:
         "conf_prob_mean": cp,
         "ece": ece,
         "think_tokens_used": think_used,
+        "think_budget": think_budget,
         "slack_ratio": slack_ratio,
         "stop_sequences": stop_sequences,
         "parity_digest": parity_digest,
         "gate_coverage": gate_cov,
+        "gate_coverage_mean": gate_cov_mean,
+        # Decomposition telemetry
+        "plan_tokens": plan_tok,
+        "exec_tokens": exec_tok,
+        "eval_tokens": eval_tok,
+        "plan_fraction": plan_frac,
+        "exec_fraction": exec_frac,
+        "eval_fraction": eval_frac,
         "leakage_detected": bool(leakage_detected),
     }
     return rec

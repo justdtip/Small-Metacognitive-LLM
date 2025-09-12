@@ -1,6 +1,6 @@
 # tina/metacog_heads.py
 from dataclasses import dataclass
-from typing import Sequence, Dict
+from typing import Sequence, Dict, Union
 import torch
 import torch.nn as nn
 
@@ -10,6 +10,7 @@ class MetacogConfig:
     taps: Sequence[int]         # which layers we pool (e.g., [6, 10, 14])
     proj_dim: int = 128         # compact metacog space
     head_temp: float = 1.0      # temperature for plan logits calibration
+    budget_head_temperature: float = 1.0  # temperature scaling for budget head logits
 
 class MetacogHeads(nn.Module):
     """
@@ -25,10 +26,12 @@ class MetacogHeads(nn.Module):
         D = cfg.proj_dim
 
         self.plan = nn.Linear(D, 4)         # outline/verify/decompose/stop
-        self.budget = nn.Linear(D, 1)       # 0..Bmax (scaled at serve time)
+        self.budget = nn.Linear(D, 1)       # raw budget logit → scaled via sigmoid to [0..Bmax]
         self.confidence = nn.Linear(D, 1)   # scalar
 
         self._tap_cache = {}  # layer_idx -> last hidden (B,T,H)
+        # Non-trainable temperature for budget head (can be tuned via calibration)
+        self._budget_temp = nn.Parameter(torch.tensor(float(cfg.budget_head_temperature)), requires_grad=False)
 
     def clear_cache(self):
         self._tap_cache.clear()
@@ -41,7 +44,11 @@ class MetacogHeads(nn.Module):
             raise ValueError(f"tap hidden size mismatch: got {h.shape[-1]}, expected {self.cfg.hidden_size}")
         self._tap_cache[layer_idx] = h[:, -1:, :].detach()  # keep last-step feature
 
-    def forward(self, B_max: int = 256) -> Dict[str, torch.Tensor]:
+    def set_budget_temp(self, value: Union[float, int]):
+        with torch.no_grad():
+            self._budget_temp.copy_(torch.tensor(float(value), dtype=self._budget_temp.dtype, device=self._budget_temp.device))
+
+    def forward(self, B_max: Union[int, float, torch.Tensor] = 256) -> Dict[str, torch.Tensor]:
         if not self._tap_cache:
             # default zeros if not populated (e.g. before a dry forward)
             z = self.pool.weight.new_zeros((1, self.cfg.proj_dim))
@@ -62,8 +69,16 @@ class MetacogHeads(nn.Module):
         # Clamp and temperature-scale plan logits for stability
         temp = max(float(self.cfg.head_temp), 1e-6)
         plan_logits = (self.plan(z) / temp).clamp(-20, 20)          # [B,4]
-        budget_raw = self.budget(z).clamp_min(0)                     # [B,1]
+        # Budget head: sigmoid over temperature-scaled logit, then scale to [0..B_max]
+        raw = self.budget(z) / torch.clamp(self._budget_temp, min=torch.tensor(1e-6, dtype=self._budget_temp.dtype, device=self._budget_temp.device))  # [B,1]
+        # Broadcastable B_max tensor
+        if not torch.is_tensor(B_max):
+            Bm = torch.tensor(float(B_max), dtype=raw.dtype, device=raw.device)
+        else:
+            Bm = B_max.to(dtype=raw.dtype, device=raw.device)
+        budget = torch.sigmoid(raw) * Bm
+        # Clamp to [0, B_max]
+        zero = torch.zeros_like(budget)
+        budget = torch.maximum(zero, torch.minimum(budget, Bm))
         confidence = torch.sigmoid(self.confidence(z))  # [B,1]
-        # Scale budget to an integer cap
-        budget = (budget_raw * B_max).clamp(0, B_max)
         return {"plan_logits": plan_logits, "budget": budget, "confidence": confidence}

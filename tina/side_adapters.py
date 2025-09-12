@@ -37,8 +37,8 @@ class LowRankAdapter(nn.Module):
         self.gate = nn.Parameter(torch.tensor(cfg.init_gate, dtype=torch.float32))
         # per-token gate
         self.hc_gate = HardConcreteGate()
-        self._last_gate_activity: Optional[torch.Tensor] = None
-        self._last_gate_coverage: Optional[torch.Tensor] = None
+        self._last_gate_activity: Optional[torch.Tensor] = torch.tensor(0.0)
+        self._last_gate_coverage: Optional[torch.Tensor] = torch.tensor(0.0)
         self._enabled = True
 
     def enable(self, flag: bool = True):
@@ -47,6 +47,11 @@ class LowRankAdapter(nn.Module):
     def forward(self, h: torch.Tensor) -> torch.Tensor:
         if not self._enabled:
             return h
+        # reset coverage each forward
+        try:
+            self._last_gate_coverage = torch.tensor(0.0, device=h.device if torch.is_tensor(h) else None)
+        except Exception:
+            self._last_gate_coverage = torch.tensor(0.0)
         g = torch.clamp(self.gate, 0.0, 1.0)
         if g.item() <= 1e-6:
             return h
@@ -71,19 +76,24 @@ class LowRankAdapter(nn.Module):
             self._last_gate_activity = None
         m = _ctx_think_mask.get()
         if m is not None:
-            m_t = m.to(y_gated.dtype).unsqueeze(-1)
+            m_t = m.to(y_gated.dtype).unsqueeze(-1)  # [B,T,1]
             full = y_gated
             masked = full * m_t
-            # coverage: proportion of post-gate activity aligned to think positions
+            # coverage: proportion of tokens within think_mask where gate is active (>0.5)
             try:
-                num = torch.sum(torch.abs(masked)).detach()
-                den = torch.sum(torch.abs(full)).detach().clamp_min(1e-8)
-                self._last_gate_coverage = (num / den)
+                s_act = (s > 0.5).to(y_gated.dtype)  # [B,T,1]
+                act_in_mask = (s_act * m_t).sum()  # counts tokens
+                denom = m.sum().clamp_min(1e-8)    # total think tokens
+                self._last_gate_coverage = (act_in_mask / denom).detach()
             except Exception:
-                self._last_gate_coverage = None
+                self._last_gate_coverage = torch.tensor(0.0, device=y_gated.device)
             y_gated = masked
         else:
-            self._last_gate_coverage = None
+            # no think mask → coverage 0.0 (no credit outside THINK)
+            try:
+                self._last_gate_coverage = torch.tensor(0.0, device=y_gated.device)
+            except Exception:
+                self._last_gate_coverage = torch.tensor(0.0)
         return h + y_gated
 
 class IntrospectionScaffold(nn.Module):

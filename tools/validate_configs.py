@@ -167,6 +167,13 @@ def _coherence_checks() -> list[str]:
                 except Exception:
                     out.append(tok(t, add_special_tokens=False).input_ids)
             return out
+        # Assert single-token encoding for each stop tag
+        for tag in stops + t_stops:
+            ids = tok.encode(tag, add_special_tokens=False)
+            if not isinstance(ids, list):
+                ids = list(ids)
+            if len(ids) != 1:
+                errs.append(f"stop tag '{tag}' does not encode to a single token: {ids}")
         eval_answer_ids = _enc_list(stops)
         eval_think_ids = _enc_list(t_stops)
         serve_answer_ids = _enc_list(stops)  # serve encodes the same strings

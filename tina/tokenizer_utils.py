@@ -6,8 +6,10 @@ except Exception:  # pragma: no cover
     torch = None  # type: ignore
 
 REASONING_TOKENS = ["<think>", "</think>", "<answer>", "</answer>"]
+DECOMP_TOKENS = ["<plan>", "</plan>", "<exec>", "</exec>", "<eval>", "</eval>"]
 STOP_SEQUENCES = ["</answer>"]
-SPECIAL_TOKENS = REASONING_TOKENS
+# Register both reasoning and decomposition tags as atomic
+SPECIAL_TOKENS = REASONING_TOKENS + DECOMP_TOKENS
 
 def ensure_reasoning_tokens(tokenizer, model=None) -> Dict[str, int]:
     """
@@ -89,6 +91,20 @@ def ensure_reasoning_tokens(tokenizer, model=None) -> Dict[str, int]:
 
     return ids
 
+def get_reasoning_tag_ids(tokenizer) -> Dict[str, int]:
+    """
+    Return mapping from each reasoning/decomposition tag to its token id.
+    Ensures tags are registered and atomic first.
+    """
+    ensure_reasoning_tokens(tokenizer)
+    out: Dict[str, int] = {}
+    for t in SPECIAL_TOKENS:
+        tid = tokenizer.convert_tokens_to_ids(t)
+        if tid is None:
+            raise ValueError(f"Failed to resolve id for tag '{t}' after registration")
+        out[t] = int(tid)
+    return out
+
 def format_chat(tokenizer, messages: List[Dict], add_generation_prompt: bool = True):
     """
     Apply chat template deterministically across server/CLI.
@@ -121,6 +137,23 @@ def count_tokens(tokenizer, text: str) -> int:
 
 def detok(tokenizer, ids: List[int]) -> str:
     return tokenizer.decode(ids, skip_special_tokens=False)
+
+def find_span(input_ids: List[int], open_id: int, close_id: int) -> Optional[Tuple[int, int]]:
+    """
+    Find the first non-overlapping span delimited by open_id and close_id in input_ids.
+    Returns (start_index, end_index) inclusive of the tag tokens or None if not found or malformed.
+    """
+    try:
+        start = input_ids.index(open_id)
+    except ValueError:
+        return None
+    try:
+        end = input_ids.index(close_id, start + 1)
+    except ValueError:
+        return None
+    if end <= start:
+        return None
+    return (start, end)
 
 def segment_and_masks(text: str, tokenizer, loss_on: str = "answer") -> Tuple[List[int], List[int], List[int], List[int], List[int]]:
     """

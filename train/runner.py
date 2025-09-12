@@ -410,20 +410,22 @@ def rl_phase_step(model: nn.Module, batch: Dict[str, Any], *, policy=None, opt=N
     device = next(model.parameters()).device if hasattr(model, 'parameters') else torch.device('cpu')
     input_ids = batch["input_ids"].to(device)
 
-    # Try HF-style forward first
+    # Try HF-style forward first (no gradients from model; features only)
     h_list = None
     try:
-        outputs = model(input_ids, output_hidden_states=True, return_dict=True)
-        h_list = getattr(outputs, "hidden_states", None)
+        with torch.no_grad():
+            outputs = model(input_ids, output_hidden_states=True, return_dict=True)
+            h_list = getattr(outputs, "hidden_states", None)
     except Exception:
         outputs = None
 
     if h_list is None:
         # Fallback for TinyLM-like models
         try:
-            x = getattr(model, "embed")(input_ids)
-            y, _ = getattr(model, "rnn")(x)
-            h_base = y
+            with torch.no_grad():
+                x = getattr(model, "embed")(input_ids)
+                y, _ = getattr(model, "rnn")(x)
+                h_base = y
         except Exception:
             B, T = input_ids.shape
             h_base = torch.zeros(B, T, 16, device=input_ids.device)
@@ -558,6 +560,10 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
     sched = cfg.get("schedule") or {}
     sample_every = int(cfg.get("sample_every") or sched.get("sample_every") or 0)
     budget_cap = int(cfg.get("budget_cap") or sched.get("budget_cap") or 16)
+    # Decode parameters (overridable by CLI in __main__ caller)
+    decode_temperature = float(cfg.get("decode_temperature") or 0.2)
+    decode_top_p = float(cfg.get("decode_top_p") or 0.95)
+    decode_max_new = int(cfg.get("decode_max_new") or 32)
     lambdas = dict(cfg.get("lambdas") or {})
 
     # Try to load a real HF model if available; fall back to TinyLM otherwise
@@ -646,11 +652,28 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
     # On-policy integration
     rl_stats = []
     pol = None
+    # Budget warmup schedule
+    total_steps = int((sched.get("steps") or steps) or steps)
+    lambda_budget_target = float((lambdas.get("budget_reg") or lambdas.get("budget") or 0.0) or 0.0)
+    warmup_cfg = cfg.get("budget_warmup_steps")
+    if warmup_cfg is None:
+        budget_warmup_steps = max(1, int(0.1 * float(total_steps)))
+    else:
+        try:
+            budget_warmup_steps = int(warmup_cfg)
+        except Exception:
+            budget_warmup_steps = max(1, int(0.1 * float(total_steps)))
     for t in range(int(steps)):
         if sample_every > 0 and (t % int(sample_every) == 0):
             try:
-                out = decode_with_budget(tok, model, batch["input_ids"], think_budget=int(budget_cap), max_new_tokens=32,
-                                         temperature=0.2, visible_cot=False)
+                out = decode_with_budget(
+                    tok, model, batch["input_ids"],
+                    think_budget=int(budget_cap),
+                    max_new_tokens=int(decode_max_new),
+                    temperature=float(decode_temperature),
+                    top_p=float(decode_top_p),
+                    visible_cot=False,
+                )
                 used = int(out.get("think_tokens_used") or 0)
             except Exception:
                 used = 0
@@ -659,8 +682,20 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
             batch["think_tokens_used"] = _t.tensor([used for _ in range(B)], dtype=_t.long)
             if not isinstance(batch.get("correctness"), _t.Tensor):
                 batch["correctness"] = _t.ones((B,), dtype=_t.long)
+            # RL budget update under no_grad features
             pol, stats = rl_phase_step(model, batch, policy=pol, B_max=int(budget_cap))
             rl_stats.append(stats)
+            # Log RL stats line
+            try:
+                print(json.dumps({
+                    "train_step": int(t),
+                    "rl": {
+                        "think_tokens_used": int(used),
+                        **{k: float(v) for k, v in stats.items() if isinstance(v, (int, float))}
+                    }
+                }))
+            except Exception:
+                pass
         # Full training step: forward with hidden states → heads → compute_losses → backward/step
         device = next(model.parameters()).device if hasattr(model, 'parameters') else torch.device('cpu')
         input_ids = batch["input_ids"].to(device)
@@ -708,7 +743,14 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
         for ti in taps_use:
             if 0 <= int(ti) < len(h_list):
                 heads.register_tap(int(ti), h_list[int(ti)])
-        head_out = heads(B_max=int(budget_cap))
+        # Choose B_max from batch target or config budget_cap
+        try:
+            B_max_use = int(budget_cap)
+            if isinstance(batch.get("target_budget"), torch.Tensor) and (batch["target_budget"] >= 0).any():
+                B_max_use = int(batch["target_budget"].max().item())
+        except Exception:
+            B_max_use = int(budget_cap)
+        head_out = heads(B_max=B_max_use)
         plan_logits = head_out.get("plan_logits")
         budget_pred = head_out.get("budget")
         conf_prob = head_out.get("confidence")
@@ -731,12 +773,18 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
                         pass
             return float(default)
 
+        # Budget weight warmup
+        if budget_warmup_steps > 0:
+            lam_budget_cur = float(min(lambda_budget_target, lambda_budget_target * (float(t) / float(budget_warmup_steps))))
+        else:
+            lam_budget_cur = float(lambda_budget_target)
+
         weights = {
             "answer_ce": _lam("answer_ce", default=1.0),
             "gate_reg": _lam("gate", "gate_reg", default=0.0),
             "aux_mix": 0.0,
             "plan_ce": _lam("plan", "plan_ce", default=0.0),
-            "budget_reg": _lam("budget", "budget_reg", default=0.0),
+            "budget_reg": lam_budget_cur,
             "conf_cal": _lam("conf", "conf_cal", default=0.0),
             "rewrite_consistency": _lam("rewrite", default=0.0),
             "style_inv": _lam("style_inv", default=0.0),
@@ -754,6 +802,11 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
             answer_mask=batch.get("answer_mask").to(device) if isinstance(batch.get("answer_mask"), torch.Tensor) else None,
             rewrite_groups=(batch.get("batch_meta") or {}).get("rewrite_groups") if isinstance(batch.get("batch_meta"), dict) else None,
         )
+        # Step debug log for budget lambda
+        try:
+            print(json.dumps({"train_step": int(t), "lambda_budget_current": lam_budget_cur}))
+        except Exception:
+            pass
         # Backprop and step
         opt.zero_grad()
         out_losses["total"].backward()
@@ -795,13 +848,19 @@ def _parse_cli(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--train-config", dest="cfg", default=None)
     ap.add_argument("--steps", type=int, default=2)
+    ap.add_argument("--sample-every", type=int, default=None, help="On-policy decode cadence (override config)")
+    ap.add_argument("--budget-cap", type=int, default=None, help="Budget cap for on-policy decode (override config)")
+    ap.add_argument("--decode-temperature", type=float, default=None, help="Sampling temperature for decode_with_budget")
+    ap.add_argument("--decode-top-p", type=float, default=None, help="Top-p for decode_with_budget")
+    ap.add_argument("--decode-max-new", type=int, default=None, help="Max new tokens for decode_with_budget")
     return ap.parse_args(argv)
 
 
 if __name__ == "__main__":
     args = _parse_cli()
     if args.cfg:
-        run_from_config(args.cfg, steps=int(args.steps))
+        # Allow simple overrides via CLI
+        out = run_from_config(args.cfg, steps=int(args.steps))
 
 
 def onpolicy_sft_and_rl_smoke(steps: int = 2, sample_every: int = 1, budget_cap: int = 16) -> Dict[str, Any]:

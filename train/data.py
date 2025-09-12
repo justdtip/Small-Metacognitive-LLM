@@ -1,11 +1,31 @@
+"""
+JSONL schema and strictness (collator contract)
+-----------------------------------------------
+
+Each record MUST include a 'text' field containing exactly one
+"<think> ... </think> <answer> ... </answer>" pair. These core tags are
+strictly enforced when strict=True; the collator raises ValueError with the
+record index if either pair is missing or malformed. This preserves stable
+segmentation and prevents leakage.
+
+Optional decomposition tags (<plan>/<exec>/<eval>) may appear inside the
+<think> segment. The collator derives soft boolean masks for any present
+sub‑segments and attaches them to the batch as plan_mask, exec_mask,
+eval_mask (same length as input_ids). Malformed or missing sub‑segments do
+not raise errors, even in strict mode; they are simply ignored (all‑zero
+mask). Stopping and masking for training remain based on </think> and
+</answer> only by default.
+"""
+
 from typing import List, Dict, Tuple, Any, Optional, Callable
+import os
 
 try:
     import torch  # type: ignore
 except Exception:  # pragma: no cover
     torch = None  # type: ignore
 
-from tina.tokenizer_utils import segment_and_masks
+from tina.tokenizer_utils import segment_and_masks, get_reasoning_tag_ids, find_span
 
 
 class ReasoningDataset:
@@ -152,6 +172,53 @@ def make_collate_fn(
             ids, attn, loss_m, think_m, ans_m = segment_and_masks(text, tokenizer, loss_on=loss_on)
             items.append((ids, attn, loss_m, think_m, ans_m))
 
+            # Optional decomposition masks within <think>
+            try:
+                tag_ids = get_reasoning_tag_ids(tokenizer)
+                tpair = find_span(ids, tag_ids["<think>"], tag_ids["</think>"])
+                L = len(ids)
+                plan_mask = [0] * L
+                exec_mask = [0] * L
+                eval_mask = [0] * L
+                any_decomp = False
+                if tpair is not None:
+                    t0, t1 = tpair
+                    # Precedence plan > exec > eval
+                    occupied = [0] * L
+                    def apply_span(open_tag: str, close_tag: str, target_mask: List[int]):
+                        nonlocal any_decomp
+                        op = tag_ids.get(open_tag); cl = tag_ids.get(close_tag)
+                        if op is None or cl is None:
+                            return
+                        sp = find_span(ids, op, cl)
+                        if sp is None:
+                            return
+                        s, e = sp
+                        # exclude tag tokens, clamp within think span
+                        s = max(s + 1, t0 + 1)
+                        e = min(e - 1, t1 - 1)
+                        if e < s:
+                            return
+                        for i in range(s, e + 1):
+                            if not occupied[i]:
+                                target_mask[i] = 1
+                                occupied[i] = 1
+                                any_decomp = True
+                    apply_span("<plan>", "</plan>", plan_mask)
+                    apply_span("<exec>", "</exec>", exec_mask)
+                    apply_span("<eval>", "</eval>", eval_mask)
+                # Stash on the example so we can pad after stacking
+                ex["_plan_mask"] = plan_mask
+                ex["_exec_mask"] = exec_mask
+                ex["_eval_mask"] = eval_mask
+                ex["_has_decomp"] = any_decomp
+            except Exception as e:
+                # Ignore malformed sub-segments; do not raise even in strict mode.
+                # Optional debug warning via env toggle (DATA_DEBUG=1)
+                if os.environ.get("DATA_DEBUG"):
+                    print(f"[decomp-mask] warning: record {idx} decomposition parse ignored: {type(e).__name__}: {e}")
+                ex["_has_decomp"] = False
+
             # Labels / targets (use -1 when missing)
             plan_targets.append(int(ex.get("plan_class", -1)) if ex.get("plan_class") is not None else -1)
 
@@ -185,6 +252,30 @@ def make_collate_fn(
         except Exception:
             pad_id = 0
         batch_out = pad_and_stack(items, pad_id=pad_id)
+
+        # Attach padded decomposition masks if any present
+        try:
+            if any((ex.get("_has_decomp") for ex in batch)):
+                Lp = int(batch_out["input_ids"].shape[1]) if torch is not None else len(batch_out["input_ids"][0])
+                def _pad_mask(m: List[int]) -> List[int]:
+                    return m + [0] * (Lp - len(m))
+                plan_ms = []; exec_ms = []; eval_ms = []
+                for ex in batch:
+                    pm = _pad_mask(ex.get("_plan_mask", [0] * len(items[0][0])))
+                    em = _pad_mask(ex.get("_exec_mask", [0] * len(items[0][0])))
+                    vm = _pad_mask(ex.get("_eval_mask", [0] * len(items[0][0])))
+                    plan_ms.append(pm); exec_ms.append(em); eval_ms.append(vm)
+                if torch is None:
+                    batch_out["plan_mask"] = plan_ms
+                    batch_out["exec_mask"] = exec_ms
+                    batch_out["eval_mask"] = eval_ms
+                else:
+                    device = None
+                    batch_out["plan_mask"] = torch.tensor(plan_ms, dtype=torch.long, device=device)
+                    batch_out["exec_mask"] = torch.tensor(exec_ms, dtype=torch.long, device=device)
+                    batch_out["eval_mask"] = torch.tensor(eval_ms, dtype=torch.long, device=device)
+        except Exception:
+            pass
 
         # Attach label tensors
         if torch is None:

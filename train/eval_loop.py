@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from tina.serve import _extract_answer, StopOnTags, SlackStop
+from tina.serve import _extract_answer, StopOnTags, SlackStop, _count_think_tokens
 from train.metrics import temperature_fit, ece_binary, f1_token
 import os as _os
 
@@ -91,6 +91,17 @@ def compute_eval_metrics(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     gate_covs: List[float] = []
     think_scores: List[float] = []
     f1s: List[float] = []
+    # Decomposition telemetry accumulators
+    plan_tokens_all: List[float] = []
+    exec_tokens_all: List[float] = []
+    eval_tokens_all: List[float] = []
+    plan_frac_all: List[float] = []
+    exec_frac_all: List[float] = []
+    eval_frac_all: List[float] = []
+    plan_present = 0
+    exec_present = 0
+    eval_present = 0
+
     for r in records:
         body = r.get("body") or ""
         gold = (r.get("gold") or "").strip()
@@ -124,6 +135,81 @@ def compute_eval_metrics(records: List[Dict[str, Any]]) -> Dict[str, Any]:
                 think_counts.append(float(_word_count(_extract_think_span(body))))
         else:
             think_counts.append(float(_word_count(_extract_think_span(body))))
+
+        # Optional decomposition metrics if masks or counts provided on the record
+        # Accept either full-length boolean masks or precomputed counts along with a denominator
+        try:
+            # Derive per-record think denominator for fractions if masks are present
+            denom = None
+            tm = r.get("think_mask")
+            if tm is not None:
+                try:
+                    import torch as _t
+                    if isinstance(tm, _t.Tensor):
+                        denom = float(tm.to(dtype=_t.float32).sum().item())
+                    else:
+                        denom = float(sum(1 for v in tm if int(v) != 0))
+                except Exception:
+                    denom = None
+            # plan
+            pt = None
+            if r.get("plan_tokens") is not None:
+                pt = float(r.get("plan_tokens") or 0.0)
+            elif r.get("plan_mask") is not None:
+                pm = r.get("plan_mask")
+                try:
+                    import torch as _t
+                    if isinstance(pm, _t.Tensor):
+                        pt = float(pm.to(dtype=_t.float32).sum().item())
+                    else:
+                        pt = float(sum(1 for v in pm if int(v) != 0))
+                except Exception:
+                    pt = None
+            if pt is not None and pt > 0:
+                plan_present += 1
+                plan_tokens_all.append(pt)
+                if denom and denom > 0:
+                    plan_frac_all.append(float(pt / denom))
+            # exec
+            et = None
+            if r.get("exec_tokens") is not None:
+                et = float(r.get("exec_tokens") or 0.0)
+            elif r.get("exec_mask") is not None:
+                em = r.get("exec_mask")
+                try:
+                    import torch as _t
+                    if isinstance(em, _t.Tensor):
+                        et = float(em.to(dtype=_t.float32).sum().item())
+                    else:
+                        et = float(sum(1 for v in em if int(v) != 0))
+                except Exception:
+                    et = None
+            if et is not None and et > 0:
+                exec_present += 1
+                exec_tokens_all.append(et)
+                if denom and denom > 0:
+                    exec_frac_all.append(float(et / denom))
+            # eval
+            vt = None
+            if r.get("eval_tokens") is not None:
+                vt = float(r.get("eval_tokens") or 0.0)
+            elif r.get("eval_mask") is not None:
+                vm = r.get("eval_mask")
+                try:
+                    import torch as _t
+                    if isinstance(vm, _t.Tensor):
+                        vt = float(vm.to(dtype=_t.float32).sum().item())
+                    else:
+                        vt = float(sum(1 for v in vm if int(v) != 0))
+                except Exception:
+                    vt = None
+            if vt is not None and vt > 0:
+                eval_present += 1
+                eval_tokens_all.append(vt)
+                if denom and denom > 0:
+                    eval_frac_all.append(float(vt / denom))
+        except Exception:
+            pass
 
         if r.get("plan_true") is not None and r.get("plan_pred") is not None:
             plan_total += 1
@@ -199,6 +285,13 @@ def compute_eval_metrics(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         "gate_coverage_mean": (sum(gate_covs) / len(gate_covs)) if gate_covs else None,
         "f1": (sum(f1s) / len(f1s)) if f1s else None,
         "think_score_mean": (sum(think_scores) / len(think_scores)) if think_scores else None,
+        # Decomposition telemetry aggregates
+        "mean_plan_fraction": (sum(plan_frac_all) / len(plan_frac_all)) if plan_frac_all else None,
+        "mean_exec_fraction": (sum(exec_frac_all) / len(exec_frac_all)) if exec_frac_all else None,
+        "mean_eval_fraction": (sum(eval_frac_all) / len(eval_frac_all)) if eval_frac_all else None,
+        "presence_rate_plan": (plan_present / max(1, len(records))) if records else None,
+        "presence_rate_exec": (exec_present / max(1, len(records))) if records else None,
+        "presence_rate_eval": (eval_present / max(1, len(records))) if records else None,
     }
 
 
@@ -282,15 +375,29 @@ def quality_vs_budget_curve(
             "accuracy": float(m.get("accuracy") or 0.0),
             "f1": float(m.get("f1")) if (m.get("f1") is not None) else None,
             "mean_think_tokens": float(m.get("think_tokens_mean") or 0.0),
+            "mean_plan_fraction": m.get("mean_plan_fraction"),
+            "mean_exec_fraction": m.get("mean_exec_fraction"),
+            "mean_eval_fraction": m.get("mean_eval_fraction"),
+            "presence_rate_plan": m.get("presence_rate_plan"),
+            "presence_rate_exec": m.get("presence_rate_exec"),
+            "presence_rate_eval": m.get("presence_rate_eval"),
         })
     # Optional CSV
     if out_csv:
         p = Path(out_csv)
         p.parent.mkdir(parents=True, exist_ok=True)
         with p.open("w", encoding="utf-8", newline="") as f:
-            f.write("budget,n,accuracy,f1,mean_think_tokens\n")
+            f.write("budget,n,accuracy,f1,mean_think_tokens,mean_plan_fraction,mean_exec_fraction,mean_eval_fraction,presence_rate_plan,presence_rate_exec,presence_rate_eval\n")
             for r in rows:
-                f.write(f"{r['budget']},{r['n']},{r['accuracy']},{'' if r['f1'] is None else r['f1']},{r['mean_think_tokens']}\n")
+                f.write(
+                    f"{r['budget']},{r['n']},{r['accuracy']},{'' if r['f1'] is None else r['f1']},{r['mean_think_tokens']}"
+                    f",{'' if r.get('mean_plan_fraction') is None else r['mean_plan_fraction']}"
+                    f",{'' if r.get('mean_exec_fraction') is None else r['mean_exec_fraction']}"
+                    f",{'' if r.get('mean_eval_fraction') is None else r['mean_eval_fraction']}"
+                    f",{'' if r.get('presence_rate_plan') is None else r['presence_rate_plan']}"
+                    f",{'' if r.get('presence_rate_exec') is None else r['presence_rate_exec']}"
+                    f",{'' if r.get('presence_rate_eval') is None else r['presence_rate_eval']}\n"
+                )
     return {"budgets": budgets_list, "curve": rows}
 
 
@@ -299,39 +406,36 @@ def load_service_config(root: Optional[str] = None) -> Dict[str, Any]:
     Load service_config.json to centralize parity behavior (visibility, stop sequences, calibration path).
     Returns a dict with keys: visible_cot_default, stop_sequences, think_stop_sequences, confidence_calibration_path.
     """
+    # Env overrides for tests and tooling
+    env_path = _os.environ.get("SERVICE_CONFIG_PATH")
+    if env_path:
+        p = Path(env_path)
+    else:
+        base_env = _os.environ.get("CONFIG_ROOT")
+        base = Path(base_env) if base_env else (Path(root) if root else Path(__file__).resolve().parents[1])
+        p = base / "config" / "service_config.json"
+    if not p.exists():
+        raise ValueError(
+            f"service_config.json not found at {p}. Example: { '{' } 'visible_cot_default': false, 'stop_sequences': ['</answer>'], "
+            "'think_stop_sequences': ['</think>'], 'soft_cap_slack_ratio': 0.2 }"
+        )
     try:
-        # Env overrides for tests and tooling
-        env_path = _os.environ.get("SERVICE_CONFIG_PATH")
-        if env_path:
-            p = Path(env_path)
-        else:
-            base_env = _os.environ.get("CONFIG_ROOT")
-            base = Path(base_env) if base_env else (Path(root) if root else Path(__file__).resolve().parents[1])
-            p = base / "config" / "service_config.json"
-        if not p.exists():
-            return {
-                "visible_cot_default": False,
-                "stop_sequences": ["</answer>"],
-                "think_stop_sequences": ["</think>"],
-                "confidence_calibration_path": "",
-                "soft_cap_slack_ratio": 0.2,
-            }
         d = _json.loads(p.read_text(encoding="utf-8"))
-        return {
-            "visible_cot_default": bool(d.get("visible_cot_default", False)),
-            "stop_sequences": list(d.get("stop_sequences") or ["</answer>"]),
-            "think_stop_sequences": list(d.get("think_stop_sequences") or ["</think>"]),
-            "confidence_calibration_path": str(d.get("confidence_calibration_path") or ""),
-            "soft_cap_slack_ratio": float(d.get("soft_cap_slack_ratio", 0.2)),
-        }
-    except Exception:
-        return {
-            "visible_cot_default": False,
-            "stop_sequences": ["</answer>"],
-            "think_stop_sequences": ["</think>"],
-            "confidence_calibration_path": "",
-            "soft_cap_slack_ratio": 0.2,
-        }
+    except Exception as e:
+        raise ValueError(f"Failed to parse service_config.json at {p}: {type(e).__name__}: {e}")
+    stops = d.get("stop_sequences")
+    t_stops = d.get("think_stop_sequences")
+    if not stops or not isinstance(stops, list):
+        raise ValueError("service_config.stop_sequences missing or empty; see docs.")
+    if not t_stops or not isinstance(t_stops, list):
+        raise ValueError("service_config.think_stop_sequences missing or empty; see docs.")
+    return {
+        "visible_cot_default": bool(d.get("visible_cot_default", False)),
+        "stop_sequences": list(stops),
+        "think_stop_sequences": list(t_stops),
+        "confidence_calibration_path": str(d.get("confidence_calibration_path") or ""),
+        "soft_cap_slack_ratio": float(d.get("soft_cap_slack_ratio")),
+    }
 
 
 
@@ -341,7 +445,6 @@ def decode_with_budget(
     input_ids,
     *,
     think_budget: int,
-    slack_ratio: float = 0.2,
     max_new_tokens: int = 512,
     temperature: float = 0.7,
     top_p: float = 0.95,
@@ -349,6 +452,7 @@ def decode_with_budget(
     ignore_eos: bool = False,
     visible_cot: bool = False,
     style_tag: Optional[str] = None,
+    verbose: bool = False,
 ) -> Dict[str, Any]:
     """
     Generate using a soft-cap budget for the <think> segment and StopOnTags for </think> and </answer>.
@@ -375,6 +479,23 @@ def decode_with_budget(
     svc = load_service_config()
     think_tags = tuple(svc.get("think_stop_sequences"))
     ans_tags = tuple(svc.get("stop_sequences"))
+    # Validate tags encode to 1 token and optionally log ids
+    def _enc_single(tag: str) -> list[int]:
+        try:
+            ids = tokenizer.encode(tag, add_special_tokens=False)
+        except Exception:
+            ids = tokenizer(tag, add_special_tokens=False).input_ids
+        if not isinstance(ids, list):
+            ids = list(ids)
+        if len(ids) != 1:
+            raise ValueError(f"Stop tag '{tag}' does not encode to a single token: {ids}")
+        return ids
+    t_ids = [_enc_single(t) for t in think_tags]
+    a_ids = [_enc_single(t) for t in ans_tags]
+    if verbose:
+        import sys as _sys
+        _sys.stderr.write(f"think_stop={list(think_tags)} ids={t_ids}\nanswer_stop={list(ans_tags)} ids={a_ids}\n")
+
     stop_think = StopOnTags(tokenizer, think_tags, max_new=None)
     ratio = float(svc.get("soft_cap_slack_ratio"))
     soft_cap = SlackStop(base_len=input_ids.shape[1], budget=int(think_budget), slack_ratio=ratio)
@@ -399,22 +520,15 @@ def decode_with_budget(
     gen1 = seqs1[0, input_ids.shape[1]:]
     text1 = tokenizer.decode(gen1, skip_special_tokens=True)
 
-    # Count think tokens used (stop at first configured closing tag if present)
+    # Count think tokens used via helper
     try:
-        g = gen1.tolist()
-        used = len(g)
-        # search for any configured closing tag; choose earliest match index from the end scan
+        close_ids_list = []
         for tag in think_tags:
             try:
-                close_ids = tokenizer.encode(str(tag), add_special_tokens=False)
+                close_ids_list.append(tokenizer.encode(str(tag), add_special_tokens=False))
             except Exception:
-                close_ids = tokenizer(str(tag), add_special_tokens=False).input_ids
-            k = len(close_ids)
-            if k > 0:
-                for i in range(max(0, len(g) - k), -1, -1):
-                    if g[i:i + k] == close_ids:
-                        used = min(used, i)
-                        break
+                close_ids_list.append(tokenizer(str(tag), add_special_tokens=False).input_ids)
+        used = _count_think_tokens(seqs1[0], close_ids_list, base_len=input_ids.shape[1], cap=int(think_budget), slack_ratio=ratio)
     except Exception:
         used = int(gen1.shape[0])
 
@@ -451,7 +565,16 @@ def decode_with_budget(
     body = (text1 or "") + (text2 or "")
     if visible_cot:
         return {"text": body.strip(), "think_tokens_used": int(used)}
-    return {"text": _extract_answer(body, include_think=False), "think_tokens_used": int(used)}
+    ans = _extract_answer(body, include_think=False)
+    # Sanitize any decomposition or think tags if they leaked into answer
+    try:
+        for tag in ("<think>", "</think>", "<plan>", "</plan>", "<exec>", "</exec>", "<eval>", "</eval>"):
+            ans = ans.replace(tag, "")
+        import re as _re
+        ans = _re.sub(r"<strategy:[^>]+>", "", ans).strip()
+    except Exception:
+        pass
+    return {"text": ans, "think_tokens_used": int(used)}
 
 
 def check_answer_invariance_for_hints(
@@ -515,7 +638,24 @@ def _check_config_cli(root: Optional[str] = None, service_config_path: Optional[
                 _os.environ["SERVICE_CONFIG_PATH"] = str(cand)
         # Lazy import to honor CONFIG_ROOT at import time
         from tools import validate_configs as _vc  # type: ignore
-        return int(_vc.main())
+        rc = int(_vc.main())
+        # Also print stop tags and ids to stderr for human inspection
+        try:
+            svc = load_service_config()
+            from transformers import AutoTokenizer
+            tok = AutoTokenizer.from_pretrained(str(base / 'model' / 'Base'), use_fast=True, local_files_only=True, trust_remote_code=True)
+            def _enc(tag: str):
+                try:
+                    ids = tok.encode(tag, add_special_tokens=False)
+                except Exception:
+                    ids = tok(tag, add_special_tokens=False).input_ids
+                return ids if isinstance(ids, list) else list(ids)
+            import sys as _sys
+            _sys.stderr.write(f"think_stop={svc.get('think_stop_sequences')} ids={[ _enc(t) for t in svc.get('think_stop_sequences') ]}\n")
+            _sys.stderr.write(f"answer_stop={svc.get('stop_sequences')} ids={[ _enc(t) for t in svc.get('stop_sequences') ]}\n")
+        except Exception:
+            pass
+        return rc
     except SystemExit as se:
         return int(getattr(se, "code", 1) or 0)
     except Exception as e:

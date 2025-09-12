@@ -70,6 +70,42 @@ class SlackStop(StoppingCriteria):
         limit = int(self.budget * (1.0 + self.slack_ratio))
         return cur_new > limit
 
+def _to_list(x):
+    try:
+        import torch as _t
+        if _t.is_tensor(x):
+            return list(x.view(-1).detach().cpu().tolist())
+    except Exception:
+        pass
+    return list(x)
+
+def _count_think_tokens(gen_ids, close_ids_list, base_len: int, cap: int, slack_ratio: float) -> int:
+    """
+    Count actual <think> tokens used between base_len and the earliest of
+    - the first occurrence of any closing tag sequence in close_ids_list, or
+    - the soft-cap boundary base_len + cap * (1 + slack_ratio).
+    gen_ids: list[int] or Tensor; close_ids_list: list[list[int]]
+    Returns an int >= 0.
+    """
+    g = _to_list(gen_ids)
+    if base_len < 0:
+        base_len = 0
+    end_soft = base_len + int(max(0, int(cap)) * (1.0 + float(slack_ratio)))
+    end_soft = min(end_soft, len(g))
+    earliest = end_soft
+    for cid in (close_ids_list or []):
+        k = len(cid)
+        if k <= 0 or k > len(g) - base_len:
+            continue
+        # slide forward from base_len
+        for j in range(base_len, len(g) - k + 1):
+            if g[j:j + k] == cid:
+                if j < earliest:
+                    earliest = j
+                break
+    used = max(0, earliest - base_len)
+    return used
+
 class IntrospectiveEngine:
     """
     Wrap a (peft) CausalLM with additive scaffolding and serve visible/hidden CoT.
@@ -363,6 +399,13 @@ class IntrospectiveEngine:
             out = re.sub(r"<strategy:[^>]+>", "", out).strip()
         except Exception:
             pass
+        # Also strip any decomposition/think tags if they accidentally appear in answer text
+        try:
+            for tag in ("<think>", "</think>", "<plan>", "</plan>", "<exec>", "</exec>", "<eval>", "</eval>"):
+                out = out.replace(tag, "")
+            out = out.strip()
+        except Exception:
+            pass
         return out
 
     def generate_cot(self, messages: List[Dict[str, str]], max_new_tokens: int = 512,
@@ -476,17 +519,18 @@ class IntrospectiveEngine:
             gen1 = seqs1[0, input_ids.shape[1]:]
             text1 = self.tok.decode(gen1, skip_special_tokens=True)
 
-            # Count think tokens actually used (tokens before closing tag if present)
+            # Count think tokens actually used (tokens before closing tag or soft-cap)
             try:
-                close_ids = self.tok.encode("</think>", add_special_tokens=False)
-                g = gen1.tolist()
-                used = len(g)
-                k = len(close_ids)
-                if k > 0:
-                    for i in range(max(0, len(g) - k), -1, -1):
-                        if g[i:i + k] == close_ids:
-                            used = i
-                            break
+                think_closes = []
+                for tag in tuple(getattr(self, "_stop_think_tags", ("</think>",))):
+                    try:
+                        think_closes.append(self.tok.encode(tag, add_special_tokens=False))
+                    except Exception:
+                        pass
+                used = _count_think_tokens(
+                    out1[0], think_closes, base_len=input_ids.shape[1], cap=int(think_budget),
+                    slack_ratio=float(getattr(self, "_slack_ratio", 0.2))
+                )
             except Exception:
                 used = int(gen1.shape[0])
 
@@ -569,7 +613,7 @@ class IntrospectiveEngine:
             gate_mean = float(sum(ga)/len(ga)) if ga else None
         except Exception:
             gate_mean = None
-        # Record strategy tags observed in outputs
+        # Record strategy/decomposition tags observed in outputs
         try:
             strat_tags = []
             for s in re.findall(r"<strategy:([^>]+)>", (text1 or "") + (text2 or "")):
@@ -577,19 +621,30 @@ class IntrospectiveEngine:
                     strat_tags.append(s)
         except Exception:
             strat_tags = []
+        try:
+            txt_all = (text1 or "") + (text2 or "")
+            decomp = {
+                "plan": ("<plan>" in txt_all and "</plan>" in txt_all),
+                "exec": ("<exec>" in txt_all and "</exec>" in txt_all),
+                "eval": ("<eval>" in txt_all and "</eval>" in txt_all),
+            }
+        except Exception:
+            decomp = {}
         self.last_stats.update({
             "answer_tokens_max": max_new_tokens,
             "gate_activity_mean": gate_mean,
-            "think_tokens_used": locals().get("used", None),
+            "think_tokens_used": int(locals().get("used", 0) or 0),
+            "think_budget": int(locals().get("think_budget", 0) or 0),
             "visible_cot": bool(self.cfg.visible_cot),
             "strategy_tags": strat_tags,
+            "decomp_present": decomp,
         })
         if self.cfg.visible_cot:
             return (text1 + text2).strip()
         out_text = _extract_answer((text1 or "") + (text2 or ""), include_think=False)
         # Defensive leakage check: no reasoning tags should remain in hidden mode
         try:
-            tags = ("<think>", "</think>", "<answer>", "</answer>")
+            tags = ("<think>", "</think>", "<answer>", "</answer>", "<plan>", "</plan>", "<exec>", "</exec>", "<eval>", "</eval>")
             if any(t in (out_text or "") for t in tags):
                 # record leakage and hard-strip tags as failsafe
                 self.last_stats["leakage"] = 1
