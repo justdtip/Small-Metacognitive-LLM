@@ -155,6 +155,21 @@ def compute_eval_metrics(records: List[Dict[str, Any]]) -> Dict[str, Any]:
             except Exception:
                 pass
 
+        # Evidence coverage if evidence_keys provided
+        if isinstance(r.get("evidence_keys"), list) and r.get("evidence_keys"):
+            th_span = _extract_think_span(body)
+            keys = [str(k) for k in r.get("evidence_keys")]
+            lo = th_span.lower()
+            num = 0
+            for k in keys:
+                try:
+                    if str(k).lower() in lo:
+                        num += 1
+                except Exception:
+                    pass
+            if len(keys) > 0:
+                think_scores.append(float(num / len(keys)))
+
     acc = sum(corrects) / max(1, len(corrects))
     plan_acc = (plan_hits / plan_total) if plan_total > 0 else None
     budget_mae = (sum(b_err_abs) / len(b_err_abs)) if b_err_abs else None
@@ -316,6 +331,7 @@ def decode_with_budget(
     repetition_penalty: float = 1.1,
     ignore_eos: bool = False,
     visible_cot: bool = False,
+    style_tag: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Generate using a soft-cap budget for the <think> segment and StopOnTags for </think> and </answer>.
@@ -328,6 +344,14 @@ def decode_with_budget(
     device = next(model.parameters()).device if hasattr(model, "parameters") else getattr(model, "device", "cpu")
     input_ids = input_ids.to(device)
     attention_mask = torch.ones_like(input_ids)
+    # Optional style hint before THINK
+    if style_tag:
+        try:
+            hint = tokenizer(f"<style:{style_tag}>", add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+            input_ids = torch.cat([input_ids, hint], dim=1)
+            attention_mask = torch.ones_like(input_ids)
+        except Exception:
+            pass
     eos_id = None if ignore_eos else getattr(tokenizer, "eos_token_id", None)
 
     # THINK with soft cap + closing tag from service config
@@ -409,3 +433,30 @@ def decode_with_budget(
     if visible_cot:
         return {"text": body.strip(), "think_tokens_used": int(used)}
     return {"text": _extract_answer(body, include_think=False), "think_tokens_used": int(used)}
+
+def inject_noise_markers_into_think(body: str, markers: Optional[List[str]] = None) -> str:
+    markers = markers or ["Step 1:", "===="]
+    i = body.find("<think>")
+    j = body.find("</think>", i + len("<think>")) if i != -1 else -1
+    if i != -1 and j != -1:
+        pre = body[:i + len("<think>")]
+        mid = body[i + len("<think>"):j]
+        post = body[j:]
+        injected = " ".join(markers) + "\n" + mid
+        return pre + injected + post
+    return body
+
+def noise_probe(records: List[Dict[str, Any]], markers: Optional[List[str]] = None) -> Dict[str, float]:
+    base = compute_eval_metrics(records)
+    rec2: List[Dict[str, Any]] = []
+    for r in records:
+        b = (r.get('body') or '')
+        b2 = inject_noise_markers_into_think(b, markers)
+        rr = dict(r)
+        rr['body'] = b2
+        rec2.append(rr)
+    alt = compute_eval_metrics(rec2)
+    return {
+        'delta_accuracy': float((alt.get('accuracy') or 0.0) - (base.get('accuracy') or 0.0)),
+        'delta_budget': float((alt.get('think_tokens_mean') or 0.0) - (base.get('think_tokens_mean') or 0.0)),
+    }

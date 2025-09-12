@@ -136,7 +136,7 @@ def aggregate(
     records: List[Dict[str, Any]],
     compute_fn: Callable[[List[Dict[str, Any]]], Dict[str, Any]],
     *,
-    slice_keys: Optional[Iterable[str]] = ("plan_src", "budget_src"),
+    slice_keys: Optional[Iterable[str]] = ("plan_src", "budget_src", "style_tag"),
 ) -> Dict[str, Any]:
     """
     Aggregate metrics for overall data and slices by provenance keys.

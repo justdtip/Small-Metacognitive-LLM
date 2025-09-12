@@ -25,6 +25,8 @@ class EngineConfig:
     taps: Sequence[int] = (6, 10, 14)
     # optional calibration blob path (JSON): {"conf_temp": float}
     calibration_path: Optional[str] = None
+    # optional reasoning style tag to hint at serve (e.g., 'checklist','explainer')
+    style_tag: Optional[str] = None
 
 def _extract_answer(body: str, include_think: bool = False) -> str:
     def _slice(s: str, open_t: str, close_t: str) -> str:
@@ -357,7 +359,8 @@ class IntrospectiveEngine:
 
     def generate_cot(self, messages: List[Dict[str, str]], max_new_tokens: int = 512,
                      temperature: float = 0.7, top_p: float = 0.95, repetition_penalty: float = 1.1,
-                     ignore_eos: bool = False, stream: bool = False) -> str:
+                     ignore_eos: bool = False, stream: bool = False,
+                     style_tag: Optional[str] = None) -> str:
         # serialize per-engine to avoid cross-request hook state issues
         with self._gen_lock:
             # initialize leakage counter for this request
@@ -369,6 +372,16 @@ class IntrospectiveEngine:
             enc = self.tok.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_tensors="pt")
             input_ids = enc.to(self.model.device)
             attention_mask = torch.ones_like(input_ids)
+            # Optional style control: inject <style:TAG> just before THINK
+            use_style = style_tag if style_tag is not None else getattr(self.cfg, "style_tag", None)
+            try:
+                if use_style:
+                    hint = self.tok(f"<style:{use_style}>", add_special_tokens=False, return_tensors="pt").input_ids.to(self.model.device)
+                    input_ids = torch.cat([input_ids, hint], dim=1)
+                    attention_mask = torch.ones_like(input_ids)
+                    self.last_stats["style_tag"] = str(use_style)
+            except Exception:
+                pass
             eos_id = None if ignore_eos else getattr(self.tok, "eos_token_id", None)
 
             # Decide reasoning budget

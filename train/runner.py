@@ -199,7 +199,8 @@ def adapter_gate_step_smoke() -> Dict[str, Any]:
 
 def _train_step(model: nn.Module, batch: Dict[str, Any], *, step: int = 0, total_steps: int = 1000,
                 final_aux_weights: Dict[str, float] | None = None,
-                taps: Sequence[int] | None = None) -> Dict[str, Any]:
+                taps: Sequence[int] | None = None,
+                style_entropy_weight: float = 0.0) -> Dict[str, Any]:
     """
     Minimal training step that wires metacog auxiliaries into compute_losses.
     Uses a simple annealing schedule for {plan_ce, budget_reg, conf_cal} weights.
@@ -314,6 +315,29 @@ def _train_step(model: nn.Module, batch: Dict[str, Any], *, step: int = 0, total
             conf_logits=conf_logits if conf_labels is not None else None,
             conf_labels=conf_labels,
         )
+    # Style entropy bonus (encourage diversity across styles; ignore unknown=-1)
+    try:
+        sid = batch.get("style_id")
+        style_pen = 0.0
+        if style_entropy_weight > 0.0 and isinstance(sid, torch.Tensor):
+            s = sid.view(-1)
+            mask = (s >= 0)
+            if mask.any():
+                vals = s[mask].to(torch.long)
+                # compute histogram over present styles
+                K = int(vals.max().item()) + 1
+                hist = torch.bincount(vals, minlength=max(1, K)).float()
+                total = hist.sum().clamp_min(1.0)
+                p = (hist / total).clamp_min(1e-8)
+                H = -(p * p.log()).sum()
+                norm = torch.log(torch.tensor(float(len(p)), dtype=H.dtype, device=H.device)).clamp_min(1.0)
+                Hn = (H / norm).clamp(0.0, 1.0)
+                style_pen = float((1.0 - Hn).item())
+                out["total"] = out["total"] + style_entropy_weight * torch.tensor(style_pen, dtype=out["total"].dtype, device=out["total"].device)
+                out["style_entropy"] = torch.tensor(style_pen, dtype=out["total"].dtype, device=out["total"].device)
+    except Exception:
+        pass
+
     # Adapter gate coverage logging (mean across adapters) if available on model/scaffold
     cov = None
     try:

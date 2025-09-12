@@ -51,113 +51,17 @@ def make_collate_fn(
         budget_srcs: List[str] = []
         think_lens: List[int] = []
         diff_bins: List[int] = []
+        style_ids: List[int] = []
+        style_tags: List[str] = []
+        rubric_scores: List[float] = []
+        evidence_meta: List[List[str]] = []
+        wrongthink_labels: List[float] = []
 
         def _has_exact_one_pair(s: str, open_t: str, close_t: str) -> bool:
             return s.count(open_t) == 1 and s.count(close_t) == 1 and (s.find(open_t) < s.rfind(close_t))
 
         for idx, ex in enumerate(batch):
-            if strict and ("text" not in ex or not (ex.get("text") or "").strip()):
-                raise ValueError(f"Missing 'text' field at record {idx}")
-
-            raw_text = (ex.get("text") or "").strip()
-            # Enforce tag integrity: exactly one <think>..</think> and one <answer>..</answer>
-            if strict:
-                ok_think = _has_exact_one_pair(raw_text, "<think>", "</think>")
-                ok_ans = _has_exact_one_pair(raw_text, "<answer>", "</answer>")
-                if not (ok_think and ok_ans):
-                    raise ValueError(f"Malformed tags at record {idx}: require exactly one <think>..</think> and one <answer>..</answer>")
-                text = raw_text
-            else:
-                # Legacy fallback: wrap content if malformed
-                ok_think = _has_exact_one_pair(raw_text, "<think>", "</think>")
-                ok_ans = _has_exact_one_pair(raw_text, "<answer>", "</answer>")
-                if not (ok_think and ok_ans):
-                    text = f"<think> {raw_text} </think> <answer> </answer>"
-                else:
-                    text = raw_text
-
-            ids, attn, loss_m, think_m, ans_m = segment_and_masks(text, tokenizer, loss_on=loss_on)
-            items.append((ids, attn, loss_m, think_m, ans_m))
-            # Think length (tokens) from mask
-            # Prefer on-policy decode count if provided on the example
-            th_len = int(ex.get("think_tokens_used")) if (ex.get("think_tokens_used") is not None) else int(sum(think_m))
-            think_lens.append(th_len)
-
-            # Plan class with provenance
-            p = ex.get("plan_class")
-            if p is None:
-                lo, hi = plan_buckets
-                if th_len <= int(lo):
-                    p = 0
-                elif th_len <= int(hi):
-                    p = 1
-                else:
-                    p = 2
-                plan_srcs.append("heuristic")
-            else:
-                plan_srcs.append(str(ex.get("plan_src") or "gold"))
-            plan_targets.append(int(p))
-
-            # Budget target with provenance
-            b = ex.get("target_budget")
-            if b is None:
-                b = int(max(1, round(float(budget_alpha) * th_len)))
-                budget_srcs.append("heuristic")
-            else:
-                budget_srcs.append(str(ex.get("budget_src") or "gold"))
-            target_budget.append(int(b))
-
-            # Correctness label (optional); -1 if unknown
-            c = ex.get("correct")
-            correctness.append(int(c) if c is not None else -1)
-
-            # Difficulty bin (optional); default -1 if unknown
-            db = ex.get("difficulty_bin", None)
-            diff_bins.append(int(db) if db is not None else -1)
-
-        batch_dict = pad_and_stack(items, pad_id=getattr(tokenizer, "pad_token_id", 0) or 0)
-
-        if torch is not None:
-            batch_dict["plan_targets"] = torch.tensor(plan_targets, dtype=torch.long)
-            batch_dict["target_budget"] = torch.tensor(target_budget, dtype=torch.long)
-            batch_dict["correctness"] = torch.tensor(correctness, dtype=torch.long)
-            batch_dict["difficulty_bin"] = torch.tensor(diff_bins, dtype=torch.long)
-        else:  # pragma: no cover
-            batch_dict["plan_targets"] = plan_targets
-            batch_dict["target_budget"] = target_budget
-            batch_dict["correctness"] = correctness
-            batch_dict["difficulty_bin"] = diff_bins
-        # Attach provenance and diagnostics
-        batch_dict["plan_src"] = plan_srcs
-        batch_dict["budget_src"] = budget_srcs
-        batch_dict["think_tokens_used"] = think_lens
-        return batch_dict
-
-    return _collate
-
-def pad_and_stack(items: List[Tuple[List[int], List[int], List[int], List[int], List[int]]], pad_id: int = 0) -> Dict[str, Any]:
-    """
-    Pad a batch of (input_ids, attention_mask, loss_mask, think_mask, answer_mask) to equal length and stack.
-    Returns dict with keys: input_ids, attention_mask, loss_mask, think_mask, answer_mask.
-    If torch is available, returns Long/Bool tensors; otherwise lists.
-    """
-    if not items:
-        return {"input_ids": [], "attention_mask": [], "loss_mask": [], "think_mask": [], "answer_mask": []}
-    max_len = max(len(x[0]) for x in items)
-    def _pad(seq: List[int], v: int, L: int) -> List[int]:
-        return seq + [v] * (L - len(seq))
-    ids_batch: List[List[int]] = []
-    attn_batch: List[List[int]] = []
-    loss_batch: List[List[int]] = []
-    think_batch: List[List[int]] = []
-    ans_batch: List[List[int]] = []
-    for inp, attn, loss, think, ans in items:
-        ids_batch.append(_pad(inp, pad_id, max_len))
-        attn_batch.append(_pad(attn, 0, max_len))
-        loss_batch.append(_pad(loss, 0, max_len))
-        think_batch.append(_pad(think, 0, max_len))
-        ans_batch.append(_pad(ans, 0, max_len))
-    if torch is None:
+         if torch is None:
         return {
             "input_ids": ids_batch,
             "attention_mask": attn_batch,
