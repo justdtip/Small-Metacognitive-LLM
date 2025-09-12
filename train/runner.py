@@ -447,6 +447,10 @@ def rl_phase_step(model: nn.Module, batch: Dict[str, Any], *, policy=None, opt=N
     # Prepare policy and optimizer
     from train.rl_loop import GaussianBudgetPolicy, reinforce_step
     pol = policy or GaussianBudgetPolicy(in_dim=feats.shape[-1], max_budget=int(B_max))
+    try:
+        pol = pol.to(feats.device)
+    except Exception:
+        pass
     if opt is None:
         # Slightly higher LR to ensure observable adaptation in short test loops
         opt = torch.optim.Adam(pol.parameters(), lr=5e-2)
@@ -685,13 +689,30 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
             # RL budget update under no_grad features
             pol, stats = rl_phase_step(model, batch, policy=pol, B_max=int(budget_cap))
             rl_stats.append(stats)
-            # Log RL stats line
+            # Log RL stats line (include decomp telemetry if present)
             try:
+                # Optional decomposition telemetry from batch masks
+                import torch as _t
+                denom = None
+                if isinstance(batch.get("think_mask"), _t.Tensor):
+                    denom = float(batch["think_mask"].to(dtype=_t.float32).sum().item())
+                def _sum_mask(m):
+                    if isinstance(m, _t.Tensor):
+                        return float(m.to(dtype=_t.float32).sum().item())
+                    return None
+                plan_tok = _sum_mask(batch.get("plan_mask"))
+                exec_tok = _sum_mask(batch.get("exec_mask"))
+                eval_tok = _sum_mask(batch.get("eval_mask"))
+                plan_frac = (plan_tok/denom) if (denom and denom>0 and plan_tok is not None) else None
+                exec_frac = (exec_tok/denom) if (denom and denom>0 and exec_tok is not None) else None
+                eval_frac = (eval_tok/denom) if (denom and denom>0 and eval_tok is not None) else None
                 print(json.dumps({
                     "train_step": int(t),
                     "rl": {
                         "think_tokens_used": int(used),
-                        **{k: float(v) for k, v in stats.items() if isinstance(v, (int, float))}
+                        **{k: float(v) for k, v in stats.items() if isinstance(v, (int, float))},
+                        "plan_tokens": plan_tok, "exec_tokens": exec_tok, "eval_tokens": eval_tok,
+                        "plan_fraction": plan_frac, "exec_fraction": exec_frac, "eval_fraction": eval_frac,
                     }
                 }))
             except Exception:
