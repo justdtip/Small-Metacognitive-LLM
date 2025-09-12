@@ -18,7 +18,6 @@ venv/
 logs/
 *.log
 *.log.jsonl
-*.jsonl
 *.transcript.txt
 *transcript*.txt
 
