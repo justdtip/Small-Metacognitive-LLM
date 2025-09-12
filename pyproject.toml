@@ -36,3 +36,13 @@ exclude = [
   "^model/",
 ]
 
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = [
+  "tests",
+]
+addopts = "-q"
+filterwarnings = [
+  # Torch occasionally emits size mismatch warnings during Huber on scalars in tests; keep noise low
+  "ignore:Using a target size.*different to the input size.*:UserWarning",
+]

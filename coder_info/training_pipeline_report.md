@@ -1,3 +1,66 @@
+# TRAINING PIPELINE REPORT
+
+## Training Pipeline — Architecture & Interdependence Digest (drop into `training_pipeline_report.md`)
+
+### Project goals (recap)
+
+- **Additive metacognition:** keep the base LM intact; add **side adapters** (gated residual deltas) and **metacognitive heads** to (a) plan, (b) allocate a **think** budget, and (c) estimate confidence; default to **hidden CoT**; enforce strong **serve/eval parity**.
+- **Strategy over syntax:** teach *how to think* via supervision of strategy/operations, subgoals, invariants, analogical structure, and consistency (e.g., paraphrase/rewrites, multi-branch search) rather than mimicking CoT phrasing.
+- **Budget awareness:** accuracy must improve or hold while the `<think>` token budget stays constant or drops; support **dynamic budget selection**; penalize overspending.
+- **Calibration & safety:** calibrated confidence, leakage≈0 of hidden CoT, and robust config/tag guardrails.
+
+### Code map — components and responsibilities
+
+#### Runtime & scaffolding (`tina/*`)
+- **`tina/serve.py`** — IntrospectiveEngine; applies **StopOnTags** and **SlackStop**; mounts **side adapters** via `IntrospectionScaffold`; hosts **generate_cot**; strips `<think>` by default; exposes telemetry (budget, plan, confidence, leakage).
+- **`tina/side_adapters.py`** — Additive **LowRankAdapter** with **HardConcrete** per-token gate; records `_last_gate_activity` and `_last_gate_coverage`; `IntrospectionScaffold` attaches adapters to decoder layers; activates only inside `scaffold.think()` (segment-conditional).
+- **`tina/metacog_heads.py`** — Pools tapped hidden layers; returns **plan logits**, **budget**, **confidence**; (extensions: cognitive ops, strategy logits, constraint vector, reflection/subgoal heads).
+- **`tina/tokenizer_utils.py`** — Enforces atomic special tags (`<think> </think> <answer> </answer>`) and (extensions) `<reflect> </reflect>`, `<program> </program>`; builds segmentation masks.
+
+#### Training & evaluation (`train/*`)
+- **`train/data.py`** — JSONL contract; tokenizes **text**; emits `think_mask`, `answer_mask`, `loss_mask`; attaches labels (`plan_targets`, `target_budget`, `correctness`, `difficulty_bin`); strict tag integrity; (extensions) `think_tokens_used`, `style/strategy` vectors, `constraint_vec`, `reflection_summary`, `program_solution`, `step_types`, `subgoal_id`, `rewrite_pair_id`.
+- **`train/losses.py`** — Primary **answer CE**; optional **quiet-star**; auxiliary **plan/budget/confidence**; **gate sparsity**; (extensions) **style invariance KL** (change_12), **rewrite consistency KL** (change_19), **constraint BCE** (change_31), **reflection/program CE** (change_32/33), **analogy**, **NLI contradiction**.
+- **`train/runner.py`** — Orchestrates train steps; **on-policy** `<think>` sampling via `decode_with_budget`; **RL budget** update; logs gate coverage; (extensions) multi-branch GRPO.
+- **`train/eval_loop.py`** — `decode_with_budget` with **service_config** parity; **quality-vs-budget** sweeps; confidence temperature fitting; CSV/JSON exports; answer extraction parity and leakage checks.
+- **`train/metrics.py`** — ECE/Brier, token-F1, rubric scoring hooks, aggregation & slicing (e.g., by provenance, style, strategy).
+- **`train/rl_loop.py`** — Gaussian budget policy + REINFORCE/DPO-like updates.
+- **`train/hooks.py`** — `think_mask_context` to pass segment mask to adapters.
+
+#### Config & validation (`config/*`, `tools/*`)
+- **`config/service_config.json`** — Stop sequences (`</think>`, `</answer>`), default visibility, slack ratio, calibration path. Shared by **serve** and **decode_with_budget**.
+- **`adapter_config.json`, `generation_config.json`** — Adapter targets & generation defaults (temperature, top-p).
+- **`tools/validate_configs.py`** — (should) assert tag atomicity and parity (train/eval/serve); fail fast on mismatches.
+
+### Script–config interdependence
+
+- **Stop/soft-cap parity**: `tina/serve.py` <-> `train/eval_loop.py` both read `config/service_config.json` for stop tags & slack ratio; tokenizer must encode tags as single tokens or stopping breaks.
+- **Adapters/heads device & dtype**: `tina/serve.py` derives target device/dtype from base model; training mirrors dtype in forward passes.
+- **Calibration**: `train/eval_loop.fit_confidence_temperature_and_save` writes a JSON; `tina/serve.py` loads it (and optionally plan thresholds/budget clip) to adjust outputs.
+- **On-policy decode**: `train/runner.py` calls `train/eval_loop.decode_with_budget`, which must honor **service_config**; runner feeds `think_tokens_used` and `correctness` into **rl_loop**.
+
+### Data contract (strict mode)
+
+Every record MUST have `text` containing **exactly one** `<think>...</think>` and **exactly one** `<answer>...</answer>`. Optional fields enrich training:
+- **Budget/plan/conf:** `plan_class`, `target_budget`, `correct`.
+- **On-policy fields:** `think_tokens_used` (preferred when present).
+- **Strategy/ops:** `style_tag`, `strategy_tags`, `cog_ops`.
+- **Quality & checks:** `rubric_score`, `evidence_keys`, `invariants`, `premise_spans`.
+- **Analogy/grid:** `analogy_sets`, `elimination_grid`.
+- **Rewrite pairs:** `rewrite_pair_id` (for change_19 paraphrase consistency).
+- **Reflection & program-of-thought:** `reflection_summary`, `program_solution` (hidden by default at serve).
+
+### Current status snapshot (what works vs. needs fixes)
+
+- ✅ **Hidden CoT, stop/soft-cap parity, leakage guard** wired in serve & eval.
+- ✅ **On-policy sampling** available in runner (smoke path) and parity decode exists.
+- ✅ **Collator strictness** (exact tags) + diagnostics fields present.
+- ⚠️ **change_19_consistency_under_rewrite**: **partial** — missing complete collation of `rewrite_pair_id`, robust pairing logic in the main training loop, and symmetric KL over answer-masked logits with variable-length handling.
+- ⚠️ **Main trainer integration** of on-policy decode (beyond smoke path) and gate coverage logs should be standardised.
+- ⚠️ **Config guardrails** and CI tests for tag atomicity/IDs and stop IDs across train/eval/serve must be enforced.
+- ⚠️ **Calibration blob** should persist plan thresholds & budget clip for serve-time parity.
+
+---
+
 1. Executive Summary
 
 - Scope: Reviewed training-time and serve-time code to verify metacognitive capabilities for hidden reasoning, plan/budget/confidence control, adapter-gated “slow thinking,” and parity of evaluation/decoding at serve time. Applied CoT‑Space lens (optimal chain length via bias–variance trade-off; noise↔length relation) to judge operationalization.
@@ -245,5 +308,5 @@ Complete List of Files Fulfilling Spec (by role)
 - Config harmony checks in `tools/assert_config_ids.py` and `tools/validate_configs.py`.
 - Tests cover: token atomicity, stop sequences, gating isolation, metacog bounds, parity, and reward sensitivity.
 
-— END —
+
 

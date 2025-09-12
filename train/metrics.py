@@ -216,3 +216,32 @@ def to_csv_json(data: Dict[str, Any], *, out_json: Optional[str] = None, out_csv
             w.writeheader()
             for r in flat_rows:
                 w.writerow(r)
+
+
+# --------- Rewrite consistency diagnostics ---------
+def rewrite_kl_mean(records: List[Dict[str, Any]]) -> float:
+    """
+    Compute the mean rewrite KL from a list of logs/records.
+    Accepts either {'rewrite_kl': value} or {'loss_rewrite_kl': value} style entries.
+    Returns 0.0 when unavailable.
+    """
+    vals: List[float] = []
+    for r in records or []:
+        v = None
+        if isinstance(r, dict):
+            if "rewrite_kl" in r:
+                v = r.get("rewrite_kl")
+            elif "loss_rewrite_kl" in r:
+                v = r.get("loss_rewrite_kl")
+        if v is not None:
+            try:
+                vals.append(float(v))
+            except Exception:
+                pass
+    if not vals:
+        return 0.0
+    import statistics
+    try:
+        return float(statistics.fmean(vals))
+    except Exception:
+        return float(sum(vals) / max(1, len(vals)))

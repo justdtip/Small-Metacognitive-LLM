@@ -6,6 +6,7 @@ import json
 import threading
 import torch
 from transformers import StoppingCriteria, StoppingCriteriaList, TextIteratorStreamer
+import re
 
 from .tokenizer_utils import ensure_reasoning_tokens
 
@@ -354,8 +355,15 @@ class IntrospectiveEngine:
             return body[start + len(ans_open):end].strip()
         # Fallback: trim up to the first closing if present, else return stripped answer_text
         if ans_close in answer_text:
-            return answer_text.split(ans_close)[0].replace(ans_open, "").strip()
-        return answer_text.strip()
+            out = answer_text.split(ans_close)[0].replace(ans_open, "").strip()
+        else:
+            out = answer_text.strip()
+        # Strategy invariance: strip any control tokens like <strategy:...> from final answers
+        try:
+            out = re.sub(r"<strategy:[^>]+>", "", out).strip()
+        except Exception:
+            pass
+        return out
 
     def generate_cot(self, messages: List[Dict[str, str]], max_new_tokens: int = 512,
                      temperature: float = 0.7, top_p: float = 0.95, repetition_penalty: float = 1.1,
@@ -561,11 +569,20 @@ class IntrospectiveEngine:
             gate_mean = float(sum(ga)/len(ga)) if ga else None
         except Exception:
             gate_mean = None
+        # Record strategy tags observed in outputs
+        try:
+            strat_tags = []
+            for s in re.findall(r"<strategy:([^>]+)>", (text1 or "") + (text2 or "")):
+                if s not in strat_tags:
+                    strat_tags.append(s)
+        except Exception:
+            strat_tags = []
         self.last_stats.update({
             "answer_tokens_max": max_new_tokens,
             "gate_activity_mean": gate_mean,
             "think_tokens_used": locals().get("used", None),
             "visible_cot": bool(self.cfg.visible_cot),
+            "strategy_tags": strat_tags,
         })
         if self.cfg.visible_cot:
             return (text1 + text2).strip()
@@ -579,6 +596,8 @@ class IntrospectiveEngine:
                 for t in tags:
                     out_text = out_text.replace(t, "") if out_text else out_text
                 out_text = (out_text or "").strip()
+            # Also strip any strategy control tokens from the final answer
+            out_text = re.sub(r"<strategy:[^>]+>", "", out_text or "").strip()
         except Exception:
             pass
         return out_text

@@ -133,13 +133,47 @@ def style_invariance_kl(
 def rewrite_consistency_kl(
     logits_a: torch.Tensor,
     logits_b: torch.Tensor,
-    mask_answer: torch.Tensor,
+    answer_mask_a: torch.Tensor,
+    answer_mask_b: torch.Tensor,
+    tau: float = 1.0,
 ) -> torch.Tensor:
     """
-    Paraphrase rewrite consistency: symmetric KL over answer positions between paraphrase variants.
-    Identical to style_invariance_kl but kept distinct for readability.
+    Paraphrase/rewrites answer-consistency on answer tokens only.
+    - Extract answer positions using masks for each sample
+    - Truncate to the minimum length to align positions across the pair
+    - Compute symmetric KL per position across vocab with softmax(logits/tau) and average over positions
+    Returns a scalar tensor.
     """
-    return style_invariance_kl(logits_a, logits_b, mask_answer)
+    # Normalize shapes
+    if logits_a.dim() == 3:
+        logits_a = logits_a.squeeze(0)
+    if logits_b.dim() == 3:
+        logits_b = logits_b.squeeze(0)
+    if answer_mask_a.dim() == 2:
+        answer_mask_a = answer_mask_a.squeeze(0)
+    if answer_mask_b.dim() == 2:
+        answer_mask_b = answer_mask_b.squeeze(0)
+
+    idx_a = (answer_mask_a > 0).nonzero(as_tuple=False).view(-1)
+    idx_b = (answer_mask_b > 0).nonzero(as_tuple=False).view(-1)
+    if idx_a.numel() == 0 or idx_b.numel() == 0:
+        return torch.tensor(0.0, dtype=logits_a.dtype, device=logits_a.device)
+    L = int(min(idx_a.numel(), idx_b.numel()))
+    if L <= 0:
+        return torch.tensor(0.0, dtype=logits_a.dtype, device=logits_a.device)
+    idx_a = idx_a[:L]
+    idx_b = idx_b[:L]
+    la = logits_a.index_select(dim=0, index=idx_a)
+    lb = logits_b.index_select(dim=0, index=idx_b)
+    tau = max(float(tau), 1e-6)
+    pa = torch.softmax(la / tau, dim=-1)
+    pb = torch.softmax(lb / tau, dim=-1)
+    log_pa = torch.log(pa.clamp_min(1e-8))
+    log_pb = torch.log(pb.clamp_min(1e-8))
+    kl_ab = (pa * (log_pa - log_pb)).sum(dim=-1)  # (L,)
+    kl_ba = (pb * (log_pb - log_pa)).sum(dim=-1)
+    sym = kl_ab + kl_ba
+    return sym.mean()
 
 
 def rubric_reg(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -196,6 +230,9 @@ def compute_losses(
     *,
     gate_modules=None,
     weights=None,
+    # batch-level masks and grouping for rewrite KL
+    answer_mask: Optional[torch.Tensor] = None,
+    rewrite_groups: Optional[list[list[int]]] = None,
     # metacog auxiliaries (optional)
     plan_logits: Optional[torch.Tensor] = None,
     plan_targets: Optional[torch.Tensor] = None,
@@ -365,23 +402,46 @@ def compute_losses(
     else:
         out["noise_marker_penalty"] = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
 
-    # Rewrite consistency KL (optional)
+    # Rewrite consistency KL (groups preferred; legacy pair path retained)
     w_rc = float(weights.get("rewrite_consistency", 0.0) or 0.0)
-    if w_rc > 0.0 and (rewrite_pair is not None):
+    rewrite_kl_val = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
+    if w_rc > 0.0 and (answer_mask is not None) and (rewrite_groups is not None):
+        try:
+            B = logits.shape[0]
+            per_group_vals = []
+            for grp in rewrite_groups:
+                if not isinstance(grp, (list, tuple)) or len(grp) < 2:
+                    continue
+                pair_vals = []
+                for i in range(len(grp)):
+                    for j in range(i + 1, len(grp)):
+                        ia, ib = int(grp[i]), int(grp[j])
+                        if 0 <= ia < B and 0 <= ib < B:
+                            val = rewrite_consistency_kl(logits[ia], logits[ib], answer_mask[ia], answer_mask[ib], tau=1.0)
+                            pair_vals.append(val)
+                if pair_vals:
+                    per_group_vals.append(torch.stack(pair_vals).mean())
+            if per_group_vals:
+                rewrite_kl_val = torch.stack(per_group_vals).mean()
+        except Exception:
+            pass
+
+    # Legacy single-pair path
+    if (w_rc > 0.0) and (rewrite_kl_val.detach().item() == 0.0) and (rewrite_pair is not None):
         try:
             la = rewrite_pair.get("logits_a")
             lb = rewrite_pair.get("logits_b")
             am = rewrite_pair.get("answer_mask")
             if (la is not None) and (lb is not None) and (am is not None):
-                rc = rewrite_consistency_kl(la, lb, am)
-                out["rewrite_consistency"] = rc
-                loss_total = loss_total + w_rc * rc
-            else:
-                out["rewrite_consistency"] = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
+                rewrite_kl_val = rewrite_consistency_kl(la, lb, am, am, tau=1.0)
         except Exception:
-            out["rewrite_consistency"] = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
-    else:
-        out["rewrite_consistency"] = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
+            pass
+
+    out["rewrite_kl_raw"] = rewrite_kl_val
+    out["rewrite_kl"] = w_rc * rewrite_kl_val
+    loss_total = loss_total + out["rewrite_kl"]
+    # Back-compat: keep key present for older tooling
+    out["rewrite_consistency"] = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
 
     out["total"] = loss_total
     return out

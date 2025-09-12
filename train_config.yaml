@@ -1,22 +1,27 @@
 model:
   base: model/Base
-  adapter_dir: model/Tina/checkpoint-2000
-  tap_layers: [6, 10, 14]
-loss:
-  answer_ce: 1.0
-  think_ce: 0.0
-  gate_reg: 1e-4
-eval:
-  stop_on: "</answer>"
-phases:
-  anneal_think_from: 0.0
-  anneal_think_to: 0.5
+  adapter:
+    path: model/Tina/checkpoint-2000
+data:
+  jsonl: data/train.jsonl
+  batch_size: 8
+  strict: true
+schedule:
   steps: 10000
-training:
-  phases:
-    phase_c:
-      enabled: false
-      algo: "DPO"  # or GRPO/PPO/KTO
-      budget_cap: 256
-      alpha: 0.01
-      format_bonus: 0.5
+  sample_every: 50
+  budget_cap: 128
+lambdas:
+  answer_ce: 1.0
+  gate_reg: 0.0001
+  plan_ce: 0.5
+  budget_reg: 0.1
+  conf_cal: 0.1
+  rewrite: 0.2
+  style_inv: 0.2
+taps: [6, 10, 14]
+logging:
+  eval_every: 500
+  out_dir: artifacts
+
+sample_every: 50
+budget_cap: 128

@@ -46,6 +46,7 @@ def ensure_reasoning_tokens(tokenizer, model=None) -> Dict[str, int]:
                 tok_ids = tokenizer(t, add_special_tokens=False).input_ids
             if not isinstance(tok_ids, list):
                 tok_ids = list(tok_ids)
+            # Fail fast if any tag is not atomic
             if len(tok_ids) != 1:
                 raise ValueError(f"Tag '{t}' splits into {tok_ids}. Check tokenizer rules.")
 

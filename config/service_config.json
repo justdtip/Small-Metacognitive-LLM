@@ -1,12 +1,12 @@
 {
-  "host": "0.0.0.0",
+  "host": "127.0.0.1",
   "port": 8000,
-  "bearer_token": "dev-secret",
+  "bearer_token": "",
   "input_tokens_cap": 8192,
   "max_new_tokens_cap": 1024,
-  "rate_limit_per_min": 60,
+  "rate_limit_per_min": 120,
   "visible_cot_default": false,
-  "confidence_calibration_path": "",
+  "confidence_calibration_path": "artifacts/heads_calibration.json",
   "stop_sequences": ["</answer>"],
   "think_stop_sequences": ["</think>"],
   "soft_cap_slack_ratio": 0.2

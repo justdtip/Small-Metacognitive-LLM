@@ -106,11 +106,16 @@ def run_one_cycle(args) -> Dict[str, Any]:
     adapter_path = adapter_root / "checkpoint-2000"
 
     device, dtype = _device_dtype()
-    # Load base
+    # Load base on a single device (prefer GPU/MPS); avoid CPU/GPU sharding
     model = AutoModelForCausalLM.from_pretrained(
-        str(base_path), device_map=("auto" if device != "cpu" else None), torch_dtype=dtype,
+        str(base_path), device_map=None, torch_dtype=dtype,
         trust_remote_code=True, local_files_only=True,
     )
+    try:
+        model.to(device)
+    except Exception:
+        # Fallback to CPU if transfer fails for any reason
+        model.to("cpu")
     tok = AutoTokenizer.from_pretrained(
         str(base_path), use_fast=True, trust_remote_code=True, local_files_only=True,
     )
@@ -122,6 +127,11 @@ def run_one_cycle(args) -> Dict[str, Any]:
     try:
         from peft import PeftModel  # type: ignore
         model = PeftModel.from_pretrained(model, str(adapter_path))
+        # Ensure adapter-wrapped model is resident on the same device
+        try:
+            model.to(device)
+        except Exception:
+            model.to("cpu")
     except Exception as e:
         sys.stderr.write(f"warn: PEFT adapter not loaded ({type(e).__name__}: {e}); continuing with base model\n")
 
@@ -143,7 +153,12 @@ def run_one_cycle(args) -> Dict[str, Any]:
     stop_sequences = list(svc.get("stop_sequences") or ["</answer>"])
 
     batch = next(iter(dl))
-    input_ids = batch["input_ids"].to(model.device)
+    # Move inputs to the model's device
+    try:
+        model_device = next(model.parameters()).device
+    except Exception:
+        model_device = torch.device(device)
+    input_ids = batch["input_ids"].to(model_device)
 
     # Teacher-forcing labels masked to answers
     labels = input_ids.clone()
@@ -152,7 +167,7 @@ def run_one_cycle(args) -> Dict[str, Any]:
     labels = torch.where(batch["loss_mask"].to(labels.device).bool(), labels, torch.full_like(labels, -100))
 
     # One forward/backward under think context and adapter think-mode
-    with think_mask_context(batch["think_mask"].to(model.device).float()):
+    with think_mask_context(batch["think_mask"].to(model_device).float()):
         with eng.scaffold.think():
             outputs = model(input_ids=input_ids, output_hidden_states=True, return_dict=True, use_cache=False)
             logits = outputs.logits
@@ -179,6 +194,17 @@ def run_one_cycle(args) -> Dict[str, Any]:
     plan_targets = batch.get("plan_targets") if (torch.is_tensor(batch.get("plan_targets")) and (batch["plan_targets"] >= 0).any()) else None
     budget_target = batch.get("target_budget") if (torch.is_tensor(batch.get("target_budget")) and (batch["target_budget"] >= 0).any()) else None
     conf_labels = batch.get("correctness") if (torch.is_tensor(batch.get("correctness")) and (batch["correctness"] >= 0).any()) else None
+    # Ensure label tensors live on the same device as model/logits
+    try:
+        model_device = next(model.parameters()).device
+    except Exception:
+        model_device = torch.device(device)
+    if torch.is_tensor(plan_targets):
+        plan_targets = plan_targets.to(model_device)
+    if torch.is_tensor(budget_target):
+        budget_target = budget_target.to(model_device)
+    if torch.is_tensor(conf_labels):
+        conf_labels = conf_labels.to(model_device)
 
     # Weights
     weights = {

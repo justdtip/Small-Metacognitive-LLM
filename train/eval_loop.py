@@ -2,11 +2,18 @@ from __future__ import annotations
 from typing import List, Dict, Any, Iterable, Callable, Optional
 from pathlib import Path
 import json
+import sys
 import torch
-from tina.serve import _extract_answer, StopOnTags, SlackStop
 from pathlib import Path
 import json as _json
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from tina.serve import _extract_answer, StopOnTags, SlackStop
 from train.metrics import temperature_fit, ece_binary, f1_token
+import os as _os
 
 
 def eval_extract_answers(texts: List[str]) -> List[str]:
@@ -131,9 +138,13 @@ def compute_eval_metrics(records: List[Dict[str, Any]]) -> Dict[str, Any]:
             conf_probs.append(float(r["conf_prob"]))
             conf_labels.append(int(corrects[-1]))
 
-        if "gate_coverage" in r and r.get("gate_coverage") is not None:
+        # Collect adapter gate coverage from either legacy or new key
+        gv = r.get("gate_coverage")
+        if gv is None:
+            gv = r.get("gate_coverage_mean")
+        if gv is not None:
             try:
-                gate_covs.append(float(r.get("gate_coverage")))
+                gate_covs.append(float(gv))
             except Exception:
                 pass
 
@@ -289,8 +300,14 @@ def load_service_config(root: Optional[str] = None) -> Dict[str, Any]:
     Returns a dict with keys: visible_cot_default, stop_sequences, think_stop_sequences, confidence_calibration_path.
     """
     try:
-        base = Path(root) if root else Path(__file__).resolve().parents[1]
-        p = base / "config" / "service_config.json"
+        # Env overrides for tests and tooling
+        env_path = _os.environ.get("SERVICE_CONFIG_PATH")
+        if env_path:
+            p = Path(env_path)
+        else:
+            base_env = _os.environ.get("CONFIG_ROOT")
+            base = Path(base_env) if base_env else (Path(root) if root else Path(__file__).resolve().parents[1])
+            p = base / "config" / "service_config.json"
         if not p.exists():
             return {
                 "visible_cot_default": False,
@@ -356,10 +373,10 @@ def decode_with_budget(
 
     # THINK with soft cap + closing tag from service config
     svc = load_service_config()
-    think_tags = tuple((svc.get("think_stop_sequences") or ["</think>"]))
-    ans_tags = tuple((svc.get("stop_sequences") or ["</answer>"]))
+    think_tags = tuple(svc.get("think_stop_sequences"))
+    ans_tags = tuple(svc.get("stop_sequences"))
     stop_think = StopOnTags(tokenizer, think_tags, max_new=None)
-    ratio = float(svc.get("soft_cap_slack_ratio", slack_ratio))
+    ratio = float(svc.get("soft_cap_slack_ratio"))
     soft_cap = SlackStop(base_len=input_ids.shape[1], budget=int(think_budget), slack_ratio=ratio)
 
     with torch.no_grad():
@@ -401,8 +418,10 @@ def decode_with_budget(
     except Exception:
         used = int(gen1.shape[0])
 
-    if "</think>" not in text1:
-        text1 = text1 + "</think>\n"
+    if not any(tag in text1 for tag in think_tags):
+        # Append the configured closing tag to keep downstream assembly stable
+        close_tag = think_tags[0] if think_tags else "</think>"
+        text1 = text1 + close_tag + "\n"
 
     # ANSWER until </answer>
     ans_tok = tokenizer("<answer>", add_special_tokens=False, return_tensors="pt").input_ids.to(device)
@@ -433,6 +452,97 @@ def decode_with_budget(
     if visible_cot:
         return {"text": body.strip(), "think_tokens_used": int(used)}
     return {"text": _extract_answer(body, include_think=False), "think_tokens_used": int(used)}
+
+
+def check_answer_invariance_for_hints(
+    tokenizer,
+    model,
+    prompt: str,
+    hints: Iterable[str],
+    *,
+    think_budget: int = 16,
+    max_new_tokens: int = 64,
+    temperature: float = 0.0,
+    decode_fn: Optional[Callable[..., Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """
+    Decode with multiple strategy hints and verify that extracted answers are invariant.
+    - Inject each hint as a control tag (test-time stubs may embed <strategy:...> in outputs).
+    - normalize answers by stripping any '<strategy:...>' control tokens before comparison.
+    Returns {'answers': {hint: answer}, 'all_equal': bool}.
+    """
+    import re as _re
+    decode = decode_fn or decode_with_budget
+    answers: Dict[str, str] = {}
+    # Build base prompt ids once
+    try:
+        enc = tokenizer(prompt, add_special_tokens=False, return_tensors="pt")
+        base_ids = getattr(enc, "input_ids", None) if not isinstance(enc, dict) else enc.get("input_ids")
+    except Exception:
+        base_ids = None
+    for h in hints:
+        # Visible mode to capture full body for normalization
+        out = decode(tokenizer, model, base_ids if base_ids is not None else [], think_budget=think_budget,
+                     max_new_tokens=max_new_tokens, temperature=temperature, visible_cot=True, style_tag=h)
+        body = out.get("text") or ""
+        ans = _extract_answer(body, include_think=False)
+        ans = _re.sub(r"<strategy:[^>]+>", "", ans).strip()
+        answers[str(h)] = ans
+    vals = list(answers.values())
+    all_equal = all(v == vals[0] for v in vals)
+    return {"answers": answers, "all_equal": all_equal}
+
+
+def _check_config_cli(root: Optional[str] = None, service_config_path: Optional[str] = None) -> int:
+    """
+    Run the same validation performed by tools/validate_configs.py, optionally against a provided root or config path.
+    If a custom service_config is provided, it will be copied into ROOT/config for validation scope.
+    Returns process exit code (0 OK, 1 errors printed to stderr).
+    """
+    import sys
+    from pathlib import Path as _P
+    base = _P(root) if root else _P(__file__).resolve().parents[1]
+    # Allow validator to read a custom service_config path without relocating model files
+    # Delegate to validator main() with CONFIG_ROOT override
+    try:
+        import os as _os
+        if service_config_path:
+            _os.environ["SERVICE_CONFIG_PATH"] = str(service_config_path)
+        else:
+            # If a root is provided and contains config/service_config.json, use it
+            cand = base / "config" / "service_config.json"
+            if cand.exists():
+                _os.environ["SERVICE_CONFIG_PATH"] = str(cand)
+        # Lazy import to honor CONFIG_ROOT at import time
+        from tools import validate_configs as _vc  # type: ignore
+        return int(_vc.main())
+    except SystemExit as se:
+        return int(getattr(se, "code", 1) or 0)
+    except Exception as e:
+        import sys as _sys
+        _sys.stderr.write(f"validation error: {type(e).__name__}: {e}\n")
+        return 1
+
+
+def _parse_args(argv=None):
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--check-config", action="store_true", help="Validate config/schema and serve/eval parity")
+    ap.add_argument("--root", default=None, help="Optional project root for service config lookup")
+    ap.add_argument("--service-config", default=None, help="Optional explicit path to a service_config.json to validate")
+    return ap.parse_args(argv)
+
+
+def main(argv=None):
+    args = _parse_args(argv)
+    if getattr(args, "check_config", False):
+        return _check_config_cli(args.root, args.service_config)
+    # No standalone CLI for eval loop otherwise
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 
 def inject_noise_markers_into_think(body: str, markers: Optional[List[str]] = None) -> str:
     markers = markers or ["Step 1:", "===="]
