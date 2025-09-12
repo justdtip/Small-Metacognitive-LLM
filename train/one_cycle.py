@@ -123,17 +123,62 @@ def run_one_cycle(args) -> Dict[str, Any]:
         tok.pad_token = tok.eos_token
     ensure_reasoning_tokens(tok, model)
 
-    # Load adapter via PEFT; fail soft if PEFT missing
+    # Load adapter via PEFT; sanitize adapter_config if necessary; fail soft if PEFT missing
     try:
         from peft import PeftModel  # type: ignore
-        model = PeftModel.from_pretrained(model, str(adapter_path))
+        removed_keys = []
+        # Some adapter configs include keys unsupported by current peft (e.g., 'eva_config', 'exclude_modules').
+        # Sanitize in place by keeping only keys accepted by LoraConfig plus peft_type.
+        try:
+            from peft.tuners.lora import LoraConfig  # type: ignore
+            import inspect as _inspect, json as _json
+            cfg_p = adapter_path / "adapter_config.json"
+            if cfg_p.exists():
+                d = _json.loads(cfg_p.read_text(encoding="utf-8"))
+                allowed = set(_inspect.signature(LoraConfig.__init__).parameters.keys())
+                allowed.discard("self")
+                # Keep dispatcher key as well
+                allowed |= {"peft_type"}
+                d2 = {}
+                for k, v in d.items():
+                    if k in allowed:
+                        d2[k] = v
+                    else:
+                        removed_keys.append(k)
+                # If we removed anything, persist sanitized config
+                if removed_keys:
+                    cfg_p.write_text(_json.dumps(d2), encoding="utf-8")
+        except Exception:
+            removed_keys = []
+        model = PeftModel.from_pretrained(model, str(adapter_path), is_trainable=True)
         # Ensure adapter-wrapped model is resident on the same device
         try:
             model.to(device)
         except Exception:
             model.to("cpu")
+        # Mandatory PEFT debug line (JSON)
+        try:
+            trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        except Exception:
+            trainable = None
+        print(json.dumps({
+            "peft_debug": {
+                "status": "loaded",
+                "adapter_path": str(adapter_path),
+                "sanitized_keys_removed": removed_keys,
+                "trainable_params": trainable,
+            }
+        }))
     except Exception as e:
         sys.stderr.write(f"warn: PEFT adapter not loaded ({type(e).__name__}: {e}); continuing with base model\n")
+        # Mandatory PEFT debug line (JSON)
+        print(json.dumps({
+            "peft_debug": {
+                "status": "base_only",
+                "reason": f"{type(e).__name__}: {e}",
+                "adapter_path": str(adapter_path)
+            }
+        }))
 
     # Attach side adapters and metacog heads using the serve engine for parity hooks
     hidden_size = getattr(getattr(model, 'config', None), 'hidden_size', 2048)
@@ -203,6 +248,8 @@ def run_one_cycle(args) -> Dict[str, Any]:
         plan_targets = plan_targets.to(model_device)
     if torch.is_tensor(budget_target):
         budget_target = budget_target.to(model_device)
+        if budget_target.dim() == 1:
+            budget_target = budget_target.view(-1, 1)
     if torch.is_tensor(conf_labels):
         conf_labels = conf_labels.to(model_device)
 

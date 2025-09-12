@@ -584,12 +584,28 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
             if adapter_path:
                 try:
                     from peft import PeftModel  # type: ignore
+                    # Sanitize adapter_config
+                    try:
+                        from peft.tuners.lora import LoraConfig  # type: ignore
+                        import inspect as _inspect, json as _json
+                        cfg_p = _Path(adapter_path) / "adapter_config.json"
+                        if cfg_p.exists():
+                            d = _json.loads(cfg_p.read_text(encoding="utf-8"))
+                            allowed = set(_inspect.signature(LoraConfig.__init__).parameters.keys()); allowed.discard("self")
+                            allowed |= {"peft_type"}
+                            d2 = {k: v for k, v in d.items() if k in allowed}
+                            if len(d2) != len(d):
+                                cfg_p.write_text(_json.dumps(d2), encoding="utf-8")
+                    except Exception:
+                        pass
                     model = PeftModel.from_pretrained(model, str(_Path(adapter_path)), is_trainable=True)
                     # keep model on same device after wrapping
                     model.to(device)
+                    print(json.dumps({"peft_debug": {"status": "loaded", "adapter_path": str(adapter_path)}}))
                 except Exception as e:
                     # soft warn and continue with base
                     print(f"warn: PEFT adapter not loaded ({type(e).__name__}: {e}); continuing with base model")
+                    print(json.dumps({"peft_debug": {"status": "base_only", "reason": f"{type(e).__name__}: {e}", "adapter_path": str(adapter_path)}}))
             # Ensure reasoning tokens are added and embeddings resized
             try:
                 ensure_reasoning_tokens(tok, model)
