@@ -29,6 +29,8 @@ backup/
 backup.tar.gz
 submission/
 *.tar.gz
+docs/artifacts/*
+!docs/artifacts/README.md
 
 # Model weights (keep configs)
 model/**/*.safetensors

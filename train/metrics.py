@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Tuple, List, Dict, Any, Iterable, Callable, Optional
+from typing import Tuple, List, Dict, Any, Iterable, Callable, Optional, Union
 from pathlib import Path
 import json as _json
 import csv as _csv
@@ -78,6 +78,33 @@ def brier_score(probs: torch.Tensor, labels: torch.Tensor) -> float:
     return brier_binary(probs, labels)
 
 
+def leakage_rate(outputs: List[str]) -> float:
+    """Fraction of outputs containing '<think>' when hidden mode is expected."""
+    if not outputs:
+        return 0.0
+    hits = 0
+    for s in outputs:
+        try:
+            if ("<think>" in (s or "")) or ("</think>" in (s or "")):
+                hits += 1
+        except Exception:
+            pass
+    return float(hits) / float(max(1, len(outputs)))
+
+
+def ece_brier_report(confidences: torch.Tensor, correctness: torch.Tensor) -> Dict[str, float]:
+    """
+    Compute ECE and Brier given confidences in [0,1] and correctness {0,1}.
+    Returns {'ece':..., 'brier':...} with float values; returns zeros if inputs invalid.
+    """
+    try:
+        p = confidences.detach().float().view(-1)
+        y = correctness.detach().float().view(-1)
+        return {"ece": ece_binary(p, y), "brier": brier_binary(p, y)}
+    except Exception:
+        return {"ece": 0.0, "brier": 0.0}
+
+
 # --------- Token-level F1 for long-form answers ---------
 
 def _tokenize(s: str) -> List[str]:
@@ -98,6 +125,16 @@ def f1_token(pred: str, gold: str) -> float:
     prec = overlap / max(1, sum(cp.values()))
     rec = overlap / max(1, sum(cg.values()))
     return 2 * prec * rec / max(1e-8, (prec + rec))
+
+
+def exact_match(pred: str, gold: str) -> float:
+    """Strict string equality after strip."""
+    return 1.0 if (str(pred or '').strip() == str(gold or '').strip()) else 0.0
+
+
+def token_f1(pred: str, gold: str) -> float:
+    """Alias wrapper over f1_token for external callers."""
+    return f1_token(pred, gold)
 
 
 # --------- Rubric/teacher scoring for <think> ---------
@@ -245,6 +282,98 @@ def rewrite_kl_mean(records: List[Dict[str, Any]]) -> float:
         return float(statistics.fmean(vals))
     except Exception:
         return float(sum(vals) / max(1, len(vals)))
+
+
+# --------- Calibration artifact helpers ---------
+def fit_confidence_temperature(logits: torch.Tensor, labels: torch.Tensor) -> float:
+    """
+    Convenience wrapper using temperature_fit for binary confidence calibration.
+    Accepts logits shape [N] or [N,1] and labels [N] in {0,1}.
+    Returns a positive scalar temperature.
+    """
+    if logits.ndim == 2 and logits.shape[-1] == 1:
+        logits = logits.view(-1)
+    return float(temperature_fit(logits, labels))
+
+
+def fit_plan_thresholds(plan_logits: torch.Tensor, labels: torch.Tensor, num_plans: int = 4) -> Dict[str, float]:
+    """
+    Derive simple per-class probability thresholds for plan selection.
+    For each class k, threshold = median of P(class=k) among samples with label==k.
+    Names default to ['short','deliberate','verify','stop'] truncated to K.
+    """
+    with torch.no_grad():
+        if plan_logits.ndim == 1:
+            plan_logits = plan_logits.view(-1, 1)
+        K = int(plan_logits.shape[-1])
+        names = ["short", "deliberate", "verify", "stop"][:K]
+        probs = torch.softmax(plan_logits.detach().float(), dim=-1)
+        y = labels.detach().long().view(-1)
+        out: Dict[str, float] = {}
+        for k in range(K):
+            mask = (y == k)
+            if mask.any():
+                vals = probs[mask, k].sort().values
+                thr = float(vals[int(0.5 * (len(vals) - 1))].item()) if len(vals) > 0 else 0.5
+            else:
+                thr = 0.5
+            out[names[k]] = float(max(0.0, min(1.0, thr)))
+        return out
+
+
+def choose_budget_clip(pred_budgets: torch.Tensor, targets: torch.Tensor, quantile: float = 0.98) -> int:
+    """
+    Choose a conservative integer clip for budgets, based on the target distribution (fallback to preds).
+    Returns max(1, int(quantile(...))).
+    """
+    q = float(max(0.0, min(1.0, quantile)))
+    try:
+        base = targets.detach().float().view(-1)
+        if base.numel() == 0 or torch.isnan(base).all():
+            base = pred_budgets.detach().float().view(-1)
+        val = torch.quantile(base, q).item() if base.numel() > 0 else 1.0
+    except Exception:
+        val = 1.0
+    return int(max(1, round(val)))
+
+
+def save_calibration(calib_path: Union[str, Path], *, conf_temp: float,
+                     plan_thresholds: Dict[str, float] | None = None,
+                     budget_clip: Optional[int] = None,
+                     budget_head_temp: Optional[float] = None) -> None:
+    """
+    Persist a calibration JSON with keys: conf_temp, plan_thresholds (optional), budget_clip (optional).
+    For backward-compat, also writes budget_posthoc_clip alias when clip is provided.
+    """
+    blob: Dict[str, Any] = {"conf_temp": float(conf_temp)}
+    if isinstance(plan_thresholds, dict) and plan_thresholds:
+        blob["plan_thresholds"] = {str(k): float(v) for k, v in plan_thresholds.items() if v is not None}
+    if isinstance(budget_clip, (int, float)) and budget_clip:
+        blob["budget_clip"] = int(budget_clip)
+        blob["budget_posthoc_clip"] = int(budget_clip)
+    if isinstance(budget_head_temp, (int, float)) and budget_head_temp:
+        blob["budget_head_temp"] = float(budget_head_temp)
+    p = Path(calib_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(_json.dumps(blob), encoding="utf-8")
+
+
+def load_calibration(calib_path: Union[str, Path]) -> Dict[str, Any]:
+    """Load calibration JSON and normalize keys. Returns dict with conf_temp, plan_thresholds, budget_clip."""
+    p = Path(calib_path)
+    d = _json.loads(p.read_text(encoding="utf-8"))
+    out: Dict[str, Any] = {}
+    if "conf_temp" in d:
+        out["conf_temp"] = float(d["conf_temp"])
+    if isinstance(d.get("plan_thresholds"), dict):
+        out["plan_thresholds"] = {str(k): float(v) for k, v in d["plan_thresholds"].items() if v is not None}
+    if "budget_clip" in d:
+        out["budget_clip"] = int(d["budget_clip"]) if d["budget_clip"] is not None else None
+    elif "budget_posthoc_clip" in d:
+        out["budget_clip"] = int(d["budget_posthoc_clip"])
+    if "budget_head_temp" in d:
+        out["budget_head_temp"] = float(d["budget_head_temp"]) if d["budget_head_temp"] is not None else None
+    return out
 
 
 # --------- Layer diagnostics helpers (optional) ---------

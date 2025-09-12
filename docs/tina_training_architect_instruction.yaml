@@ -1,0 +1,32 @@
+title: Tina Small-Scale Introspective LLM — Training Architect Notes
+version: 0.1
+goals:
+  - preserve base model; add heads/adapters only
+  - learn plan, dynamic think budget, and calibrated confidence
+  - keep hidden CoT off by default; zero leakage
+  - maintain serve/eval parity (stop rules, slack, tokenization)
+phases:
+  - name: A
+    freeze_base: true
+    train_adapters: true
+    train_heads: true
+    use_on_policy: false
+  - name: B
+    freeze_base: true
+    train_adapters: true
+    train_heads: true
+    use_on_policy: true
+  - name: C
+    freeze_base: false
+    train_adapters: true
+    train_heads: true
+    train_base_top: true
+    use_on_policy: true
+telemetry:
+  - parity_digest
+  - alpha_summary
+  - plan_agreement
+  - gate_activity, gate_coverage
+artifacts:
+  calibration: artifacts/metacog_calibration.json
+  budget_sweep: artifacts/budget_sweep_*.{json,csv}

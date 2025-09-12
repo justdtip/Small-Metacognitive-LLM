@@ -11,8 +11,10 @@ Emits one JSON line with:
   - side-adapter gate activity (if exposed)
   - answer text (hidden CoT removed by default)
 
-Usage:
-  python tools/observe_infer.py --prompt "Factor 12345" --visible-cot true --jsonl logs/obs.jsonl
+Usage examples:
+  python tools/observe_infer.py \
+    --models-root model --base Base --adapter Tina --subfolder checkpoint-2000 \
+    --prompt "Factor 12345" --visible-cot false --jsonl-out logs/obs.jsonl --debug-per-layer --calibration artifacts/metacog_calibration.json
 """
 import argparse, json, time, uuid, sys
 from pathlib import Path
@@ -37,10 +39,7 @@ except Exception:
         ans = _slice(body, "<answer>", "</answer>")
         return ans.strip()
 
-try:
-    from tina.metacog_heads import MetacogHeads
-except Exception:
-    MetacogHeads = None  # optional
+from tina.serve import IntrospectiveEngine, EngineConfig
 
 
 class StopOnTags(StoppingCriteria):
@@ -141,14 +140,19 @@ def _resolve_base_from_adapter(adapter_dir: Path) -> Path | None:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B")
+    ap.add_argument("--models-root", default="model")
+    ap.add_argument("--base", default="Base")
+    ap.add_argument("--adapter", default="Tina")
+    ap.add_argument("--subfolder", default="checkpoint-2000")
+    ap.add_argument("--calibration", default="", help="Optional calibration JSON path")
     ap.add_argument("--prompt", required=True)
     ap.add_argument("--visible-cot", type=lambda s: s.lower()=="true", default=False)
-    ap.add_argument("--max-new-tokens", type=int, default=256)
+    ap.add_argument("--max-new", dest="max_new", type=int, default=256)
     ap.add_argument("--temperature", type=float, default=0.6)
     ap.add_argument("--top-p", type=float, default=0.95)
     ap.add_argument("--device", default="auto", choices=["auto","cpu","cuda","mps"])
-    ap.add_argument("--jsonl", default="", help="Append JSON line to this file (else print).")
+    ap.add_argument("--jsonl-out", default="", help="Append JSON line to this file (else print).")
+    ap.add_argument("--debug-per-layer", action="store_true", help="Include per-layer diagnostics (alpha, per_layer_plan)")
     ap.add_argument("--log-raw-prompt", action="store_true", help="Include raw prompt (redacted otherwise).")
     args = ap.parse_args()
 
@@ -157,78 +161,40 @@ def main():
               "mps"  if (args.device=="auto" and getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available()) else
               args.device if args.device!="auto" else "cpu")
 
-    model_path = Path(args.model)
-    base_path = None
-    # Prefer local directories if present; otherwise treat as model ID and let from_pretrained handle it.
-    if (model_path / "config.json").exists():
-        base_path = model_path
-        adapter_path = None
-    elif (model_path / "adapter_config.json").exists():
-        adapter_path = model_path
-        base_path = _resolve_base_from_adapter(adapter_path)
-        if base_path is None:
-            raise SystemExit(f"Could not resolve base model for adapter at {adapter_path}")
-    else:
-        # Fallback: pass the string through; unit tests monkeypatch HF loaders to accept arbitrary IDs
-        base_path = args.model
-        adapter_path = None
-
-    tok = AutoTokenizer.from_pretrained(str(base_path), use_fast=True, local_files_only=True)
+    models_root = Path(args.models_root)
+    base_path = models_root / args.base
+    adapter_path = models_root / args.adapter / args.subfolder
+    tok = AutoTokenizer.from_pretrained(str(base_path), use_fast=True, trust_remote_code=True, local_files_only=True)
     if getattr(tok, "pad_token", None) is None and getattr(tok, "eos_token", None) is not None:
         tok.pad_token = tok.eos_token
     dtype = torch.bfloat16 if device != "cpu" else torch.float32
-    model = AutoModelForCausalLM.from_pretrained(str(base_path), torch_dtype=dtype, local_files_only=True).to(device)
-    # Resolve a usable device for tensors
-    try:
-        model_device = next(model.parameters()).device
-    except Exception:
-        model_device = torch.device("cpu")
-    # If adapter path provided, try to load it via PEFT
-    if 'adapter_path' in locals() and adapter_path is not None:
-        try:
-            from peft import PeftModel  # type: ignore
-            model = PeftModel.from_pretrained(model, str(adapter_path))
-        except Exception as e:
-            # proceed without adapter if PEFT not available
-            sys.stderr.write(f"warn: failed to load adapter from {adapter_path}: {type(e).__name__}: {e}\n")
-
-    # Ensure tags exist and resize embeddings if added (safe no-op if already present)
+    model = AutoModelForCausalLM.from_pretrained(str(base_path), torch_dtype=dtype, trust_remote_code=True, local_files_only=True)
+    model.to(device)
     ensure_reasoning_tokens(tok, model)
-
-    seed = args.prompt.strip()
-    seed = (seed + "\n<think>\n") if args.visible_cot else (seed + "\n<think>\n</think><answer>")
-    enc = tok(seed, return_tensors="pt")
-    # Support both dict-style and object-style tokenizer returns
-    if isinstance(enc, dict):
-        input_ids = enc.get("input_ids")
-        attention_mask = enc.get("attention_mask")
-    else:
-        input_ids = getattr(enc, "input_ids", None)
-        attention_mask = getattr(enc, "attention_mask", None)
-    if input_ids is None:
-        raise SystemExit("tokenizer did not return input_ids")
-    input_ids = input_ids.to(model_device)
-    attention_mask = attention_mask.to(model_device) if attention_mask is not None else None
-
-    stop = StoppingCriteriaList([StopOnTags(tok, stop_strs=("</answer>",))])
-
-    t0 = time.time()
-    gen = model.generate(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        do_sample=True,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        max_new_tokens=args.max_new_tokens,
-        output_scores=True,
-        return_dict_in_generate=True,
-        output_hidden_states=True,
-        output_attentions=True,
-        stopping_criteria=stop
+    hidden = int(getattr(model.config, 'hidden_size', 2048))
+    layers = int(getattr(model.config, 'num_hidden_layers', 24))
+    eng = IntrospectiveEngine(
+        model=model,
+        tokenizer=tok,
+        cfg=EngineConfig(
+            visible_cot=args.visible_cot,
+            budget_cap=256,
+            calibration_path=(args.calibration or None),
+            linked_all_layers=True,
+            proj_dim=128,
+            agg='attn',
+            dump_per_layer=bool(args.debug_per_layer),
+        ),
+        hidden_size=hidden,
+        num_layers=layers,
     )
-    t1 = time.time()
 
-    full_text = tok.decode(gen.sequences[0], skip_special_tokens=False)
+    messages = [{"role": "user", "content": args.prompt}]
+    t0 = time.time()
+    out_text = eng.generate_cot(messages, max_new_tokens=args.max_new, temperature=args.temperature, top_p=args.top_p, repetition_penalty=1.1, ignore_eos=False, stream=False)
+    t1 = time.time()
+    # Gather stats
+    full_text = out_text
     output_text = _extract_answer(full_text, include_think=args.visible_cot)
     sections = count_sections(tok, full_text)
 
@@ -243,71 +209,39 @@ def main():
     except Exception:
         logprobs = None
 
-    # Hidden states for last step (fallback: post-forward)
-    last_hs = None
-    try:
-        if gen.hidden_states and isinstance(gen.hidden_states, tuple):
-            step_hs = gen.hidden_states[-1]  # tuple per layer
-            if isinstance(step_hs, tuple):
-                last_hs = [h.detach().to("cpu") for h in step_hs]
-    except Exception:
-        last_hs = None
-    if last_hs is None:
-        with torch.no_grad():
-            out = model(gen.sequences, output_hidden_states=True)
-        last_hs = [h.detach().to("cpu") for h in out.hidden_states]
-
-    norms = layer_last_token_norms(last_hs)
-
-    # Attention entropies (optional)
-    attn_entropies = None
-    try:
-        if getattr(gen, "attentions", None):
-            attn_entropies = attn_entropy_last_token(gen.attentions[-1])
-    except Exception:
-        attn_entropies = None
-
-    # Heads (optional)
-    heads_out = None
-    if MetacogHeads is not None:
-        try:
-            heads = MetacogHeads(hidden_size=model.config.hidden_size, taps=(6,10,14), plan_k=3)
-            plan_logits, budget_cap, conf_logit = heads(last_hs)
-            heads_out = {
-                "plan_logits": [float(x) for x in plan_logits[0].detach().cpu().tolist()],
-                "budget_cap": float(budget_cap[0,0].detach().cpu().item()),
-                "confidence_logit": float(conf_logit[0,0].detach().cpu().item()),
-                "confidence_sigmoid": float(torch.sigmoid(conf_logit)[0,0].detach().cpu().item()),
-            }
-        except Exception as e:
-            heads_out = {"error": f"metacog_heads_failed: {e.__class__.__name__}"}
-
-    gate_stats = collect_gate_stats(model)
+    gate_stats = collect_gate_stats(eng.scaffold)
+    stats = getattr(eng, "last_stats", {}) or {}
 
     rec = {
         "request_id": rid,
         "ts_ms": int(time.time()*1000),
         "model": args.model,
         "device": device,
-        "decode": {"temperature": args.temperature, "top_p": args.top_p, "max_new_tokens": args.max_new_tokens},
+        "decode": {"temperature": args.temperature, "top_p": args.top_p, "max_new_tokens": args.max_new},
         "timing": {
             "latency_s": round(t1 - t0, 4),
-            "tokens_per_sec": round((gen.sequences.shape[1] - input_ids.shape[1]) / max(1e-6, (t1 - t0)), 2)
+            "tokens_per_sec": None
         },
         "io": {
-            "input_tokens": int(input_ids.shape[1]),
-            "output_tokens": int(gen.sequences.shape[1] - input_ids.shape[1]),
+            "input_tokens": None,
+            "output_tokens": None,
             "visible_cot": args.visible_cot,
             "prompt_preview": args.prompt if args.log_raw_prompt else (args.prompt[:64] + ("..." if len(args.prompt) > 64 else ""))
         },
         "sections": sections,
-        "heads": heads_out,
+        "heads": {
+            "plan": stats.get("plan_label") or stats.get("plan"),
+            "confidence": stats.get("confidence"),
+            "budget": stats.get("think_budget"),
+            "alpha_summary": stats.get("alpha_summary"),
+            "plan_agreement": stats.get("plan_agreement"),
+        },
         "activations": {
-            "layer_last_token_norms": norms,
-            "attn_entropies_last_token": attn_entropies
+            "layer_last_token_norms": None,
+            "attn_entropies_last_token": None
         },
         "gates": gate_stats,
-        "logprobs": logprobs,
+        "logprobs": None,
         "text": {
             "full": full_text if args.log_raw_prompt or args.visible_cot else None,
             "answer": output_text
@@ -315,9 +249,10 @@ def main():
     }
 
     line = json.dumps(rec, ensure_ascii=False)
-    if args.jsonl:
-        Path(args.jsonl).parent.mkdir(parents=True, exist_ok=True)
-        with open(args.jsonl, "a", encoding="utf-8") as f:
+    out_path = args.jsonl_out
+    if out_path:
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     else:
         print(line)

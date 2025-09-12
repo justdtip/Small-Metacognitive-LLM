@@ -11,6 +11,15 @@ import re
 
 from .tokenizer_utils import ensure_reasoning_tokens
 
+__all__ = [
+    "EngineConfig",
+    "IntrospectiveEngine",
+    "StopOnTags",
+    "SlackStop",
+    "_extract_answer",
+    "_count_think_tokens",
+]
+
 @dataclass
 class EngineConfig:
     # reasoning behavior
@@ -96,29 +105,34 @@ def _to_list(x):
 
 def _count_think_tokens(gen_ids, close_ids_list, base_len: int, cap: int, slack_ratio: float) -> int:
     """
-    Count actual <think> tokens used between base_len and the earliest of
-    - the first occurrence of any closing tag sequence in close_ids_list, or
-    - the soft-cap boundary base_len + cap * (1 + slack_ratio).
-    gen_ids: list[int] or Tensor; close_ids_list: list[list[int]]
-    Returns an int >= 0.
+    Count number of <think> tokens generated after base_len and up to the earliest of:
+    - the first occurrence of any closing tag in close_ids_list, or
+    - the soft-cap boundary: base_len + cap * (1 + slack_ratio), clamped by actual generated length.
+
+    Robust to empty/None close sequences and negative base_len.
     """
     g = _to_list(gen_ids)
-    if base_len < 0:
-        base_len = 0
-    end_soft = base_len + int(max(0, int(cap)) * (1.0 + float(slack_ratio)))
-    end_soft = min(end_soft, len(g))
+    n = len(g)
+    base = max(0, int(base_len))
+    cap_i = max(0, int(cap))
+    limit = int(cap_i * (1.0 + float(slack_ratio)))
+    end_soft = min(n, base + limit)
     earliest = end_soft
-    for cid in (close_ids_list or []):
-        k = len(cid)
-        if k <= 0 or k > len(g) - base_len:
-            continue
-        # slide forward from base_len
-        for j in range(base_len, len(g) - k + 1):
-            if g[j:j + k] == cid:
-                if j < earliest:
-                    earliest = j
-                break
-    used = max(0, earliest - base_len)
+    if close_ids_list:
+        for cid in close_ids_list:
+            if not cid:
+                continue
+            k = len(cid)
+            if k <= 0 or base + k > n:
+                continue
+            j = base
+            while j <= n - k:
+                if g[j:j + k] == cid:
+                    if j < earliest:
+                        earliest = j
+                    break
+                j += 1
+    used = max(0, earliest - base)
     return used
 
 class IntrospectiveEngine:
@@ -288,6 +302,8 @@ class IntrospectiveEngine:
                 "stop_think": list(getattr(self, "_stop_think_tags", ("</think>",))),
                 "visible_cot": bool(self.cfg.visible_cot),
                 "conf_temp": self._conf_temp,
+                "plan_thresholds": getattr(self, "_plan_thresholds", None),
+                "budget_clip": getattr(self, "_budget_clip", None),
                 "soft_cap_slack_ratio": float(getattr(self, "_slack_ratio", 0.2)),
             }
         except Exception:
@@ -474,9 +490,19 @@ class IntrospectiveEngine:
                 th = blob.get("plan_thresholds")
                 if isinstance(th, dict) and th:
                     self._plan_thresholds = {str(k): float(v) for k, v in th.items() if v is not None}
-                bc = blob.get("budget_posthoc_clip")
+                # support both keys for budget clip
+                bc = blob.get("budget_clip", None)
+                if bc is None:
+                    bc = blob.get("budget_posthoc_clip")
                 if isinstance(bc, (int, float)) and bc:
                     self._budget_clip = int(bc)
+                # Optional budget head temperature for metacog head
+                bht = blob.get("budget_head_temp")
+                if isinstance(bht, (int, float)) and hasattr(self, "metacog") and hasattr(self.metacog, "set_budget_temp"):
+                    try:
+                        self.metacog.set_budget_temp(float(bht))
+                    except Exception:
+                        pass
         except Exception:
             self._conf_temp = None
 
@@ -667,6 +693,23 @@ class IntrospectiveEngine:
                 )
             except Exception:
                 used = int(gen1.shape[0])
+            # Gate activity/coverage across adapters (think-only period)
+            try:
+                vals_act = []
+                vals_cov = []
+                for m in self.scaffold.adapters:
+                    a = getattr(m, "_last_gate_activity", None)
+                    c = getattr(m, "_last_gate_coverage", None)
+                    if torch.is_tensor(a):
+                        vals_act.append(float(a.item()))
+                    if torch.is_tensor(c):
+                        vals_cov.append(float(c.item()))
+                if vals_act:
+                    self.last_stats["gate_activity"] = sum(vals_act) / len(vals_act)
+                if vals_cov:
+                    self.last_stats["gate_coverage"] = sum(vals_cov) / len(vals_cov)
+            except Exception:
+                pass
 
             # If we didn't get </think>, forcibly close it
             if "</think>" not in text1:

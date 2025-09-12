@@ -183,6 +183,31 @@ def rewrite_consistency_kl(
     return sym.mean()
 
 
+def masked_symmetric_kl(p_logits: torch.Tensor, q_logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """
+    Symmetric KL divergence over vocabulary, masked over token positions.
+    - p_logits, q_logits: (T,V)
+    - mask: (T,) float/bool in {0,1}; only positions with mask==1 contribute.
+    Returns scalar mean over masked positions.
+    """
+    if p_logits.dim() == 3:
+        p_logits = p_logits.squeeze(0)
+    if q_logits.dim() == 3:
+        q_logits = q_logits.squeeze(0)
+    T, V = p_logits.shape
+    m = mask.view(-1).to(dtype=p_logits.dtype)
+    # log-softmax for numerical stability
+    lp = torch.log_softmax(p_logits, dim=-1)
+    lq = torch.log_softmax(q_logits, dim=-1)
+    p = torch.exp(lp)
+    q = torch.exp(lq)
+    kl_pq = (p * (lp - lq)).sum(dim=-1)  # (T,)
+    kl_qp = (q * (lq - lp)).sum(dim=-1)
+    skl = 0.5 * (kl_pq + kl_qp)
+    denom = m.sum().clamp_min(1.0)
+    return (skl * m).sum() / denom
+
+
 def rubric_reg(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """
     Simple regression objective for rubric supervision.
@@ -265,6 +290,15 @@ def compute_losses(
     noise_acc_gain: Optional[torch.Tensor] = None,
     # per-layer diagnostics (optional)
     per_layer: Optional[Dict[str, torch.Tensor]] = None,
+    # on-policy + think auxiliaries
+    think_mask: Optional[torch.Tensor] = None,
+    think_ce_w: float = 0.0,
+    # over-budget penalty
+    think_tokens_used: Optional[torch.Tensor] = None,
+    target_budget: Optional[torch.Tensor] = None,
+    budget_penalty_w: float = 0.0,
+    # quiet-star override (phase-driven)
+    quiet_star_w: float = 0.0,
 ):
     """
     Compute masked answer CE and optional regularizers/auxiliaries.
@@ -306,6 +340,9 @@ def compute_losses(
     # Optional Quiet-Star auxiliary consistency loss (training-only)
     # Blends self-distillation on a sampled subset of think tokens, encouraging robustness to short 'silent thoughts'.
     aux_w = float(weights.get("aux_mix", 0.0) or 0.0)
+    # Allow phase override via quiet_star_w
+    if quiet_star_w > 0.0:
+        aux_w = float(quiet_star_w)
     if aux_w > 0.0:
         cfg = _QUIET_STAR_CTX.get()
         if cfg is not None:
@@ -431,7 +468,9 @@ def compute_losses(
                     for j in range(i + 1, len(grp)):
                         ia, ib = int(grp[i]), int(grp[j])
                         if 0 <= ia < B and 0 <= ib < B:
-                            val = rewrite_consistency_kl(logits[ia], logits[ib], answer_mask[ia], answer_mask[ib], tau=1.0)
+                            # Masked symmetric KL over intersection of answer masks at shared positions
+                            inter = (answer_mask[ia].to(dtype=logits.dtype) * answer_mask[ib].to(dtype=logits.dtype)).view(-1)
+                            val = masked_symmetric_kl(logits[ia], logits[ib], inter)
                             pair_vals.append(val)
                 if pair_vals:
                     per_group_vals.append(torch.stack(pair_vals).mean())
@@ -440,6 +479,14 @@ def compute_losses(
         except Exception:
             pass
 
+    # Optional explicit pair-map path (batch_meta)
+    try:
+        pair_map = None
+        # Support both list of tuples and list of lists
+        if isinstance(rewrite_groups, dict) and "pair_map" in rewrite_groups:
+            pair_map = rewrite_groups.get("pair_map")
+    except Exception:
+        pair_map = None
     # Legacy single-pair path
     if (w_rc > 0.0) and (rewrite_kl_val.detach().item() == 0.0) and (rewrite_pair is not None):
         try:
@@ -447,7 +494,7 @@ def compute_losses(
             lb = rewrite_pair.get("logits_b")
             am = rewrite_pair.get("answer_mask")
             if (la is not None) and (lb is not None) and (am is not None):
-                rewrite_kl_val = rewrite_consistency_kl(la, lb, am, am, tau=1.0)
+                rewrite_kl_val = masked_symmetric_kl(la, lb, am)
         except Exception:
             pass
 
@@ -485,6 +532,39 @@ def compute_losses(
         loss_total = loss_total + w_var * vloss
     else:
         out["var_reg"] = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
+
+    # Over-budget penalty (token basis)
+    w_bp = float(budget_penalty_w or 0.0)
+    if w_bp > 0.0 and (think_tokens_used is not None) and (target_budget is not None):
+        try:
+            used = think_tokens_used.view(-1).float()
+            tb = target_budget.view(-1).float()
+            over = (used - tb).clamp_min(0.0) / (tb.clamp_min(1.0))
+            ob = over.mean()
+        except Exception:
+            ob = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
+        out["over_budget_penalty"] = ob
+        loss_total = loss_total + w_bp * ob
+    else:
+        out["over_budget_penalty"] = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
+
+    # Think CE on masked region (optional)
+    w_tce = float(think_ce_w or 0.0)
+    if w_tce > 0.0 and (think_mask is not None):
+        try:
+            B, T, V = logits.shape
+            m = think_mask.to(device=logits.device)
+            lbl = labels.to(dtype=torch.long, device=logits.device)
+            # mask labels outside vocab and outside think
+            invalid = (lbl >= V) | (lbl < 0)
+            lbl = torch.where((m > 0) & (~invalid), lbl, torch.full_like(lbl, -100))
+            tce = torch.nn.functional.cross_entropy(logits.view(B*T, V), lbl.view(B*T), ignore_index=-100)
+        except Exception:
+            tce = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
+        out["think_ce"] = tce
+        loss_total = loss_total + w_tce * tce
+    else:
+        out["think_ce"] = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
 
     out["total"] = loss_total
     return out

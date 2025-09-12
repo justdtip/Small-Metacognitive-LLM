@@ -102,6 +102,7 @@ def parse_args():
     p.add_argument("--repetition-penalty", "--repetition_penalty", dest="repetition_penalty", type=float, default=1.1)
     p.add_argument("--ignore-eos", "--ignore_eos", dest="ignore_eos", action="store_true")
     p.add_argument("--no-stream", "--no_stream", dest="no_stream", action="store_true")
+    p.add_argument("--calibration", dest="calibration", default="", help="Optional metacog calibration JSON path")
     # logging
     p.add_argument("--log-jsonl", "--log_jsonl", dest="log_jsonl", default="",
                    help="Path to JSONL log of turns (prompts, outputs, token counts, timings).")
@@ -251,6 +252,7 @@ def main():
             side_rank=8,
             adapter_layers=None,   # all
             taps=[6, 10, 14],
+            calibration_path=(args.calibration or None),
         ),
         hidden_size=hidden,
         num_layers=layers,

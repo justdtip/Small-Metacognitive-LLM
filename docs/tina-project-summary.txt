@@ -1,0 +1,12 @@
+Tina Introspective CoT — Project Summary
+----------------------------------------
+
+Goal: teach a small local LLM to plan, budget its hidden reasoning (<think>), and report confidence, while preserving
+serve/eval parity and minimizing cost (tokens). Implementation is fully local and additive: the base model is left
+unchanged; a side adapter (LoRA-like) and lightweight metacognitive heads are attached.
+
+Key properties:
+- Hidden CoT by default; strict stop-on-tags; budget soft-cap with slack
+- Heads for plan/budget/confidence; optional per-layer aggregator
+- On-policy training hooks; calibration artifacts for deterministic serving
+

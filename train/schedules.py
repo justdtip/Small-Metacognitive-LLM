@@ -1,7 +1,9 @@
 from __future__ import annotations
 import torch
 from contextlib import contextmanager
-from typing import Optional, Dict, Callable
+from typing import Optional, Dict, Callable, Any, List
+from dataclasses import dataclass
+from enum import Enum
 from train.losses import _QUIET_STAR_CTX
 
 def linear_anneal(step: int, total: int, start: float, end: float) -> float:
@@ -79,3 +81,39 @@ def quiet_star_schedule(total_steps: int, *, start: float = 0.1, end: float = 0.
         return s0 + (s1 - s0) * prog
 
     return f
+
+
+# ---- Phase schedule for trainer integration ------------------------------------
+
+class Phase(str, Enum):
+    A = "A"
+    B = "B"
+    C = "C"
+    D = "D"
+
+
+@dataclass
+class PhaseSchedule:
+    name: str
+    freeze_base: bool
+    train_adapters: bool
+    train_heads: bool
+    train_base_top: bool
+    use_on_policy: bool
+    budget_penalty_w: float = 0.0
+    think_ce_w: float = 0.0
+    quiet_star_w: float = 0.0
+
+
+def next_phase_metrics(val_report: Dict[str, Any]) -> Phase:
+    """Trivial heuristic: advance to C if accuracy improves and leakage≈0; else stay in B.
+    Stub for future sophistication.
+    """
+    try:
+        acc = float(val_report.get("accuracy", 0.0))
+        leakage = float(val_report.get("leakage", 0.0))
+        if acc >= 0.5 and leakage <= 0.01:
+            return Phase.C
+    except Exception:
+        pass
+    return Phase.B

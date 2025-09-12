@@ -30,7 +30,7 @@ import torch.nn as nn
 from tina.tokenizer_utils import ensure_reasoning_tokens, segment_and_masks
 from train.data import pad_and_stack
 from train.losses import compute_losses
-from tina.serve import _extract_answer, StopOnTags
+from tina.serve import _extract_answer, StopOnTags, IntrospectiveEngine, EngineConfig
 from train.reward import reward_fn, dry_run_mocked
 import time, uuid, json
 from train.hooks import think_mask_context
@@ -66,6 +66,192 @@ class TinyLM(nn.Module):
         y, _ = self.rnn(x)
         logits = self.lm_head(y)
         return logits
+
+
+# ---- Trainer integration (optional) ---------------------------------------------
+
+class Trainer:
+    def __init__(self, cfg: Dict[str, Any]):
+        self.cfg = cfg
+        self.root = _Path(__file__).resolve().parents[1]
+        self.device = (
+            "cuda" if torch.cuda.is_available() else
+            "mps" if getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available() else
+            "cpu"
+        )
+        self.dtype = torch.bfloat16 if (self.device == "cuda" and torch.cuda.is_bf16_supported()) else (torch.float16 if self.device == "cuda" else torch.float32)
+        self.scaler = torch.cuda.amp.GradScaler(enabled=(self.dtype == torch.float16)) if self.device == "cuda" else None
+        self.engine: Optional[IntrospectiveEngine] = None
+        self.model = None
+        self.tok = None
+
+    def build_model(self):
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        model_cfg = (self.cfg.get("model") or {})
+        base = str(model_cfg.get("base") or "model/Base")
+        adapter_path = str((model_cfg.get("adapter") or {}).get("path") or "")
+        base_path = _Path(base)
+        self.tok = AutoTokenizer.from_pretrained(str(base_path), use_fast=True, trust_remote_code=True, local_files_only=True)
+        if getattr(self.tok, "pad_token", None) is None and getattr(self.tok, "eos_token", None) is not None:
+            self.tok.pad_token = self.tok.eos_token
+        try:
+            self.tok.padding_side = "left"
+        except Exception:
+            pass
+        self.model = AutoModelForCausalLM.from_pretrained(str(base_path), device_map=None, torch_dtype=self.dtype, trust_remote_code=True, local_files_only=True)
+        self.model.to(self.device)
+        ensure_reasoning_tokens(self.tok, self.model)
+        hidden = getattr(getattr(self.model, 'config', None), 'hidden_size', 2048)
+        layers = getattr(getattr(self.model, 'config', None), 'num_hidden_layers', 24)
+        eng_cfg = EngineConfig(visible_cot=False)
+        self.engine = IntrospectiveEngine(self.model, self.tok, eng_cfg, hidden_size=int(hidden), num_layers=int(layers))
+        # Attach adapter if present (trainable)
+        try:
+            for m in self.engine.scaffold.adapters:
+                for p in m.parameters():
+                    p.requires_grad = True
+        except Exception:
+            pass
+        return self.engine
+
+    def build_optimizer(self):
+        optim_cfg = (self.cfg.get("optim") or {})
+        wd = float(optim_cfg.get("wd", 0.01) or 0.01)
+        heads_lr = float(optim_cfg.get("heads_lr", 5e-4) or 5e-4)
+        adapters_lr = float(optim_cfg.get("adapters_lr", 2e-4) or 2e-4)
+        base_top_lr = float(optim_cfg.get("base_top_lr", 5e-5) or 5e-5)
+        heads_params = list(self.engine.metacog.parameters()) if self.engine else []
+        adapters_params = list(self.engine.scaffold.adapters.parameters()) if self.engine else []
+        # Base-top: last two decoder layers
+        try:
+            dec_layers = self.engine.scaffold._get_decoder_layers(self.model)
+            top_layers = dec_layers[-2:] if len(dec_layers) >= 2 else dec_layers
+            base_top_params = [p for l in top_layers for p in l.parameters()]
+        except Exception:
+            base_top_params = []
+        groups = [
+            {"params": [p for p in heads_params if p.requires_grad], "lr": heads_lr, "weight_decay": wd},
+            {"params": [p for p in adapters_params if p.requires_grad], "lr": adapters_lr, "weight_decay": wd},
+            {"params": [p for p in base_top_params if p.requires_grad], "lr": base_top_lr, "weight_decay": wd},
+        ]
+        # filter empty groups to avoid optimizer errors
+        groups = [g for g in groups if g["params"]]
+        return torch.optim.AdamW(groups)
+
+    def _set_train_flags(self, phase: Dict[str, Any]):
+        # Freeze/unfreeze base
+        freeze = bool(phase.get("freeze_base", False))
+        for p in self.model.parameters():
+            p.requires_grad = not freeze
+        # Always keep adapters/heads trainable per phase flags
+        if bool(phase.get("train_adapters", True)):
+            for m in self.engine.scaffold.adapters:
+                for p in m.parameters():
+                    p.requires_grad = True
+        if bool(phase.get("train_heads", True)):
+            for p in self.engine.metacog.parameters():
+                p.requires_grad = True
+
+    def train(self, steps: int = 100):
+        # Data stub: single batch from configured data
+        data_cfg = self.cfg.get("data") or {}
+        path = data_cfg.get("jsonl") or str(self.root / "data/train.jsonl")
+        examples = _load_jsonl(Path(path))
+        collate = make_collate_fn(self.tok, loss_on="answer")
+        batch = next(iter(build_dataloader(Path(path), self.tok, batch_size=int((self.cfg.get("data") or {}).get("batch_size") or 8))))
+
+        opt = self.build_optimizer()
+        svc = load_service_config()
+        on_pol_int = int(((self.cfg.get("trainer") or {}).get("on_policy_interval") or 200))
+        clip_norm = float(((self.cfg.get("optim") or {}).get("clip") or 1.0))
+        phases = (self.cfg.get("phases") or [])
+        phase = phases[0] if phases else {"freeze_base": True, "train_adapters": True, "train_heads": True, "use_on_policy": False}
+        self._set_train_flags(phase)
+
+        # Training steps loop
+        for t in range(int(steps)):
+            input_ids = batch["input_ids"].to(self.device)
+            labels = input_ids.clone(); labels[:, :-1] = input_ids[:, 1:]; labels[:, -1] = -100
+            labels = torch.where(batch["loss_mask"].to(self.device).bool(), labels, torch.full_like(labels, -100))
+
+            # Optional on-policy sampling
+            if bool(phase.get("use_on_policy", False)) and on_pol_int > 0 and (t % on_pol_int == 0):
+                try:
+                    out = decode_with_budget(self.tok, self.model, input_ids, think_budget=int(((self.cfg.get("schedule") or {}).get("budget_cap") or 16)), max_new_tokens=32, temperature=0.2, top_p=0.95, visible_cot=False)
+                    used = int(out.get("think_tokens_used") or 0)
+                    import torch as _t
+                    B = int(input_ids.shape[0])
+                    batch["think_tokens_used"] = _t.tensor([used for _ in range(B)], dtype=_t.long, device=self.device)
+                except Exception:
+                    pass
+
+            # Forward
+            with torch.autocast(device_type=("cuda" if self.device=="cuda" else "cpu"), dtype=(torch.bfloat16 if self.dtype==torch.bfloat16 else torch.float32), enabled=(self.dtype!=torch.float32)):
+                outputs = self.model(input_ids=input_ids, output_hidden_states=True, return_dict=True)
+                logits = outputs.logits
+            # Heads
+            from tina.metacog_heads import MetacogHeads as _MH, MetacogConfig as _MC
+            hidden_size = int(outputs.hidden_states[-1].shape[-1]) if isinstance(outputs.hidden_states, (list, tuple)) else int(getattr(self.model.config, 'hidden_size', 2048))
+            taps_use = tuple((self.cfg.get("taps") or (6, 10, 14)))
+            # Build heads honoring linked_all_layers/proj_dim/agg from config when available
+            mc_cfg = _MC(
+                hidden_size=hidden_size,
+                taps=taps_use,
+                proj_dim=int(((cfg.get("metacog") or {}).get("proj_dim") or 128)),
+                head_temp=1.0,
+                linked_all_layers=bool(((cfg.get("metacog") or {}).get("linked_all_layers") or False)),
+                agg=str(((cfg.get("metacog") or {}).get("agg") or 'attn')),
+                dump_per_layer=True,
+            )
+            heads = _MH(mc_cfg).to(logits.device, dtype=logits.dtype)
+            heads.clear_cache()
+            hs_list = list(outputs.hidden_states) if isinstance(outputs.hidden_states, (list, tuple)) else []
+            for ti in taps_use:
+                if 0 <= int(ti) < len(hs_list):
+                    heads.register_tap(int(ti), hs_list[int(ti)])
+            B_max_use = int(((self.cfg.get("schedule") or {}).get("budget_cap") or 16))
+            head_out = heads(B_max=B_max_use)
+            plan_logits = head_out.get("plan_logits")
+            budget_pred = head_out.get("budget")
+            conf_prob = head_out.get("confidence")
+            conf_logits = torch.logit(conf_prob.clamp(1e-6, 1 - 1e-6)) if conf_prob is not None else None
+            per_layer = head_out.get("per_layer") if isinstance(head_out, dict) else None
+
+            # Targets
+            plan_targets = batch.get("plan_targets").to(self.device) if isinstance(batch.get("plan_targets"), torch.Tensor) else None
+            budget_target = batch.get("target_budget").to(self.device) if isinstance(batch.get("target_budget"), torch.Tensor) else None
+            if isinstance(budget_target, torch.Tensor) and budget_target.dim() == 1:
+                budget_target = budget_target.view(-1, 1)
+            conf_labels = batch.get("correctness").to(self.device) if isinstance(batch.get("correctness"), torch.Tensor) else None
+
+            # Losses (include var_reg when configured)
+            var_reg = float(((self.cfg.get("metacog") or {}).get("var_reg") or 0.0) or 0.0)
+            weights = {"answer_ce": 1.0, "plan_ce": 0.5, "budget_reg": 0.1, "conf_cal": 0.1, "var_reg": var_reg}
+            out_losses = compute_losses(
+                logits, labels,
+                weights=weights,
+                plan_logits=plan_logits if plan_targets is not None else None,
+                plan_targets=plan_targets,
+                budget_pred=budget_pred if budget_target is not None else None,
+                budget_target=budget_target,
+                conf_logits=conf_logits if conf_labels is not None else None,
+                conf_labels=conf_labels,
+                answer_mask=batch.get("answer_mask").to(self.device) if isinstance(batch.get("answer_mask"), torch.Tensor) else None,
+                think_mask=batch.get("think_mask").to(self.device) if isinstance(batch.get("think_mask"), torch.Tensor) else None,
+                think_tokens_used=batch.get("think_tokens_used") if isinstance(batch.get("think_tokens_used"), torch.Tensor) else None,
+                budget_penalty_w=float(phase.get("budget_penalty_w", 0.0) or 0.0),
+                think_ce_w=float(phase.get("think_ce_w", 0.0) or 0.0),
+                quiet_star_w=float(phase.get("quiet_star_w", 0.0) or 0.0),
+                per_layer=per_layer,
+            )
+
+            opt.zero_grad(set_to_none=True)
+            out_losses["total"].backward()
+            if clip_norm and clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=float(clip_norm))
+            opt.step()
+
+        return {"last_losses": {k: float(v.item()) if torch.is_tensor(v) else float(v) for k, v in out_losses.items()}}
 
 
 class DummyTok:
@@ -319,6 +505,7 @@ def _train_step(model: nn.Module, batch: Dict[str, Any], *, step: int = 0, total
                 budget_target=budget_target,
                 conf_logits=conf_logits if conf_labels is not None else None,
                 conf_labels=conf_labels,
+                per_layer=per_layer,
             )
     else:
         out = compute_losses(
@@ -333,6 +520,7 @@ def _train_step(model: nn.Module, batch: Dict[str, Any], *, step: int = 0, total
             budget_target=budget_target,
             conf_logits=conf_logits if conf_labels is not None else None,
             conf_labels=conf_labels,
+            per_layer=per_layer,
         )
     # Style entropy bonus (encourage diversity across styles; ignore unknown=-1)
     try:
@@ -569,6 +757,14 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
     decode_top_p = float(cfg.get("decode_top_p") or 0.95)
     decode_max_new = int(cfg.get("decode_max_new") or 32)
     lambdas = dict(cfg.get("lambdas") or {})
+
+    # Optional: if trainer is enabled, use integrated trainer path
+    if isinstance(cfg.get("trainer"), dict) and bool(cfg["trainer"].get("enabled", False)):
+        tr = Trainer(cfg)
+        tr.build_model()
+        out = tr.train(steps=int(steps))
+        print(json.dumps({"trainer": {"steps": int(steps), **out}}))
+        return {"trainer": out}
 
     # Try to load a real HF model if available; fall back to TinyLM otherwise
     tok = None

@@ -15,6 +15,7 @@ class MetacogConfig:
     linked_all_layers: bool = False
     agg: str = "attn"           # 'attn' | 'mean'
     dump_per_layer: bool = False
+    var_reg: float = 0.0
 
 
 class LinkedTrunk(nn.Module):

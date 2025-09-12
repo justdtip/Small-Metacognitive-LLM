@@ -12,7 +12,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tina.serve import _extract_answer, StopOnTags, SlackStop, _count_think_tokens
-from train.metrics import temperature_fit, ece_binary, f1_token
+from train.metrics import temperature_fit, ece_binary, f1_token, fit_confidence_temperature, fit_plan_thresholds, choose_budget_clip, save_calibration, exact_match, token_f1, leakage_rate, ece_brier_report
 import os as _os
 
 
@@ -55,6 +55,144 @@ def fit_confidence_temperature_and_save(
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(blob), encoding="utf-8")
     return blob
+
+
+def export_calibration_from_eval(
+    *,
+    conf_logits: torch.Tensor,
+    conf_labels: torch.Tensor,
+    plan_logits: Optional[torch.Tensor] = None,
+    plan_labels: Optional[torch.Tensor] = None,
+    pred_budgets: Optional[torch.Tensor] = None,
+    gold_budgets: Optional[torch.Tensor] = None,
+    out_path: str = "artifacts/metacog_calibration.json",
+) -> Dict[str, Any]:
+    """
+    Convenience: fit confidence temperature and simple plan thresholds/budget clip, then persist JSON.
+    All tensors are optional except conf_logits/conf_labels.
+    """
+    T = fit_confidence_temperature(conf_logits, conf_labels)
+    th = fit_plan_thresholds(plan_logits, plan_labels, num_plans=int(plan_logits.shape[-1])) if (plan_logits is not None and plan_labels is not None) else {}
+    bc = choose_budget_clip(pred_budgets, gold_budgets) if (pred_budgets is not None or gold_budgets is not None) else None
+    save_calibration(out_path, conf_temp=float(T), plan_thresholds=th, budget_clip=bc)
+    return {"conf_temp": float(T), "plan_thresholds": th, "budget_clip": bc}
+
+
+def quality_vs_budget_sweep(
+    tokenizer,
+    model,
+    inputs: torch.Tensor,
+    *,
+    budgets: list[int] = (16, 32, 64, 128),
+    temperature: float = 0.2,
+    top_p: float = 0.95,
+) -> Dict[int, Dict[str, float]]:
+    """
+    Sweep quality vs budget: for each think budget, decode and compute simple metrics.
+    Returns {budget: {avg_think_tokens, leakage_rate}}; placeholder for richer metrics.
+    """
+    out: Dict[int, Dict[str, float]] = {}
+    for b in budgets:
+        try:
+            from train.eval_loop import decode_with_budget  # local import to avoid cycles
+        except Exception:
+            return {}
+        try:
+            rec = decode_with_budget(tokenizer, model, inputs, think_budget=int(b), max_new_tokens=int(64), temperature=temperature, top_p=top_p, visible_cot=False)
+            out[int(b)] = {
+                "avg_think_tokens": float(rec.get("think_tokens_used") or 0.0),
+                "leakage": float(1.0 if ("<think>" in (rec.get("text") or "")) else 0.0),
+            }
+        except Exception:
+            out[int(b)] = {"avg_think_tokens": 0.0, "leakage": 0.0}
+    return out
+
+
+def run_budget_sweep(
+    tokenizer,
+    model,
+    eval_dataset: List[Dict[str, Any]],
+    budgets: List[int],
+    *,
+    split: str = "eval",
+    out_dir: str = "artifacts",
+    temperature: float = 0.2,
+    top_p: float = 0.95,
+) -> Dict[int, Dict[str, float]]:
+    """
+    For each budget in 'budgets', decode the dataset and compute metrics:
+    EM, token-F1, avg_think_tokens, leakage_rate, ECE (if confidences present).
+    Writes JSON and CSV to artifacts/budget_sweep_{split}.{json,csv}.
+    """
+    from pathlib import Path as _P
+    import json as _J
+    import csv as _CSV
+    device = next(model.parameters()).device if hasattr(model, 'parameters') else getattr(model, 'device', 'cpu')
+    results: Dict[int, Dict[str, float]] = {}
+    for B in budgets:
+        ems: List[float] = []
+        f1s: List[float] = []
+        thinks: List[float] = []
+        outs: List[str] = []
+        confs: List[float] = []
+        labs: List[float] = []
+        for ex in eval_dataset or []:
+            # Build prompt
+            prompt = ex.get('prompt') or ex.get('question') or ex.get('input') or ex.get('text') or ''
+            try:
+                enc = tokenizer(prompt, return_tensors='pt', add_special_tokens=True)
+                inp = enc['input_ids'].to(device)
+            except Exception:
+                # skip on failure
+                continue
+            d = decode_with_budget(tokenizer, model, inp, think_budget=int(B), max_new_tokens=128, temperature=temperature, top_p=top_p, visible_cot=False)
+            text = d.get('text') or ''
+            outs.append(text)
+            thinks.append(float(d.get('think_tokens_used') or 0.0))
+            gold = ex.get('gold') or ex.get('answer') or ex.get('target') or ''
+            ems.append(exact_match(text, gold))
+            f1s.append(token_f1(text, gold))
+            # Optional confidence/correctness if present
+            if ex.get('conf_prob') is not None and ex.get('correct') is not None:
+                try:
+                    confs.append(float(ex.get('conf_prob')))
+                    labs.append(float(ex.get('correct')))
+                except Exception:
+                    pass
+        # Aggregate
+        avg_think = float(sum(thinks) / max(1, len(thinks)))
+        leak = leakage_rate(outs)
+        em = float(sum(ems) / max(1, len(ems)))
+        f1 = float(sum(f1s) / max(1, len(f1s)))
+        ece = 0.0
+        brier = 0.0
+        if len(confs) == len(labs) and len(confs) > 0:
+            import torch as _t
+            rep = ece_brier_report(_t.tensor(confs), _t.tensor(labs))
+            ece = float(rep.get('ece') or 0.0)
+            brier = float(rep.get('brier') or 0.0)
+        results[int(B)] = {
+            'em': em,
+            'f1': f1,
+            'avg_think_tokens': avg_think,
+            'leakage': leak,
+            'ece': ece,
+            'brier': brier,
+        }
+    # Write artifacts
+    outp = _P(out_dir)
+    outp.mkdir(parents=True, exist_ok=True)
+    base = outp / f"budget_sweep_{split}"
+    (base.with_suffix('.json')).write_text(_J.dumps(results), encoding='utf-8')
+    # CSV: rows per budget with columns
+    cols = ['budget', 'em', 'f1', 'avg_think_tokens', 'leakage', 'ece', 'brier']
+    with (base.with_suffix('.csv')).open('w', encoding='utf-8', newline='') as f:
+        w = _CSV.DictWriter(f, fieldnames=cols)
+        w.writeheader()
+        for b in sorted(results.keys()):
+            row = {'budget': int(b), **results[b]}
+            w.writerow(row)
+    return results
 
 
 def _extract_think_span(body: str) -> str:

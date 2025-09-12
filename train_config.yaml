@@ -25,6 +25,8 @@ logging:
 
 sample_every: 50
 budget_cap: 128
+losses:
+  lambda_rewrite: 0.1
 metacog:
   linked_all_layers: true
   proj_dim: 128
@@ -35,3 +37,22 @@ conditioning:
   film: true
   film_scale: 0.05
   per_layer: true
+optim:
+  heads_lr: 5.0e-4
+  adapters_lr: 2.0e-4
+  base_top_lr: 5.0e-5
+  wd: 0.01
+  clip: 1.0
+fp:
+  dtype: bf16
+  grad_ckpt: true
+trainer:
+  enabled: false
+  epochs: 3
+  steps_per_eval: 1000
+  on_policy_interval: 200
+phases:
+  - {name: A, freeze_base: true,  train_adapters: true,  train_heads: true,  train_base_top: false, use_on_policy: false, budget_penalty_w: 0.0, think_ce_w: 0.0, quiet_star_w: 0.0}
+  - {name: B, freeze_base: true,  train_adapters: true,  train_heads: true,  train_base_top: false, use_on_policy: true,  budget_penalty_w: 0.1, think_ce_w: 0.0, quiet_star_w: 0.05}
+  - {name: C, freeze_base: false, train_adapters: true,  train_heads: true,  train_base_top: true,  use_on_policy: true,  budget_penalty_w: 0.2, think_ce_w: 0.1, quiet_star_w: 0.1}
+  - {name: D, freeze_base: true,  train_adapters: true,  train_heads: true,  train_base_top: false, use_on_policy: true,  budget_penalty_w: 0.1, think_ce_w: 0.0, quiet_star_w: 0.05}

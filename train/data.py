@@ -294,7 +294,7 @@ def make_collate_fn(
             batch_out["style_tag"] = style_tags
             batch_out["rewrite_pair_id"] = torch.tensor(rewrite_pair_ids, dtype=torch.long, device=device)
 
-        # Build rewrite groups (list[list[int]]) in sample order
+        # Build rewrite groups (list[list[int]]) and explicit pair map (list[tuple[int,int]])
         groups_map: Dict[int, List[int]] = {}
         for i, rp in enumerate(rewrite_pair_ids):
             if rp is None:
@@ -303,8 +303,14 @@ def make_collate_fn(
             if rid >= 0:
                 groups_map.setdefault(rid, []).append(i)
         rewrite_groups = [idxs for _, idxs in groups_map.items()]
+        pair_map: List[Tuple[int, int]] = []
+        for g in rewrite_groups:
+            if isinstance(g, (list, tuple)) and len(g) >= 2:
+                for a in range(len(g)):
+                    for b in range(a + 1, len(g)):
+                        pair_map.append((int(g[a]), int(g[b])))
 
-        batch_out["batch_meta"] = {"rewrite_groups": rewrite_groups}
+        batch_out["batch_meta"] = {"rewrite_groups": rewrite_groups, "rewrite_pair_map": pair_map}
         return batch_out
 
     return _collate
