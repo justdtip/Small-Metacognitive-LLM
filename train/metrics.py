@@ -245,3 +245,55 @@ def rewrite_kl_mean(records: List[Dict[str, Any]]) -> float:
         return float(statistics.fmean(vals))
     except Exception:
         return float(sum(vals) / max(1, len(vals)))
+
+
+# --------- Layer diagnostics helpers (optional) ---------
+def plan_agreement_rate(plan_logits_pl: torch.Tensor, plan_logits_agg: torch.Tensor) -> float:
+    """
+    Fraction of layers whose argmax plan equals the aggregated argmax plan.
+    - plan_logits_pl: [B,L,K]
+    - plan_logits_agg: [B,K]
+    Returns mean across batch in [0,1].
+    """
+    if not (torch.is_tensor(plan_logits_pl) and torch.is_tensor(plan_logits_agg)):
+        return 0.0
+    try:
+        pa = torch.argmax(plan_logits_agg, dim=-1).view(-1, 1)  # [B,1]
+        pl = torch.argmax(plan_logits_pl, dim=-1)               # [B,L]
+        agree = (pl == pa).float().mean(dim=1)
+        return float(agree.mean().item())
+    except Exception:
+        return 0.0
+
+
+def budget_variance_mean(budget_raw_pl: torch.Tensor) -> float:
+    """
+    Mean variance over layers of per-layer budgets (sigmoid(raw) for stability).
+    - budget_raw_pl: [B,L,1]
+    Returns scalar float.
+    """
+    if not torch.is_tensor(budget_raw_pl):
+        return 0.0
+    try:
+        x = torch.sigmoid(budget_raw_pl.view(budget_raw_pl.shape[0], budget_raw_pl.shape[1]))
+        v = x.var(dim=1, unbiased=False).mean()
+        return float(v.item())
+    except Exception:
+        return 0.0
+
+
+def alpha_entropy_mean(alpha: torch.Tensor, eps: float = 1e-8) -> float:
+    """
+    Mean entropy of attention weights over layers; normalized by log(L).
+    - alpha: [B,L]
+    """
+    if not torch.is_tensor(alpha):
+        return 0.0
+    try:
+        p = alpha.clamp_min(eps)
+        H = -(p * p.log()).sum(dim=1)
+        norm = torch.log(torch.tensor(float(p.shape[1]), dtype=H.dtype, device=H.device)).clamp_min(1.0)
+        Hn = (H / norm).mean().clamp(0.0, 1.0)
+        return float(Hn.item())
+    except Exception:
+        return 0.0

@@ -256,6 +256,8 @@ def compute_losses(
     noise_present: Optional[torch.Tensor] = None,
     noise_len_increase: Optional[torch.Tensor] = None,
     noise_acc_gain: Optional[torch.Tensor] = None,
+    # per-layer diagnostics (optional)
+    per_layer: Optional[Dict[str, torch.Tensor]] = None,
 ):
     """
     Compute masked answer CE and optional regularizers/auxiliaries.
@@ -271,6 +273,7 @@ def compute_losses(
     weights = weights or {"answer_ce": 1.0, "gate_reg": 0.0, "aux_mix": 0.0,
                           "plan_ce": 0.0, "budget_reg": 0.0, "conf_cal": 0.0, "style_inv": 0.0,
                           "rubric": 0.0, "evidence": 0.0, "wrongthink": 0.0, "noise_marker": 0.0,
+                          "var_reg": 0.0,
                           "rewrite_consistency": 0.0}
     loss_total = torch.tensor(0.0, dtype=logits.dtype, device=logits.device)
     out = {}
@@ -442,6 +445,35 @@ def compute_losses(
     loss_total = loss_total + out["rewrite_kl"]
     # Back-compat: keep key present for older tooling
     out["rewrite_consistency"] = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
+
+    # Per-layer variance regularizer (agreement encouragement across layers)
+    try:
+        w_var = float(weights.get("var_reg", 0.0) or 0.0)
+    except Exception:
+        w_var = 0.0
+    if w_var > 0.0 and isinstance(per_layer, dict):
+        vloss = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
+        try:
+            # Budget variance over layers (use sigmoid of raw to be scale-invariant)
+            braw = per_layer.get("budget_raw_pl")
+            if torch.is_tensor(braw) and braw.dim() == 3:
+                pb = torch.sigmoid(braw).view(braw.shape[0], braw.shape[1])  # [B,L]
+                # mean variance per example
+                v_b = pb.var(dim=1, unbiased=False).mean()
+                vloss = vloss + v_b
+            # Plan disagreement: variance of per-layer plan probabilities vs mean
+            plog = per_layer.get("plan_logits_pl")
+            if torch.is_tensor(plog) and plog.dim() == 3:
+                p = torch.softmax(plog, dim=-1)  # [B,L,K]
+                pm = p.mean(dim=1, keepdim=True)  # [B,1,K]
+                v_p = ((p - pm) ** 2).mean()  # scalar
+                vloss = vloss + v_p
+        except Exception:
+            vloss = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
+        out["var_reg"] = vloss
+        loss_total = loss_total + w_var * vloss
+    else:
+        out["var_reg"] = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
 
     out["total"] = loss_total
     return out

@@ -6,6 +6,7 @@ import json
 import threading
 import torch
 from transformers import StoppingCriteria, StoppingCriteriaList, TextIteratorStreamer
+import torch.nn as nn
 import re
 
 from .tokenizer_utils import ensure_reasoning_tokens
@@ -24,6 +25,20 @@ class EngineConfig:
     adapter_layers: Optional[List[int]] = None   # None → all
     # taps for metacog heads
     taps: Sequence[int] = (6, 10, 14)
+    # linked-all-layers metacog options
+    linked_all_layers: bool = False
+    proj_dim: int = 128
+    agg: str = "attn"
+    dump_per_layer: bool = False
+    # FiLM conditioning (think-only)
+    conditioning_film: bool = False
+    conditioning_film_scale: float = 0.05
+    conditioning_per_layer: bool = True
+    # linked-all-layers metacog options
+    linked_all_layers: bool = False
+    proj_dim: int = 128
+    agg: str = "attn"  # 'attn' | 'mean'
+    dump_per_layer: bool = False
     # optional calibration blob path (JSON): {"conf_temp": float}
     calibration_path: Optional[str] = None
     # optional reasoning style tag to hint at serve (e.g., 'checklist','explainer')
@@ -133,7 +148,15 @@ class IntrospectiveEngine:
         )
 
         # Light metacognitive heads (you'll train later)
-        self.metacog = MetacogHeads(MetacogConfig(hidden_size=hidden_size, taps=cfg.taps))
+        self.metacog = MetacogHeads(MetacogConfig(
+            hidden_size=hidden_size,
+            taps=cfg.taps,
+            proj_dim=int(getattr(cfg, "proj_dim", 128)),
+            head_temp=1.0,
+            linked_all_layers=bool(getattr(cfg, "linked_all_layers", False)),
+            agg=str(getattr(cfg, "agg", "attn")),
+            dump_per_layer=bool(getattr(cfg, "dump_per_layer", False)),
+        ))
 
         # Ensure side modules live on the same device as the base model
         try:
@@ -147,6 +170,26 @@ class IntrospectiveEngine:
         self.metacog.to(device=model_device, dtype=model_dtype)
         # Move adapter params as well (the wrapped model's params stay where they are)
         self.scaffold.to(device=model_device, dtype=model_dtype)
+
+        # Optional FiLM projection heads for conditioning
+        self._film_enabled = bool(getattr(self.cfg, "conditioning_film", False))
+        self._film_scale = float(getattr(self.cfg, "conditioning_film_scale", 0.05) or 0.05)
+        self._film_per_layer = bool(getattr(self.cfg, "conditioning_per_layer", True))
+        self._film_gamma_head = None
+        self._film_beta_head = None
+        self._film_gamma_layers = None
+        self._film_beta_layers = None
+        self._last_state_g: Optional[torch.Tensor] = None
+        if self._film_enabled:
+            D = int(getattr(self.metacog.cfg, "proj_dim", 128))
+            if self._film_per_layer:
+                self._film_gamma_layers = nn.ModuleList([nn.Linear(D, hidden_size) for _ in range(num_layers)])
+                self._film_beta_layers = nn.ModuleList([nn.Linear(D, hidden_size) for _ in range(num_layers)])
+                self._film_gamma_layers.to(device=model_device, dtype=model_dtype)
+                self._film_beta_layers.to(device=model_device, dtype=model_dtype)
+            else:
+                self._film_gamma_head = nn.Linear(D, hidden_size).to(device=model_device, dtype=model_dtype)
+                self._film_beta_head = nn.Linear(D, hidden_size).to(device=model_device, dtype=model_dtype)
 
         # Resolve visible_cot default, stop sequences, and calibration path from service config if not explicitly provided
         try:
@@ -202,7 +245,7 @@ class IntrospectiveEngine:
         # Tap registration: cache last-token states from chosen layers
         dec_layers = self.scaffold._get_decoder_layers(self.model)
         for i, layer in enumerate(dec_layers):
-            if i in cfg.taps:
+            if bool(getattr(cfg, "linked_all_layers", False)) or (i in cfg.taps):
                 def _hook(mod, inp, out, _i=i):
                     # out can be Tensor or a tuple containing hidden states as first element
                     hs = None
@@ -253,15 +296,57 @@ class IntrospectiveEngine:
     def _estimate_budget(self, input_ids) -> int:
         # Dry forward to populate taps, then ask metacog for budget
         with torch.no_grad():
-            _ = self.model(input_ids=input_ids, attention_mask=torch.ones_like(input_ids),
+            outputs = self.model(input_ids=input_ids, attention_mask=torch.ones_like(input_ids),
                            use_cache=False, output_hidden_states=True, return_dict=True)
-        out = self.metacog(B_max=self.cfg.budget_cap)
+            # Fallback: if hooks didn't populate taps (e.g., wrapper output type), use hidden_states
+            try:
+                has_cache = bool(getattr(self.metacog, "_tap_cache", {})) and any(self.metacog._tap_cache.values())
+                if (not has_cache) and isinstance(getattr(outputs, "hidden_states", None), (list, tuple)):
+                    self.metacog.clear_cache()
+                    hs_list = list(outputs.hidden_states)
+                    # HF typically returns embeddings at index 0, then per-layer states
+                    start = 1 if len(hs_list) >= 2 else 0
+                    for li, hs in enumerate(hs_list[start:]):
+                        if torch.is_tensor(hs):
+                            self.metacog.register_tap(li, hs)
+            except Exception:
+                pass
+        out = self.metacog(B_max=self.cfg.budget_cap, return_state=True)
         out = self._postprocess_heads(out)
+        try:
+            st = out.get("state") if isinstance(out, dict) else None
+            if torch.is_tensor(st):
+                self._last_state_g = st.detach()
+        except Exception:
+            self._last_state_g = None
         # record metacog head outputs for observability
         try:
             plan_logits = out.get("plan_logits")
             conf_val = float(out["confidence"][0].item()) if out.get("confidence") is not None else None
             raw_budget = float(out["budget"][0].item()) if out.get("budget") is not None else None
+            # Per-layer diagnostics summary if present
+            try:
+                per = out.get("per_layer") if isinstance(out, dict) else None
+                alpha = per.get("alpha") if isinstance(per, dict) else None
+                if torch.is_tensor(alpha):
+                    a = alpha.detach().float()
+                    self.last_stats["alpha_summary"] = {
+                        "min": float(a.min().item()),
+                        "mean": float(a.mean().item()),
+                        "max": float(a.max().item()),
+                    }
+                # Plan agreement rate (first sample) if available
+                try:
+                    plog_pl = per.get("plan_logits_pl") if isinstance(per, dict) else None
+                    if torch.is_tensor(plan_logits) and torch.is_tensor(plog_pl):
+                        agg_arg = torch.argmax(plan_logits[0], dim=-1)
+                        pl_args = torch.argmax(plog_pl[0], dim=-1)  # [L]
+                        agree = (pl_args == agg_arg).float().mean()
+                        self.last_stats["plan_agreement"] = float(agree.item())
+                except Exception:
+                    pass
+            except Exception:
+                pass
             # Plan selection with optional thresholds
             plan_idx = None
             plan_label = None
@@ -307,6 +392,7 @@ class IntrospectiveEngine:
             "conf_prob": conf_val,
             "conf_temp": self._conf_temp,
             "think_budget": b,
+            "linked_all_layers": bool(getattr(self.cfg, "linked_all_layers", False)),
         }
         if plan_label is not None:
             stats["plan_label"] = plan_label
@@ -317,6 +403,40 @@ class IntrospectiveEngine:
             stats["budget_clip"] = int(self._budget_clip)
         self.last_stats.update(stats)
         return b
+
+    def _compute_film_params(self, g: torch.Tensor) -> Optional[tuple[list[torch.Tensor], list[torch.Tensor]]]:
+        if not self._film_enabled or (g is None) or (not torch.is_tensor(g)):
+            return None
+        try:
+            with torch.no_grad():
+                gv = g[0] if g.dim() == 2 else g.view(-1)
+                if self._film_per_layer and self._film_gamma_layers is not None and self._film_beta_layers is not None:
+                    gammas = []
+                    betas = []
+                    for lg, lb in zip(self._film_gamma_layers, self._film_beta_layers):
+                        g_vec = torch.tanh(lg(gv))
+                        b_vec = torch.tanh(lb(gv))
+                        gammas.append(1.0 + self._film_scale * g_vec)
+                        betas.append(self._film_scale * b_vec)
+                else:
+                    g_vec = torch.tanh(self._film_gamma_head(gv)) if self._film_gamma_head is not None else torch.zeros_like(gv)
+                    b_vec = torch.tanh(self._film_beta_head(gv)) if self._film_beta_head is not None else torch.zeros_like(gv)
+                    vec_g = 1.0 + self._film_scale * g_vec
+                    vec_b = self._film_scale * b_vec
+                    L = len(getattr(self.scaffold, 'adapters', []))
+                    gammas = [vec_g for _ in range(max(1, L))]
+                    betas = [vec_b for _ in range(max(1, L))]
+                # Telemetry
+                try:
+                    dg = torch.stack([torch.abs(x - 1.0).mean() for x in gammas]).mean()
+                    db = torch.stack([torch.abs(x).mean() for x in betas]).mean()
+                    self.last_stats["film_gamma_mean_delta"] = float(dg.item())
+                    self.last_stats["film_beta_mean_abs"] = float(db.item())
+                except Exception:
+                    pass
+                return gammas, betas
+        except Exception:
+            return None
 
     @staticmethod
     def apply_conf_temperature(prob: Any, temp: float) -> Any:
@@ -468,6 +588,13 @@ class IntrospectiveEngine:
                         with self.scaffold.think():
                             self.model.generate(**gen_kwargs1)
                 t1 = threading.Thread(target=_worker1, daemon=True)
+                # Optional FiLM conditioning (think-only)
+                try:
+                    fp = self._compute_film_params(self._last_state_g)
+                    if fp is not None:
+                        self.scaffold.set_film(*fp)
+                except Exception:
+                    pass
                 t1.start()
                 for piece in streamer1:
                     # stream visible think tokens directly
@@ -496,6 +623,13 @@ class IntrospectiveEngine:
                         out1 = input_ids
             else:
                 with torch.no_grad():
+                    # Optional FiLM conditioning (think-only)
+                    try:
+                        fp = self._compute_film_params(self._last_state_g)
+                        if fp is not None:
+                            self.scaffold.set_film(*fp)
+                    except Exception:
+                        pass
                     with self.scaffold.think():
                         out1 = self.model.generate(
                         input_ids=input_ids,

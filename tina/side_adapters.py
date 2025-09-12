@@ -114,6 +114,9 @@ class IntrospectionScaffold(nn.Module):
         self._hooks = []
         # context-local think flag; per-request isolation
         self._think_flag: contextvars.ContextVar = contextvars.ContextVar("tina_think", default=False)
+        # Optional FiLM modulation parameters, set per request
+        self._film_gamma: Optional[List[torch.Tensor]] = None  # list of [H] or broadcastable to [B,T,H]
+        self._film_beta: Optional[List[torch.Tensor]] = None
 
         target_layers = cfg.layers if cfg.layers is not None else list(range(num_layers))
         # create per-layer adapter module
@@ -129,22 +132,67 @@ class IntrospectionScaffold(nn.Module):
             k = idx_map[i]
             adap = self.adapters[k]
 
-            def hook_fn(module, inputs, output, _adap=adap):
+            def hook_fn(module, inputs, output, _adap=adap, _layer_idx=k):
                 # Apply adapter only in think mode (context-local), and handle tuple outputs
                 try:
                     if not self._think_flag.get():
                         return output
                 except LookupError:
                     return output
+                def _apply_film(h: torch.Tensor, idx: int) -> torch.Tensor:
+                    try:
+                        g_list = self._film_gamma
+                        b_list = self._film_beta
+                        if (g_list is None) and (b_list is None):
+                            return h
+                        B, T, H = h.shape
+                        gamma = None
+                        beta = None
+                        if isinstance(g_list, list) and 0 <= idx < len(g_list) and torch.is_tensor(g_list[idx]):
+                            gamma = g_list[idx].to(h.device, dtype=h.dtype)
+                        if isinstance(b_list, list) and 0 <= idx < len(b_list) and torch.is_tensor(b_list[idx]):
+                            beta = b_list[idx].to(h.device, dtype=h.dtype)
+                        if gamma is None and beta is None:
+                            return h
+                        if gamma is not None:
+                            if gamma.dim() == 1:
+                                gamma = gamma.view(1, 1, -1)
+                            elif gamma.dim() == 2:
+                                gamma = gamma.view(gamma.shape[0], 1, gamma.shape[1])
+                            elif gamma.dim() == 3:
+                                pass
+                            else:
+                                gamma = gamma.view(1, 1, -1)
+                        if beta is not None:
+                            if beta.dim() == 1:
+                                beta = beta.view(1, 1, -1)
+                            elif beta.dim() == 2:
+                                beta = beta.view(beta.shape[0], 1, beta.shape[1])
+                            elif beta.dim() == 3:
+                                pass
+                            else:
+                                beta = beta.view(1, 1, -1)
+                        y = h
+                        if gamma is not None:
+                            y = y * gamma
+                        if beta is not None:
+                            y = y + beta
+                        return y
+                    except Exception:
+                        return h
                 # Direct tensor output
                 if torch.is_tensor(output):
-                    return _adap(output)
+                    y = _adap(output)
+                    y = _apply_film(y, _layer_idx)
+                    return y
                 # Tuple/list: assume first element is hidden_states tensor
                 if isinstance(output, tuple) and len(output) > 0 and torch.is_tensor(output[0]):
                     new_h = _adap(output[0])
+                    new_h = _apply_film(new_h, _layer_idx)
                     return (new_h, *output[1:])
                 if isinstance(output, list) and len(output) > 0 and torch.is_tensor(output[0]):
                     new_h = _adap(output[0])
+                    new_h = _apply_film(new_h, _layer_idx)
                     rest = list(output[1:])
                     return [new_h, *rest]
                 # Unknown structure; no-op to avoid breaking model
@@ -194,6 +242,11 @@ class IntrospectionScaffold(nn.Module):
                     scaffold._think_flag.reset(self_._tok)
                 except Exception:
                     scaffold._think_flag.set(False)
+                # Clear any FiLM modulation at the end of THINK scope
+                try:
+                    scaffold.clear_film()
+                except Exception:
+                    pass
         return _Ctx()
 
     def forward(self, *args, **kwargs):
@@ -214,6 +267,18 @@ class IntrospectionScaffold(nn.Module):
             self.close()
         except Exception:
             pass
+
+    # ---- FiLM conditioning interface ----
+    def set_film(self, gamma: Optional[List[torch.Tensor]] = None, beta: Optional[List[torch.Tensor]] = None) -> None:
+        """Register FiLM modulation parameters for each attached adapter layer.
+        gamma/beta should be lists of length len(self.adapters) with vectors broadcastable to hidden size.
+        """
+        self._film_gamma = gamma
+        self._film_beta = beta
+
+    def clear_film(self) -> None:
+        self._film_gamma = None
+        self._film_beta = None
 
 # Context variable for per-token think mask provided at train time
 _ctx_think_mask: ContextVar = ContextVar("_ctx_think_mask", default=None)

@@ -25,3 +25,13 @@ logging:
 
 sample_every: 50
 budget_cap: 128
+metacog:
+  linked_all_layers: true
+  proj_dim: 128
+  agg: attn
+  head_temp: 1.0
+  var_reg: 0.0
+conditioning:
+  film: true
+  film_scale: 0.05
+  per_layer: true

@@ -183,7 +183,35 @@ def run_one_cycle(args) -> Dict[str, Any]:
     # Attach side adapters and metacog heads using the serve engine for parity hooks
     hidden_size = getattr(getattr(model, 'config', None), 'hidden_size', 2048)
     num_layers = getattr(getattr(model, 'config', None), 'num_hidden_layers', 24)
-    eng = IntrospectiveEngine(model=model, tokenizer=tok, cfg=EngineConfig(visible_cot=False),
+    # Read metacog/conditioning flags from train_config.yaml if available
+    cfg_file = ROOT / "train_config.yaml"
+    mc = {}
+    cond = {}
+    if cfg_file.exists():
+        try:
+            import yaml as _yaml
+            d = _yaml.safe_load(cfg_file.read_text(encoding="utf-8")) or {}
+            mc = d.get("metacog") or {}
+            cond = d.get("conditioning") or {}
+        except Exception:
+            try:
+                import json as _json
+                d = _json.loads(cfg_file.read_text(encoding="utf-8"))
+                mc = d.get("metacog") or {}
+                cond = d.get("conditioning") or {}
+            except Exception:
+                mc = {}; cond = {}
+    eng_cfg = EngineConfig(
+        visible_cot=False,
+        linked_all_layers=bool(mc.get("linked_all_layers", False)),
+        proj_dim=int(mc.get("proj_dim", 128) or 128),
+        agg=str(mc.get("agg", "attn") or "attn"),
+        dump_per_layer=True,
+        conditioning_film=bool(cond.get("film", False)),
+        conditioning_film_scale=float(cond.get("film_scale", 0.05) or 0.05),
+        conditioning_per_layer=bool(cond.get("per_layer", True)),
+    )
+    eng = IntrospectiveEngine(model=model, tokenizer=tok, cfg=eng_cfg,
                               hidden_size=int(hidden_size), num_layers=int(num_layers))
     # Initialize adapter gates to non-zero for testing to surface coverage telemetry
     try:
@@ -425,6 +453,14 @@ def run_one_cycle(args) -> Dict[str, Any]:
         "eval_fraction": eval_frac,
         "leakage_detected": bool(leakage_detected),
     }
+    # Optional diagnostics from engine
+    try:
+        rec["alpha_summary"] = eng.last_stats.get("alpha_summary")
+        rec["plan_agreement"] = eng.last_stats.get("plan_agreement")
+        rec["film_gamma_mean_delta"] = eng.last_stats.get("film_gamma_mean_delta")
+        rec["film_beta_mean_abs"] = eng.last_stats.get("film_beta_mean_abs")
+    except Exception:
+        pass
     return rec
 
 
