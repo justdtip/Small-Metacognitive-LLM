@@ -7,16 +7,23 @@ import torch
 
 def plan_ce(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     """
-    Cross-entropy over discrete plan classes.
+    Cross-entropy over discrete plan classes with safe masking for invalid targets.
     - logits: (N, K) or (..., K)
-    - targets: (N,) or matching leading dims; int64 in [0..K-1]
-    Returns a scalar mean loss.
+    - targets: (N,) or matching leading dims; may include negatives for missing labels.
+    Returns a scalar mean loss over valid targets; 0.0 if none valid.
     """
     if logits.ndim > 2:
-        K = logits.shape[-1]
+        K = int(logits.shape[-1])
         logits = logits.view(-1, K)
         targets = targets.view(-1)
-    return torch.nn.functional.cross_entropy(logits, targets)
+    else:
+        K = int(logits.shape[-1])
+    # Ensure long dtype for class indices
+    tgt = targets.to(dtype=torch.long)
+    valid = (tgt >= 0) & (tgt < K)
+    if not torch.any(valid):
+        return torch.tensor(0.0, dtype=logits.dtype, device=logits.device)
+    return torch.nn.functional.cross_entropy(logits[valid], tgt[valid])
 
 
 def budget_reg(pred_budget: torch.Tensor, target_budget: torch.Tensor, *, huber_delta: float = 10.0,
@@ -277,10 +284,14 @@ def compute_losses(
                           "rewrite_consistency": 0.0}
     loss_total = torch.tensor(0.0, dtype=logits.dtype, device=logits.device)
     out = {}
-    # Flatten for CE
+    # Flatten for CE with safety: mask any labels outside [0, V-1]
     B, T, V = logits.shape
+    lab = labels.to(dtype=torch.long, device=logits.device)
+    invalid = (lab >= V) | (lab < 0)
+    if invalid.any():
+        lab = lab.masked_fill(invalid, -100)
     ce = torch.nn.functional.cross_entropy(
-        logits.view(B * T, V), labels.view(B * T), ignore_index=-100
+        logits.view(B * T, V), lab.view(B * T), ignore_index=-100
     )
     out["answer_ce"] = ce
     loss_total = loss_total + weights.get("answer_ce", 1.0) * ce
