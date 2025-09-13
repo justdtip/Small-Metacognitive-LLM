@@ -1,6 +1,6 @@
 {
   "model": {
-    "base": "model/Base"
+    "base": "model/Tina"
   },
   "trainer": {
     "mode": "supervised",
@@ -27,7 +27,7 @@
   },
   "lm_adaptation": {
     "enabled": true,
-    "mode": "ln_only",
+    "mode": "lora",
     "last_k_layers": 2,
     "apply_to_all_layers": true,
     "layer_indices": []

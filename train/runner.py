@@ -1159,6 +1159,10 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
         tok = AutoTokenizer.from_pretrained(str(base_path), use_fast=True, trust_remote_code=True, local_files_only=True)
         if getattr(tok, "pad_token", None) is None and getattr(tok, "eos_token", None) is not None:
             tok.pad_token = tok.eos_token
+        try:
+            tok.padding_side = "left"
+        except Exception:
+            pass
         device = (
             "cuda" if torch.cuda.is_available() else
             "mps" if getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available() else
@@ -1223,6 +1227,10 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
             # set PAD if missing
             if getattr(tok, "pad_token", None) is None and getattr(tok, "eos_token", None) is not None:
                 tok.pad_token = tok.eos_token
+            try:
+                tok.padding_side = "left"
+            except Exception:
+                pass
             # Load base on a single device (prefer GPU if available)
             device = (
                 "cuda" if torch.cuda.is_available() else

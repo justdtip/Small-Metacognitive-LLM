@@ -1,0 +1,24 @@
+{
+"model": { "model_name_or_path": "model/Base" },
+"trainer": { "mode": "supervised", "dashboard": true },
+"data": { "dataset_name": "jsonl", "jsonl": "data/train.jsonl", "limit_train": 1024, "streaming": false },
+"use_predicted_budget": true,
+"metacog": {
+"linked_all_layers": true,
+"dump_per_layer": true,
+"num_experts": 3,
+"feedback": true,
+"feedback_dim": null,
+"agg": "attn",
+"var_reg": 0.001
+},
+"lm_adaptation": {
+"enabled": true,
+"mode": "lora",
+"apply_to_all_layers": true,
+"last_k_layers": 24
+},
+"optim": { "heads_lr": 5e-4, "adapters_lr": 2e-4, "base_top_lr": 5e-5, "wd": 0.01 },
+"schedule": { "budget_cap": 10000 },
+"probe_interval": 1000
+}
