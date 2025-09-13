@@ -3,7 +3,13 @@ model:
   adapter:
     path: model/Tina/checkpoint-2000
 data:
+  dataset_name: jsonl   # 'jsonl' or 'glaive'
   jsonl: data/train.jsonl
+  split: train
+  path: null
+  streaming: false
+  val_split: null
+  limit_train: null
   batch_size: 8
   strict: true
 schedule:

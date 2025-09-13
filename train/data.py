@@ -17,7 +17,7 @@ mask). Stopping and masking for training remain based on </think> and
 </answer> only by default.
 """
 
-from typing import List, Dict, Tuple, Any, Optional, Callable
+from typing import List, Dict, Tuple, Any, Optional, Callable, Iterator
 import os
 
 try:
@@ -44,6 +44,51 @@ class ReasoningDataset:
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         return self.examples[idx]
+
+
+# ---- Glaive reasoning dataset loader -------------------------------------------
+try:
+    from datasets import load_dataset  # type: ignore
+except Exception:  # pragma: no cover
+    load_dataset = None  # type: ignore
+
+
+class GlaiveDataset:
+    """
+    Stream or load the glaiveai/reasoning-v1-20m dataset and transform each record
+    to Tina's expected {'text': '<prompt> <think>..</think> <answer>..</answer>'} format.
+    The upstream dataset has fields: {'prompt': str, 'response': str}, where response
+    contains a '<think>...</think>' block followed by the final answer text.
+    """
+    def __init__(self, split: str = 'train', path: Optional[str] = None, streaming: bool = False):
+        if load_dataset is None:
+            raise RuntimeError("datasets is not installed; cannot load glaive dataset")
+        kwargs: Dict[str, Any] = {}
+        self.split = split
+        if path:
+            kwargs['data_files'] = {split: path}
+        self.ds = load_dataset('glaiveai/reasoning-v1-20m', split=split, streaming=bool(streaming), **kwargs)
+        self.streaming = bool(streaming)
+
+    def __len__(self) -> int:  # pragma: no cover - streaming may not support len
+        try:
+            return len(self.ds)  # type: ignore[arg-type]
+        except Exception:
+            return 0
+
+    def __iter__(self) -> Iterator[Dict[str, Any]]:
+        for rec in self.ds:  # type: ignore[operator]
+            prompt = (rec.get('prompt') or '').strip()
+            resp = (rec.get('response') or '').strip()
+            # find closing </think>
+            end = resp.find('</think>')
+            if end != -1:
+                reasoning = resp[:end + len('</think>')].strip()
+                answer = resp[end + len('</think>'):].strip()
+                text = f"{prompt} {reasoning} <answer> {answer} </answer>"
+            else:
+                text = f"{prompt} <answer> {resp} </answer>"
+            yield {'text': text}
 
 
 def pad_and_stack(

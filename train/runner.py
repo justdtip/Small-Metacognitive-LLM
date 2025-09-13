@@ -898,25 +898,50 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
         model = TinyLM(vocab_size=max(tok.vocab.values()) + 64, hidden=64)
 
     # Data
-    examples: list[dict] = []
-    try:
-        if data_path:
-            for line in Path(data_path).read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    examples.append(json.loads(line))
-                except Exception:
-                    pass
-        if not examples:
-            examples = [{"text": "<think> alpha beta </think> <answer> ok </answer>"}]
-    except Exception:
-        examples = [{"text": "<think> alpha beta </think> <answer> ok </answer>"}]
+    data_cfg = cfg.get("data") or {}
+    ds_name = (data_cfg.get("dataset_name") or "jsonl").lower()
     from train.data import make_collate_fn
-    strict = bool(((cfg.get("data") or {}).get("strict") is not False))
+    strict = bool((data_cfg.get("strict") is not False))
     collate = make_collate_fn(tok, loss_on="answer", strict=strict)
-    batch = collate(examples)
+    batch = None
+    if ds_name == 'glaive':
+        # Stream a small batch from the glaive dataset
+        try:
+            from train.data import GlaiveDataset  # type: ignore
+            split = str(data_cfg.get('split') or 'train')
+            path_opt = data_cfg.get('path')
+            streaming = bool(data_cfg.get('streaming', False))
+            ds = GlaiveDataset(split=split, path=path_opt, streaming=streaming)
+            # Collect up to batch_size examples
+            bs = int((data_cfg.get('batch_size') or 8))
+            examples = []
+            for i, rec in enumerate(ds):
+                examples.append({'text': rec.get('text') or ''})
+                if len(examples) >= bs:
+                    break
+            if not examples:
+                examples = [{"text": "<think> alpha beta </think> <answer> ok </answer>"}]
+            batch = collate(examples)
+        except Exception:
+            batch = None
+    if batch is None:
+        # Fallback to JSONL path
+        examples: list[dict] = []
+        try:
+            if data_path:
+                for line in Path(data_path).read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        examples.append(json.loads(line))
+                    except Exception:
+                        pass
+            if not examples:
+                examples = [{"text": "<think> alpha beta </think> <answer> ok </answer>"}]
+        except Exception:
+            examples = [{"text": "<think> alpha beta </think> <answer> ok </answer>"}]
+        batch = collate(examples)
 
     # Optimizer for a real parameter update (actual training step)
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-4)
