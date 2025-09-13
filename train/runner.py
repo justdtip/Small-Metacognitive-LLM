@@ -47,6 +47,56 @@ except Exception:  # pragma: no cover
     yaml = None  # type: ignore
 
 
+# ---- Utilities: parameter summary and dataset probing -------------------------
+def summarize_trainable_params(model):
+    """Print a compact summary of trainable parameters by top-level module group.
+
+    Returns a dict {total: int, by_group: Dict[str,int]}.
+    """
+    total = 0
+    by_group: Dict[str, int] = {}
+    try:
+        for name, p in model.named_parameters():  # type: ignore[attr-defined]
+            if getattr(p, "requires_grad", False):
+                n = int(getattr(p, "numel", lambda: 0)() or 0)
+                total += n
+                group = str(name).split('.')[0] if isinstance(name, str) else "root"
+                by_group[group] = int(by_group.get(group, 0) + n)
+    except Exception:
+        pass
+    print(f"[PARAM SUMMARY] total trainable params: {total}")
+    for k in sorted(by_group.keys()):
+        print(f"[PARAM SUMMARY] {k}: {by_group[k]}")
+    return {"total": total, "by_group": by_group}
+
+
+def estimate_max_tokens(dataset, tokenizer, sample_size: int = 1000) -> int:
+    """Estimate maximum tokenized length over up to sample_size examples.
+
+    Accepts an iterable of records where each record is a dict containing
+    either 'text' or ('prompt','response').
+    """
+    max_len = 0
+    if dataset is None:
+        return max_len
+    for i, rec in enumerate(dataset):
+        if i >= int(sample_size):
+            break
+        try:
+            text = rec.get('text') if isinstance(rec, dict) else None
+            if not text and isinstance(rec, dict):
+                text = f"{rec.get('prompt','')} {rec.get('response','')}".strip()
+            if not text:
+                continue
+            ids = tokenizer.encode(text, add_special_tokens=False)  # type: ignore[attr-defined]
+            if isinstance(ids, (list, tuple)):
+                if len(ids) > max_len:
+                    max_len = len(ids)
+        except Exception:
+            continue
+    return int(max_len)
+
+
 @dataclass
 class SmokeCfg:
     vocab_size: int = 256
@@ -417,20 +467,23 @@ class Trainer:
                         if isinstance(per_layer, dict):
                             alpha = per_layer.get("alpha")
                             per_pl = per_layer.get("plan_logits_pl")
-                        _dash.update({
-                            "step": t,
-                            "loss_total": float(out_losses["total"].item()),
-                            "loss_answer": float(out_losses.get("answer_ce", torch.tensor(0.0)).item()) if isinstance(out_losses.get("answer_ce"), torch.Tensor) else out_losses.get("answer_ce"),
-                            "loss_rl": float(out_losses.get("budget_reg", torch.tensor(0.0)).item()) if isinstance(out_losses.get("budget_reg"), torch.Tensor) else out_losses.get("budget_reg"),
-                            "reward_mean": None,
-                            "think_tokens": think_used,
-                            "budget_pred": float(budget_pred.mean().item()) if isinstance(budget_pred, torch.Tensor) else None,
-                            "budget_target": float(budget_target.mean().item()) if isinstance(budget_target, torch.Tensor) else None,
-                            "plan_pred": int(plan_logits.argmax(dim=-1)[0].item()) if isinstance(plan_logits, torch.Tensor) and plan_logits.numel() > 0 else None,
-                            "confidence": float(conf_prob.mean().item()) if isinstance(conf_prob, torch.Tensor) else None,
-                            "alpha": alpha,
-                            "per_layer_plan": per_pl,
-                        })
+                    _dash.update({
+                        "step": t,
+                        "loss_total": float(out_losses["total"].item()),
+                        "loss_answer": float(out_losses.get("answer_ce", torch.tensor(0.0)).item()) if isinstance(out_losses.get("answer_ce"), torch.Tensor) else out_losses.get("answer_ce"),
+                        "loss_rl": float(out_losses.get("budget_reg", torch.tensor(0.0)).item()) if isinstance(out_losses.get("budget_reg"), torch.Tensor) else out_losses.get("budget_reg"),
+                        "reward_mean": None,
+                        "think_tokens": think_used,
+                        "budget_pred": float(budget_pred.mean().item()) if isinstance(budget_pred, torch.Tensor) else None,
+                        "budget_target": float(budget_target.mean().item()) if isinstance(budget_target, torch.Tensor) else None,
+                        "plan_pred": int(plan_logits.argmax(dim=-1)[0].item()) if isinstance(plan_logits, torch.Tensor) and plan_logits.numel() > 0 else None,
+                        "confidence": float(conf_prob.mean().item()) if isinstance(conf_prob, torch.Tensor) else None,
+                        "alpha": alpha,
+                        "per_layer_plan": per_pl,
+                        "policy": head_out.get("policy") if isinstance(head_out, dict) else None,
+                        "expert_weights": head_out.get("weights_e") if isinstance(head_out, dict) else None,
+                        "expert_entropy": float(head_out.get("H_e").mean().item()) if isinstance(head_out.get("H_e"), torch.Tensor) else None,
+                    })
                 except Exception:
                     pass
 
@@ -988,6 +1041,12 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
     decode_top_p = float(cfg.get("decode_top_p") or 0.95)
     decode_max_new = int(cfg.get("decode_max_new") or 32)
     lambdas = dict(cfg.get("lambdas") or {})
+    # Periodic eval configuration
+    eval_prompts = cfg.get('eval_prompts', [])
+    try:
+        eval_interval = int(cfg.get('eval_interval', 100) or 100)
+    except Exception:
+        eval_interval = 100
 
     # Trainer mode routing
     tr_cfg = cfg.get("trainer") or {}
@@ -1158,8 +1217,42 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
             examples = [{"text": "<think> alpha beta </think> <answer> ok </answer>"}]
         batch = collate(examples)
 
+    # Report trainable parameters and probe max token length before loop
+    try:
+        summarize_trainable_params(model)
+    except Exception:
+        pass
+    try:
+        dataset_for_probe = None
+        if 'ds' in locals() and ds is not None:
+            dataset_for_probe = ds
+        elif 'examples' in locals() and examples:
+            dataset_for_probe = examples
+        if dataset_for_probe is not None:
+            est = estimate_max_tokens(dataset_for_probe, tok, sample_size=1000)
+            # allow margin for answer/special tokens
+            new_max_len = int(max(est + 32, int(cfg.get('max_len') or est + 32)))
+            cfg['max_len'] = new_max_len
+            print(f"[INFO] setting max_len to {new_max_len} based on probe")
+    except Exception:
+        pass
+
     # Optimizer for a real parameter update (actual training step)
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-4)
+
+    # Checkpoint configuration
+    try:
+        save_interval = int(cfg.get('save_interval', 1000) or 1000)
+    except Exception:
+        save_interval = 1000
+    try:
+        save_dir = Path(cfg.get('save_dir', 'checkpoints') or 'checkpoints')
+    except Exception:
+        save_dir = Path('checkpoints')
+    try:
+        save_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
 
     # On-policy integration
     rl_stats = []
@@ -1350,6 +1443,30 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
             print(json.dumps({"train_step": int(t), "lambda_budget_current": lam_budget_cur}))
         except Exception:
             pass
+        # Periodic evaluation on simple prompts (before backward)
+        try:
+            if eval_prompts and eval_interval > 0 and ((t + 1) % int(eval_interval) == 0):
+                for prompt in (eval_prompts or []):
+                    try:
+                        enc = tok(str(prompt), return_tensors='pt', add_special_tokens=True)
+                        inp = enc['input_ids'].to(device)
+                        res = decode_with_budget(tok, model, inp,
+                                                  think_budget=int(budget_cap),
+                                                  max_new_tokens=32,
+                                                  temperature=0.0,
+                                                  top_p=1.0,
+                                                  visible_cot=False)
+                        ans = res.get('text') or ''
+                        print(f"[EVAL step {t+1}] {prompt} -> {ans}")
+                        try:
+                            if _dash is not None:
+                                _dash.update({'eval_output': f'{str(prompt)[:30]} -> {str(ans)[:30]}'})
+                        except Exception:
+                            pass
+                    except Exception as _e:
+                        print(f"[EVAL ERROR step {t+1}] {_e}")
+        except Exception:
+            pass
         # Dashboard update (best-effort)
         try:
             if _dash is not None:
@@ -1389,6 +1506,9 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
                     "alpha": alpha,
                     "per_layer_plan": per_pl,
                     "plan_logits": plan_logits,
+                    "policy": head_out.get("policy") if isinstance(head_out, dict) else None,
+                    "expert_weights": head_out.get("weights_e") if isinstance(head_out, dict) else None,
+                    "expert_entropy": float(head_out.get("H_e").mean().item()) if isinstance(head_out.get("H_e"), torch.Tensor) else None,
                 })
         except Exception:
             pass
@@ -1396,6 +1516,32 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
         opt.zero_grad()
         out_losses["total"].backward()
         opt.step()
+
+        # Periodic checkpoint saving
+        try:
+            if save_interval > 0 and ((t + 1) % int(save_interval) == 0):
+                ckpt = save_dir / f"checkpoint-{t+1}"
+                ckpt.mkdir(parents=True, exist_ok=True)
+                # Model
+                try:
+                    if hasattr(model, 'save_pretrained'):
+                        model.save_pretrained(str(ckpt))  # type: ignore[attr-defined]
+                    else:
+                        torch.save(getattr(model, 'state_dict')(), str(ckpt / 'pytorch_model.bin'))
+                except Exception:
+                    try:
+                        torch.save(getattr(model, 'state_dict')(), str(ckpt / 'pytorch_model.bin'))
+                    except Exception:
+                        pass
+                # Tokenizer (optional)
+                try:
+                    if tok is not None and hasattr(tok, 'save_pretrained'):
+                        tok.save_pretrained(str(ckpt))  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                print(f"[CKPT] saved at step {t+1} to {ckpt}")
+        except Exception:
+            pass
 
     # Manifest: config hashes and service parity digest
     svc = load_service_config()

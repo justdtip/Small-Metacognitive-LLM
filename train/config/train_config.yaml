@@ -1,38 +1,22 @@
-data:
-  name: glaive_reasoning_v1_20m
-  # Path can be a HF dataset name or a local JSONL file
-  path: glaiveai/reasoning-v1-20m
-  probe_first_n: 1000
-  set_max_from_probe: true
-
-generation:
-  pad_token_side: left
-  use_cache: true
-  # These will be optionally set by probe_max_lengths() if enabled
-  max_input_tokens: null
-  max_new_tokens: null
-
-schedule:
-  save_every_steps: 1000
-  eval_every_steps: 100
+data_mixture:
+  datasets:
+    - name: gsm8k
+      adapter: gsm8k_adapter
+      weight: 1.0
+    - name: math
+      adapter: math_adapter
+      weight: 0.7
+    - name: mbpp
+      adapter: mbpp_adapter
+      weight: 0.6
+    - name: logic
+      adapter: logic_adapter
+      weight: 0.8
+  temperature_sampling: 0.7
+  probe_first_n: 10000
+  target_depth_mix: {short: 0.35, mid: 0.45, long: 0.20}
 
 losses:
   lambda_over: 0.2
   lambda_under: 0.5
   expert_entropy_reg: 0.01
-
-metacog:
-  linked_all_layers: true
-  proj_dim: 128
-  agg: attn
-  num_experts: 3
-  expert_entropy_reg: 0.0
-
-lm_adaptation:
-  enabled: false        # default off
-  mode: ln_only         # 'ln_only' | 'lora'
-  last_k_layers: 2
-  lr_scale: 0.05        # relative to metacog heads LR
-  lora_r: 4
-  lora_alpha: 8
-  lora_dropout: 0.05

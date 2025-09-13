@@ -295,10 +295,13 @@ def compute_losses(
     think_ce_w: float = 0.0,
     # over-budget penalty
     think_tokens_used: Optional[torch.Tensor] = None,
+    # alias for clarity in some call-sites
+    used_think_tokens: Optional[torch.Tensor] = None,
     target_budget: Optional[torch.Tensor] = None,
     budget_penalty_w: float = 0.0,
     # length shaping (CoT-space inspired)
     target_L_opt: Optional[torch.Tensor] = None,
+    target_length_bin: Optional[Any] = None,
     solution_incomplete: Optional[torch.Tensor] = None,
     # correctness/verifier shaping
     correct_labels: Optional[torch.Tensor] = None,
@@ -600,39 +603,86 @@ def compute_losses(
 
     # Length shaping: overlength and underlength penalties
     try:
-        w_over = float(weights.get("len_over", 0.0) or 0.0)
-        w_under = float(weights.get("len_under", 0.0) or 0.0)
+        # allow both key styles: our existing 'len_over/len_under' or requested 'lambda_over/lambda_under'
+        w_over = float(weights.get("len_over", weights.get("lambda_over", 0.0)) or 0.0)
+        w_under = float(weights.get("len_under", weights.get("lambda_under", 0.0)) or 0.0)
     except Exception:
         w_over, w_under = 0.0, 0.0
     if (w_over > 0.0 or w_under > 0.0):
-        try:
-            used = (think_tokens_used.view(-1).float() if isinstance(think_tokens_used, torch.Tensor) else torch.zeros(B, device=logits.device, dtype=loss_total.dtype))
-            Lopt = None
-            if isinstance(target_L_opt, torch.Tensor):
-                Lopt = target_L_opt.view(-1).float()
-            elif isinstance(target_budget, torch.Tensor):
-                Lopt = target_budget.view(-1).float()
-            else:
-                Lopt = torch.ones_like(used)
-            over_pen = ((used - Lopt).clamp_min(0.0) / Lopt.clamp_min(1.0)).mean()
-        except Exception:
-            over_pen = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
-        try:
-            if isinstance(solution_incomplete, torch.Tensor):
-                under_pen = solution_incomplete.view(-1).float().clamp(0.0, 1.0).mean()
-            else:
-                under_pen = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
-        except Exception:
-            under_pen = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
+        # Prefer explicit used_think_tokens if provided
+        if isinstance(used_think_tokens, torch.Tensor):
+            used = used_think_tokens.view(-1).float().to(device=logits.device)
+        elif isinstance(think_tokens_used, torch.Tensor):
+            used = think_tokens_used.view(-1).float().to(device=logits.device)
+        else:
+            used = torch.zeros(B, device=logits.device, dtype=loss_total.dtype)
+
+        # Resolve per-sample bin bounds [min,max]
+        def _bounds_for_label(label: str, i: int) -> tuple[torch.Tensor, torch.Tensor]:
+            # If a target budget is provided, scale bins as fractions of it; else use static defaults
+            if isinstance(target_budget, torch.Tensor):
+                b = target_budget.view(-1).float().to(device=logits.device)
+                Bi = b[i].clamp_min(1.0)
+                if label == "short":
+                    return torch.tensor(0.0, device=logits.device), (0.25 * Bi)
+                if label == "mid":
+                    return (0.25 * Bi), (0.6 * Bi)
+                # long
+                return (0.6 * Bi), Bi
+            # Fallback static bins
+            if label == "short":
+                return torch.tensor(0.0, device=logits.device), torch.tensor(16.0, device=logits.device)
+            if label == "mid":
+                return torch.tensor(16.0, device=logits.device), torch.tensor(64.0, device=logits.device)
+            return torch.tensor(64.0, device=logits.device), torch.tensor(256.0, device=logits.device)
+
+        # Expand labels to a list per batch
+        labels_list: list[str] = []
+        if isinstance(target_length_bin, str):
+            labels_list = [target_length_bin for _ in range(len(used))]
+        elif isinstance(target_length_bin, (list, tuple)):
+            labels_list = [str(x) for x in target_length_bin]
+            # pad/trim to batch
+            if len(labels_list) < len(used):
+                labels_list = labels_list + [labels_list[-1] if labels_list else "long"] * (len(used) - len(labels_list))
+            labels_list = labels_list[: len(used)]
+        elif isinstance(target_length_bin, torch.Tensor):
+            # map integer bins {0,1,2} -> short/mid/long
+            arr = target_length_bin.view(-1).tolist()
+            map_int = {0: "short", 1: "mid", 2: "long"}
+            labels_list = [map_int.get(int(v), "long") for v in arr]
+            if len(labels_list) < len(used):
+                labels_list = labels_list + ["long"] * (len(used) - len(labels_list))
+            labels_list = labels_list[: len(used)]
+        else:
+            # Fallback: infer from target_L_opt if present, else mark all long
+            labels_list = ["long"] * len(used)
+
+        mins = []
+        maxs = []
+        for i, lab in enumerate(labels_list):
+            mn, mx = _bounds_for_label(str(lab).lower(), i)
+            mins.append(mn)
+            maxs.append(mx)
+        bin_min = torch.stack(mins) if mins else torch.zeros_like(used)
+        bin_max = torch.stack(maxs) if maxs else torch.ones_like(used)
+
+        over_vec = ((used - bin_max).clamp_min(0.0) / bin_max.clamp_min(1.0))
+        under_vec = (used < bin_min).float()
+        over_pen = over_vec.mean()
+        under_pen = under_vec.mean()
+
         len_loss = w_over * over_pen + w_under * under_pen
         out["len_over_pen"] = over_pen
         out["len_under_pen"] = under_pen
         out["len_loss"] = len_loss
+        out["length_penalty"] = len_loss
         loss_total = loss_total + len_loss
     else:
         out["len_over_pen"] = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
         out["len_under_pen"] = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
         out["len_loss"] = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
+        out["length_penalty"] = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
 
     # Expert diversity: encourage higher selector entropy (if provided via aux)
     try:
