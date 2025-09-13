@@ -458,3 +458,93 @@ def alpha_entropy_mean(alpha: torch.Tensor, eps: float = 1e-8) -> float:
         return float(Hn.item())
     except Exception:
         return 0.0
+
+
+# --------- Training-time batch logging helpers ---------
+def cot_length_stats(
+    *,
+    think_mask: torch.Tensor | None = None,
+    answer_mask: torch.Tensor | None = None,
+    think_tokens_used: torch.Tensor | None = None,
+) -> Dict[str, float]:
+    """
+    Compute token usage stats per batch:
+    - used_tokens (think): if provided via think_tokens_used else sum of think_mask
+    - final_tokens (answer): sum of answer_mask
+    - E[L] and E[|xi|] (means across batch); and product as a complexity proxy
+    Returns floats; missing values become 0.0.
+    """
+    out: Dict[str, float] = {}
+    try:
+        if isinstance(think_tokens_used, torch.Tensor):
+            L = think_tokens_used.view(-1).float()
+            out['think_tokens_mean'] = float(L.mean().item())
+            out['think_tokens_max'] = float(L.max().item())
+        elif isinstance(think_mask, torch.Tensor):
+            L = think_mask.view(think_mask.shape[0], -1).float().sum(dim=1)
+            out['think_tokens_mean'] = float(L.mean().item())
+            out['think_tokens_max'] = float(L.max().item())
+        else:
+            out['think_tokens_mean'] = 0.0
+            out['think_tokens_max'] = 0.0
+    except Exception:
+        out['think_tokens_mean'] = 0.0
+        out['think_tokens_max'] = 0.0
+    try:
+        if isinstance(answer_mask, torch.Tensor):
+            A = answer_mask.view(answer_mask.shape[0], -1).float().sum(dim=1)
+            out['answer_tokens_mean'] = float(A.mean().item())
+            out['answer_tokens_max'] = float(A.max().item())
+        else:
+            out['answer_tokens_mean'] = 0.0
+            out['answer_tokens_max'] = 0.0
+    except Exception:
+        out['answer_tokens_mean'] = 0.0
+        out['answer_tokens_max'] = 0.0
+    try:
+        out['cot_complexity_proxy'] = float(out.get('think_tokens_mean', 0.0) * out.get('answer_tokens_mean', 0.0))
+    except Exception:
+        out['cot_complexity_proxy'] = 0.0
+    return out
+
+
+def expert_weights_stats(weights_e: torch.Tensor | None) -> Dict[str, float]:
+    """Summarize expert weights distribution and entropy across batch."""
+    out: Dict[str, float] = {}
+    if not torch.is_tensor(weights_e):
+        return {'expert_entropy_mean': 0.0}
+    try:
+        w = weights_e.detach().float()
+        eps = 1e-12
+        H = -(w * (w.clamp_min(eps).log())).sum(dim=1)
+        out['expert_entropy_mean'] = float(H.mean().item())
+        out['expert_weights_mean'] = float(w.mean().item())
+        out['expert_e'] = int(w.shape[-1])
+    except Exception:
+        out['expert_entropy_mean'] = 0.0
+    return out
+
+
+def alpha_stats(alpha: torch.Tensor | None) -> Dict[str, float]:
+    """Per-layer attention aggregator entropy and simple stats."""
+    if not torch.is_tensor(alpha):
+        return {'alpha_entropy_mean': 0.0}
+    try:
+        return {
+            'alpha_entropy_mean': alpha_entropy_mean(alpha),
+            'alpha_min': float(alpha.min().item()),
+            'alpha_max': float(alpha.max().item()),
+        }
+    except Exception:
+        return {'alpha_entropy_mean': 0.0}
+
+
+def success_at_1(correct_labels: torch.Tensor | None) -> float:
+    """Return mean correctness in [0,1] if provided."""
+    if not torch.is_tensor(correct_labels):
+        return 0.0
+    try:
+        y = correct_labels.detach().float().view(-1)
+        return float(y.mean().item())
+    except Exception:
+        return 0.0

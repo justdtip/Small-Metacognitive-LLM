@@ -24,6 +24,10 @@ __all__ = [
     'make_collate_fn',
     'pad_and_stack',
     'GlaiveDataset',
+    'ReasoningV1Dataset',
+    'probe_max_lengths',
+    'update_train_config_from_probe',
+    'build_reasoning_v1_dataloader',
 ]
 import os
 
@@ -96,6 +100,209 @@ class GlaiveDataset:
             else:
                 text = f"{prompt} <answer> {resp} </answer>"
             yield {'text': text}
+
+
+# ---- Reasoning V1 dataset (question/answer/rationale) ---------------------------
+class ReasoningV1Dataset:
+    """
+    Adapter for datasets that provide fields like {'question','answer','rationale'}.
+    Composes Tina-format text: "<prompt> <think> rationales </think> <answer> final </answer>".
+    Optional few-shot examples can be prepended via 'fewshot' list of dicts: {q, r, a}.
+    """
+    def __init__(
+        self,
+        split: str = 'train',
+        path: Optional[str] = None,
+        streaming: bool = False,
+        *,
+        fewshot: Optional[List[Dict[str, str]]] = None,
+        fewshot_sep: str = "\n\n",
+        dataset_name: str = 'glaiveai/reasoning-v1-20m',
+    ):
+        try:
+            from datasets import load_dataset  # type: ignore
+        except Exception as e:  # pragma: no cover
+            raise RuntimeError("datasets is not installed; cannot load reasoning dataset") from e
+        kwargs: Dict[str, Any] = {}
+        self.split = split
+        if path:
+            kwargs['data_files'] = {split: path}
+        self.ds = load_dataset(dataset_name, split=split, streaming=bool(streaming), **kwargs)
+        self.streaming = bool(streaming)
+        self.fewshot = list(fewshot) if fewshot else []
+        self.fewshot_sep = str(fewshot_sep or "\n\n")
+
+    def _fewshot_prefix(self) -> str:
+        if not self.fewshot:
+            return ""
+        xs = []
+        for ex in self.fewshot:
+            q = str(ex.get('q') or ex.get('question') or ex.get('prompt') or '').strip()
+            r = str(ex.get('r') or ex.get('rationale') or '').strip()
+            a = str(ex.get('a') or ex.get('answer') or '').strip()
+            body = f"{q} <think> {r} </think> <answer> {a} </answer>".strip()
+            xs.append(body)
+        return self.fewshot_sep.join(xs).strip() + (self.fewshot_sep if xs else "")
+
+    def __len__(self) -> int:  # pragma: no cover
+        try:
+            return len(self.ds)  # type: ignore[arg-type]
+        except Exception:
+            return 0
+
+    def __iter__(self) -> Iterator[Dict[str, Any]]:
+        prefix = self._fewshot_prefix()
+        for rec in self.ds:  # type: ignore[operator]
+            q = (rec.get('question') or rec.get('prompt') or '').strip()
+            a = (rec.get('answer') or '').strip()
+            r = (rec.get('rationale') or rec.get('reasoning') or '').strip()
+            prompt = (prefix + q).strip()
+            if r:
+                text = f"{prompt} <think> {r} </think> <answer> {a} </answer>"
+            else:
+                text = f"{prompt} <answer> {a} </answer>"
+            yield {
+                'text': text,
+                'prompt': prompt,
+                'solution': a,
+            }
+
+
+def probe_max_lengths(tokenizer, dataset_iter: Iterator[Dict[str, Any]], *, first_n: int = 1000) -> Dict[str, int]:
+    """
+    Scan up to first_n samples and compute maxima for:
+      - input_tokens: tokens in prompt (pre-<think>)
+      - target_tokens: tokens in think+answer segments
+    Returns {'max_input_tokens','max_target_tokens'}.
+    """
+    n = 0
+    max_in = 0
+    max_tgt = 0
+    for rec in dataset_iter:
+        try:
+            text = str(rec.get('text') or '')
+            prompt = str(rec.get('prompt') or '')
+            # Tokenize prompt
+            ids_in = tokenizer(prompt, add_special_tokens=False, return_tensors='pt').input_ids[0]
+            in_n = int(ids_in.numel())
+            if in_n > max_in:
+                max_in = in_n
+            # Tokenize target region: from first <think> (or <answer>) to final </answer>
+            s = text
+            i = s.find('<think>')
+            j = s.find('</answer>')
+            if i == -1:
+                k0 = s.find('<answer>')
+                seg = s[k0:] if k0 != -1 else s
+            else:
+                seg = s[i:j+len('</answer>')] if j != -1 else s[i:]
+            ids_t = tokenizer(seg, add_special_tokens=False, return_tensors='pt').input_ids[0]
+            tgt_n = int(ids_t.numel())
+            if tgt_n > max_tgt:
+                max_tgt = tgt_n
+        except Exception:
+            pass
+        n += 1
+        if n >= int(first_n):
+            break
+    return {'max_input_tokens': int(max_in), 'max_target_tokens': int(max_tgt)}
+
+
+def update_train_config_from_probe(cfg_path: str, probe: Dict[str, int], *,
+                                   clamp_input: int = 8192, clamp_new: int = 1024) -> None:
+    """
+    Update a YAML/JSON train config file with generation.max_input_tokens/max_new_tokens
+    based on probe stats. Values are clamped for safety.
+    """
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        yaml = None
+    from pathlib import Path
+    import json as _json
+    p = Path(cfg_path)
+    if not p.exists():
+        return
+    text = p.read_text(encoding='utf-8')
+    data: Dict[str, Any]
+    try:
+        if yaml is not None:
+            data = yaml.safe_load(text) or {}
+        else:
+            data = _json.loads(text)
+    except Exception:
+        try:
+            data = _json.loads(text)
+        except Exception:
+            return
+    gen = data.get('generation') or {}
+    max_in = int(min(int(probe.get('max_input_tokens') or 0), int(clamp_input)))
+    max_new = int(min(int(probe.get('max_target_tokens') or 0), int(clamp_new)))
+    # leave as-is if zeros
+    if max_in > 0:
+        gen['max_input_tokens'] = max_in
+    if max_new > 0:
+        gen['max_new_tokens'] = max_new
+    data['generation'] = gen
+    try:
+        if yaml is not None:
+            p.write_text(yaml.safe_dump(data, sort_keys=False), encoding='utf-8')
+        else:
+            p.write_text(_json.dumps(data), encoding='utf-8')
+    except Exception:
+        pass
+
+
+def build_reasoning_v1_dataloader(
+    tokenizer,
+    *,
+    split: str = 'train',
+    path: Optional[str] = None,
+    batch_size: int = 8,
+    probe_first_n: int = 1000,
+    set_max_from_probe: bool = False,
+    train_config_path: Optional[str] = None,
+    fewshot: Optional[List[Dict[str, str]]] = None,
+    dataset_name: str = 'glaiveai/reasoning-v1-20m',
+):
+    """
+    Convenience builder for a simple one-batch DataLoader over ReasoningV1Dataset,
+    with optional max-length probe updating a train config.
+    """
+    ds = ReasoningV1Dataset(split=split, path=path, streaming=False, fewshot=fewshot, dataset_name=dataset_name)
+    # Run probe if requested
+    if set_max_from_probe:
+        stats = probe_max_lengths(tokenizer, iter(ds), first_n=int(probe_first_n))
+        # If no explicit path given, try conventional path
+        cfg_p = train_config_path
+        if not cfg_p:
+            from pathlib import Path as _P
+            # prefer train/config/train_config.yaml, else root
+            cand = _P(__file__).resolve().parents[0] / 'config' / 'train_config.yaml'
+            if cand.exists():
+                cfg_p = str(cand)
+            else:
+                cand2 = _P(__file__).resolve().parents[1] / 'train_config.yaml'
+                cfg_p = str(cand2) if cand2.exists() else None
+        if cfg_p:
+            update_train_config_from_probe(cfg_p, stats)
+    # Build a minimal DataLoader yielding a single collated batch
+    def _iterable():
+        # collect first batch_size items
+        items: List[Dict[str, Any]] = []
+        for i, rec in enumerate(ds):
+            items.append({'text': rec.get('text') or ''})
+            if len(items) >= int(batch_size):
+                break
+        return items
+    batch_items = _iterable()
+    collate = make_collate_fn(tokenizer, loss_on='answer')
+    class _Iter:
+        def __init__(self, data):
+            self.data = data
+        def __iter__(self):
+            yield collate(self.data)
+    return _Iter(batch_items)
 
 
 def pad_and_stack(

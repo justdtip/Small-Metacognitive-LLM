@@ -147,11 +147,67 @@ class Trainer:
             base_top_params = [p for l in top_layers for p in l.parameters()]
         except Exception:
             base_top_params = []
+
+        # Optional tiny LM adaptation (measured tuning)
+        adapt_cfg = (self.cfg.get("lm_adaptation") or {})
+        adapt_enabled = bool(adapt_cfg.get("enabled", False))
+        adapt_mode = str(adapt_cfg.get("mode", "ln_only") or "ln_only").lower()
+        last_k = int(adapt_cfg.get("last_k_layers", 2) or 2)
+        lr_scale = float(adapt_cfg.get("lr_scale", 0.05) or 0.05)
+        lm_params: list = []
+        if adapt_enabled:
+            try:
+                dec = self.engine.scaffold._get_decoder_layers(self.model)
+                if dec:
+                    target_idx = list(range(max(0, len(dec) - last_k), len(dec)))
+                    if adapt_mode == 'ln_only':
+                        import torch.nn as _nn
+                        for i in target_idx:
+                            for name, mod in dec[i].named_modules():
+                                if isinstance(mod, _nn.LayerNorm) or ('norm' in name.lower()):
+                                    for p in mod.parameters(recurse=True):
+                                        p.requires_grad = True
+                                        lm_params.append(p)
+                    elif adapt_mode == 'lora':
+                        try:
+                            from peft import LoraConfig, get_peft_model  # type: ignore
+                            lcfg = LoraConfig(
+                                r=int(adapt_cfg.get('lora_r', 4) or 4),
+                                lora_alpha=int(adapt_cfg.get('lora_alpha', 8) or 8),
+                                lora_dropout=float(adapt_cfg.get('lora_dropout', 0.05) or 0.05),
+                                bias='none',
+                                task_type='CAUSAL_LM',
+                                target_modules=['q_proj','k_proj','v_proj','o_proj','up_proj','down_proj','gate_proj'],
+                            )
+                            self.model = get_peft_model(self.model, lcfg)
+                            # Enable LoRA params only for last_k layers
+                            for n, p in self.model.named_parameters():
+                                if 'lora_' in n:
+                                    use = any(f"layers.{j}." in n for j in target_idx)
+                                    p.requires_grad = bool(use)
+                                    if use:
+                                        lm_params.append(p)
+                        except Exception:
+                            # Fallback: LN-only
+                            import torch.nn as _nn
+                            for i in target_idx:
+                                for name, mod in dec[i].named_modules():
+                                    if isinstance(mod, _nn.LayerNorm) or ('norm' in name.lower()):
+                                        for p in mod.parameters(recurse=True):
+                                            p.requires_grad = True
+                                            lm_params.append(p)
+                if lm_params:
+                    print(json.dumps({"lm_adaptation": {"enabled": True, "mode": adapt_mode, "params": int(sum(p.numel() for p in lm_params))}}))
+            except Exception:
+                lm_params = []
         groups = [
             {"params": [p for p in heads_params if p.requires_grad], "lr": heads_lr, "weight_decay": wd},
             {"params": [p for p in adapters_params if p.requires_grad], "lr": adapters_lr, "weight_decay": wd},
             {"params": [p for p in base_top_params if p.requires_grad], "lr": base_top_lr, "weight_decay": wd},
         ]
+        if lm_params:
+            lm_lr = max(1e-8, float(heads_lr) * float(lr_scale))
+            groups.append({"params": [p for p in lm_params if p.requires_grad], "lr": lm_lr, "weight_decay": wd})
         # filter empty groups to avoid optimizer errors
         groups = [g for g in groups if g["params"]]
         return torch.optim.AdamW(groups)
@@ -169,6 +225,30 @@ class Trainer:
         if bool(phase.get("train_heads", True)):
             for p in self.engine.metacog.parameters():
                 p.requires_grad = True
+        # Re-enable tiny LM adaptation params even if base is frozen
+        try:
+            adapt_cfg = (self.cfg.get("lm_adaptation") or {})
+            if bool(adapt_cfg.get("enabled", False)):
+                mode = str(adapt_cfg.get("mode", "ln_only") or "ln_only").lower()
+                last_k = int(adapt_cfg.get("last_k_layers", 2) or 2)
+                dec = self.engine.scaffold._get_decoder_layers(self.model)
+                if dec:
+                    target_idx = list(range(max(0, len(dec) - last_k), len(dec)))
+                    if mode == 'ln_only':
+                        import torch.nn as _nn
+                        for i in target_idx:
+                            for name, mod in dec[i].named_modules():
+                                if isinstance(mod, _nn.LayerNorm) or ('norm' in name.lower()):
+                                    for p in mod.parameters(recurse=True):
+                                        p.requires_grad = True
+                    else:
+                        for n, p in self.model.named_parameters():
+                            if 'lora_' in n:
+                                use = any(f"layers.{j}." in n for j in target_idx)
+                                if use:
+                                    p.requires_grad = True
+        except Exception:
+            pass
 
     def train(self, steps: int = 100):
         # Data stub: single batch from configured data
@@ -199,8 +279,45 @@ class Trainer:
                 print(f"note: dashboard disabled ({type(_e).__name__}: {_e}). Install rich>=13.4 to enable.")
                 dash_ctx = _nullcontext()
 
+        # Report trainable parameter counts by group before training
+        try:
+            from tina.metacog_heads import MetacogHeads as _MH, MetacogConfig as _MC
+            hidden = int(getattr(getattr(self.model, 'config', None), 'hidden_size', 2048))
+            taps_use = tuple((self.cfg.get("taps") or (6, 10, 14)))
+            mc_cfg0 = _MC(
+                hidden_size=hidden,
+                taps=taps_use,
+                proj_dim=int(((self.cfg.get("metacog") or {}).get("proj_dim") or 128)),
+                head_temp=1.0,
+                linked_all_layers=bool(((self.cfg.get("metacog") or {}).get("linked_all_layers") or False)),
+                agg=str(((self.cfg.get("metacog") or {}).get("agg") or 'attn')),
+                dump_per_layer=True,
+                num_experts=int(((self.cfg.get("metacog") or {}).get("num_experts") or 1) or 1),
+            )
+            _heads0 = _MH(mc_cfg0).to(self.device, dtype=torch.float32)
+            def _np(m):
+                try:
+                    return int(sum(p.numel() for p in m.parameters() if p.requires_grad))
+                except Exception:
+                    return 0
+            counts = {
+                'trunk': _np(getattr(_heads0, '_trunk', nn.Identity())),
+                'per_layer_heads': _np(getattr(_heads0, '_pl_heads', nn.Identity())),
+                'aggregator': _np(getattr(_heads0, '_aggregator', nn.Identity())),
+                'expert_selector': _np(getattr(_heads0, 'selector', nn.Identity())),
+                'expert_heads': _np(getattr(_heads0, 'expert_heads', nn.Identity())),
+                'policy_head': _np(getattr(_heads0, 'policy_head', nn.Identity())),
+                'base_lm_trainable': int(sum(p.numel() for p in self.model.parameters() if p.requires_grad)),
+            }
+            counts['metacog_total'] = int(sum(v for k, v in counts.items() if k not in ('base_lm_trainable',)))
+            print(json.dumps({'param_counts': counts}))
+        except Exception:
+            pass
+
         # Training steps loop
         with dash_ctx as _dash:
+            eval_interval = int(((self.cfg.get("trainer") or {}).get("eval_interval") or 100))
+            ckpt_interval = int(((self.cfg.get("trainer") or {}).get("ckpt_interval") or 1000))
             for t in range(int(steps)):
                 input_ids = batch["input_ids"].to(self.device)
                 labels = input_ids.clone(); labels[:, :-1] = input_ids[:, 1:]; labels[:, -1] = -100
@@ -258,7 +375,12 @@ class Trainer:
 
                 # Losses (include var_reg when configured)
                 var_reg = float(((self.cfg.get("metacog") or {}).get("var_reg") or 0.0) or 0.0)
-                weights = {"answer_ce": 1.0, "plan_ce": 0.5, "budget_reg": 0.1, "conf_cal": 0.1, "var_reg": var_reg}
+                eent = float(((self.cfg.get("metacog") or {}).get("expert_entropy_reg") or 0.0) or 0.0)
+                w_len_over = float(((self.cfg.get("trainer") or {}).get("len_over") or 0.0) or 0.0)
+                w_len_under = float(((self.cfg.get("trainer") or {}).get("len_under") or 0.0) or 0.0)
+                w_correct = float(((self.cfg.get("trainer") or {}).get("w_correct") or 0.0) or 0.0)
+                weights = {"answer_ce": 1.0, "plan_ce": 0.5, "budget_reg": 0.1, "conf_cal": 0.1, "var_reg": var_reg,
+                           "expert_entropy_reg": eent, "len_over": w_len_over, "len_under": w_len_under, "correct": w_correct}
                 out_losses = compute_losses(
                     logits, labels,
                     weights=weights,
@@ -271,6 +393,9 @@ class Trainer:
                     answer_mask=batch.get("answer_mask").to(self.device) if isinstance(batch.get("answer_mask"), torch.Tensor) else None,
                     think_mask_tce=batch.get("think_mask").to(self.device) if isinstance(batch.get("think_mask"), torch.Tensor) else None,
                     think_tokens_used=batch.get("think_tokens_used") if isinstance(batch.get("think_tokens_used"), torch.Tensor) else None,
+                    target_L_opt=budget_target if budget_target is not None else None,
+                    correct_labels=conf_labels if conf_labels is not None else None,
+                    aux=head_out.get("aux") if isinstance(head_out, dict) else None,
                     budget_penalty_w=float(phase.get("budget_penalty_w", 0.0) or 0.0),
                     think_ce_w=float(phase.get("think_ce_w", 0.0) or 0.0),
                     quiet_star_w=float(phase.get("quiet_star_w", 0.0) or 0.0),
@@ -314,6 +439,42 @@ class Trainer:
                 if clip_norm and clip_norm > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=float(clip_norm))
                 opt.step()
+
+                # Periodic tiny eval with logic-like prompts and record decoding params + batch metrics
+                if eval_interval > 0 and (t % eval_interval == 0):
+                    try:
+                        # Run light eval using the full engine + DecodingController
+                        from eval.light_eval import run as light_eval_run  # type: ignore
+                        le = light_eval_run(self.engine, self.tok, visible_cot=False, temperature=0.2, top_p=0.95, max_new_tokens=64)
+                        # Batch token/entropy stats
+                        try:
+                            from train.metrics import cot_length_stats, expert_weights_stats, alpha_stats
+                            bstats = cot_length_stats(think_mask=batch.get('think_mask'), answer_mask=batch.get('answer_mask'), think_tokens_used=batch.get('think_tokens_used'))
+                            ews = expert_weights_stats(head_out.get('expert_weights') if isinstance(head_out, dict) else None)
+                            ast = alpha_stats(per_layer.get('alpha') if isinstance(per_layer, dict) else None)
+                        except Exception:
+                            bstats, ews, ast = {}, {}, {}
+                        # Emit a compact record for TUI/JSON logs
+                        print(json.dumps({"light_eval": {"step": int(t), "accuracy": float(le.get('accuracy') or 0.0), "n": len(le.get('results') or []), "batch_stats": {**bstats, **ews, **ast}}}))
+                        # Also dump full results once in a while
+                        print(json.dumps({"light_eval_results": le}))
+                    except Exception:
+                        pass
+
+                # Periodic checkpoint saving
+                if ckpt_interval > 0 and (t > 0) and (t % ckpt_interval == 0):
+                    try:
+                        ckpt_dir = Path(self.root) / "artifacts" / "checkpoints"
+                        ckpt_dir.mkdir(parents=True, exist_ok=True)
+                        state = {
+                            'model': self.model.state_dict(),
+                            'optimizer': opt.state_dict(),
+                            'step': int(t),
+                        }
+                        torch.save(state, ckpt_dir / f"step-{int(t):06d}.pt")
+                        print(json.dumps({"checkpoint": {"path": str(ckpt_dir / f'step-{int(t):06d}.pt')}}))
+                    except Exception:
+                        pass
 
         return {"last_losses": {k: float(v.item()) if torch.is_tensor(v) else float(v) for k, v in out_losses.items()}}
 
@@ -570,6 +731,9 @@ def _train_step(model: nn.Module, batch: Dict[str, Any], *, step: int = 0, total
                 conf_logits=conf_logits if conf_labels is not None else None,
                 conf_labels=conf_labels,
                 per_layer=per_layer,
+                aux=head_out.get("aux") if isinstance(head_out, dict) else None,
+                target_L_opt=budget_target if budget_target is not None else None,
+                correct_labels=conf_labels if conf_labels is not None else None,
             )
     else:
         out = compute_losses(
@@ -585,6 +749,9 @@ def _train_step(model: nn.Module, batch: Dict[str, Any], *, step: int = 0, total
             conf_logits=conf_logits if conf_labels is not None else None,
             conf_labels=conf_labels,
             per_layer=per_layer,
+            aux=head_out.get("aux") if isinstance(head_out, dict) else None,
+            target_L_opt=budget_target if budget_target is not None else None,
+            correct_labels=conf_labels if conf_labels is not None else None,
         )
     # Style entropy bonus (encourage diversity across styles; ignore unknown=-1)
     try:

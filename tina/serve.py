@@ -61,6 +61,12 @@ class EngineConfig:
     calibration_path: Optional[str] = None
     # optional reasoning style tag to hint at serve (e.g., 'checklist','explainer')
     style_tag: Optional[str] = None
+    # Multi-expert + feedback options
+    num_experts: int = 1
+    feedback: bool = False
+    feedback_dim: Optional[int] = None
+    # Apply feedback gate to this decoder layer index during THINK (None disables)
+    feedback_apply_layer: Optional[int] = None
 
 def _extract_answer(body: str, include_think: bool = False) -> str:
     def _slice(s: str, open_t: str, close_t: str) -> str:
@@ -144,6 +150,110 @@ def _count_think_tokens(gen_ids, close_ids_list, base_len: int, cap: int, slack_
     used = max(0, earliest - base)
     return used
 
+
+class DecodingController:
+    """
+    Translate metacog policy signals to generation settings.
+    Maps (plan_logits, confidence, policy_vector[, selector_entropy]) → params.
+    """
+    def __init__(self):
+        pass
+
+    @staticmethod
+    def _sigmoid(x):
+        import math
+        try:
+            if hasattr(x, 'detach'):
+                import torch
+                return torch.sigmoid(x)
+        except Exception:
+            pass
+        # scalar fallback
+        try:
+            v = float(x)
+        except Exception:
+            v = 0.0
+        return 1.0 / (1.0 + math.exp(-v))
+
+    @staticmethod
+    def _softplus(x):
+        try:
+            import torch
+            return torch.nn.functional.softplus(x)
+        except Exception:
+            import math
+            v = float(x)
+            return math.log1p(math.exp(v))
+
+    def compute(self, *, plan_logits=None, confidence=None, policy_raw=None, selector_entropy=None, B_max=None):
+        """
+        Returns a dict with: temperature, top_p, repetition_penalty, think_ratio.
+        Uses provided tensors when available; falls back to scalars.
+        """
+        import torch
+        # Defaults
+        out = {
+            'temperature': 0.6,
+            'top_p': 0.95,
+            'repetition_penalty': 1.1,
+            'think_ratio': 1.0,
+        }
+        if policy_raw is not None:
+            try:
+                pv = policy_raw[0] if (torch.is_tensor(policy_raw) and policy_raw.dim() >= 2) else policy_raw
+                # mapping per spec: temp/top_p/rep/think_ratio from raw
+                t = 0.3 + 1.7 * self._sigmoid(pv[0])
+                tp = 0.2 + 0.78 * self._sigmoid(pv[1])
+                rp = 0.8 + 1.2 * self._softplus(pv[2])
+                tr = self._sigmoid(pv[3])
+                # clamp sensible bounds
+                if torch.is_tensor(t):
+                    t = t.clamp(0.1, 2.5)
+                    tp = tp.clamp(0.05, 1.0)
+                    rp = rp.clamp(0.8, 3.0)
+                    tr = tr.clamp(0.05, 1.0)
+                else:
+                    t = max(0.1, min(2.5, float(t)))
+                    tp = max(0.05, min(1.0, float(tp)))
+                    rp = max(0.8, min(3.0, float(rp)))
+                    tr = max(0.05, min(1.0, float(tr)))
+                out.update({'temperature': t, 'top_p': tp, 'repetition_penalty': rp, 'think_ratio': tr})
+            except Exception:
+                pass
+        # Confidence and entropy can adjust conservativeness (optional heuristic)
+        try:
+            if torch.is_tensor(confidence):
+                c = float(confidence.detach().view(-1)[0].item())
+            else:
+                c = float(confidence) if confidence is not None else None
+        except Exception:
+            c = None
+        try:
+            if torch.is_tensor(selector_entropy):
+                se = float(selector_entropy.detach().view(-1)[0].item())
+            elif selector_entropy is not None:
+                se = float(selector_entropy)
+            else:
+                se = None
+        except Exception:
+            se = None
+        # Slightly increase temperature if low confidence/high entropy; else be more conservative
+        try:
+            if c is not None:
+                if c < 0.3:
+                    out['temperature'] = (out['temperature'] if not torch.is_tensor(out['temperature']) else float(out['temperature'])) * 1.1
+                elif c > 0.8:
+                    out['temperature'] = (out['temperature'] if not torch.is_tensor(out['temperature']) else float(out['temperature'])) * 0.9
+        except Exception:
+            pass
+        out['selector_entropy'] = se
+        if B_max is not None:
+            try:
+                out['B_max'] = int(B_max if not torch.is_tensor(B_max) else int(B_max.detach().view(-1)[0].item()))
+            except Exception:
+                pass
+        return out
+
 class IntrospectiveEngine:
     """
     Wrap a (peft) CausalLM with additive scaffolding and serve visible/hidden CoT.
@@ -157,6 +267,7 @@ class IntrospectiveEngine:
         self._conf_temp: Optional[float] = None
         self._plan_thresholds: Optional[Dict[str, float]] = None
         self._budget_clip: Optional[int] = None
+        self._decode_params: Dict[str, Any] = {}
         # Lazy imports to avoid heavy deps at module import time
         from .side_adapters import attach_residual_adapters, IntrospectionScaffold
         from .metacog_heads import MetacogHeads, MetacogConfig
@@ -176,9 +287,14 @@ class IntrospectiveEngine:
             taps=cfg.taps,
             proj_dim=int(getattr(cfg, "proj_dim", 128)),
             head_temp=1.0,
+            budget_head_temperature=1.0,
             linked_all_layers=bool(getattr(cfg, "linked_all_layers", False)),
             agg=str(getattr(cfg, "agg", "attn")),
             dump_per_layer=bool(getattr(cfg, "dump_per_layer", False)),
+            # new: experts + feedback
+            num_experts=int(getattr(cfg, "num_experts", 1) or 1),
+            feedback=bool(getattr(cfg, "feedback", False)),
+            feedback_dim=(getattr(cfg, "feedback_dim", None)),
         ))
 
         # Ensure side modules live on the same device as the base model
@@ -284,6 +400,58 @@ class IntrospectiveEngine:
                     return out
                 layer.register_forward_hook(_hook)
 
+        # Optional feedback gate hook (applied during THINK only)
+        self._gate_hook = None
+        try:
+            if bool(getattr(cfg, "feedback", False)) and getattr(cfg, "feedback_apply_layer", None) is not None:
+                idx = int(cfg.feedback_apply_layer)
+                layers = self.scaffold._get_decoder_layers(self.model)
+                if 0 <= idx < len(layers):
+                    def _gate_hook_fn(module, inputs, output):
+                        # apply only during THINK
+                        try:
+                            if not self.scaffold._think_flag.get():
+                                return output
+                        except Exception:
+                            pass
+                        gate = getattr(self.metacog, 'last_gate', None)
+                        if gate is None or (not torch.is_tensor(gate)):
+                            return output
+                        # Determine output hidden state tensor
+                        def _apply(h: torch.Tensor) -> torch.Tensor:
+                            try:
+                                g = gate
+                                # Use first sample if batch mismatch
+                                if g.dim() == 2 and g.shape[0] != h.shape[0]:
+                                    g = g[:1]
+                                if g.dim() == 2:
+                                    # expect [B,H]
+                                    if g.shape[-1] != h.shape[-1]:
+                                        return h
+                                    g = g.to(device=h.device, dtype=h.dtype)
+                                    return h * g.unsqueeze(1)
+                                elif g.dim() == 1:
+                                    if g.numel() != h.shape[-1]:
+                                        return h
+                                    g = g.to(device=h.device, dtype=h.dtype)
+                                    return h * g.view(1,1,-1)
+                            except Exception:
+                                return h
+                            return h
+                        if torch.is_tensor(output):
+                            return _apply(output)
+                        if isinstance(output, tuple) and len(output) > 0 and torch.is_tensor(output[0]):
+                            new_h = _apply(output[0])
+                            return (new_h, *output[1:])
+                        if isinstance(output, list) and len(output) > 0 and torch.is_tensor(output[0]):
+                            new_h = _apply(output[0])
+                            rest = list(output[1:])
+                            return [new_h, *rest]
+                        return output
+                    self._gate_hook = layers[idx].register_forward_hook(_gate_hook_fn)
+        except Exception:
+            self._gate_hook = None
+
         # Load optional calibration blob (explicit path or from service config)
         try:
             cal_path: Optional[str] = None
@@ -337,6 +505,69 @@ class IntrospectiveEngine:
             except Exception:
                 pass
         out = self.metacog(B_max=self.cfg.budget_cap, return_state=True)
+        # Save expert mix and feedback gate for downstream use/telemetry
+        try:
+            ew = out.get('expert_weights') if isinstance(out, dict) else None
+            if torch.is_tensor(ew):
+                self.last_stats['expert_weights'] = ew[0].detach().float().cpu().tolist()
+        except Exception:
+            pass
+        try:
+            fg = out.get('feedback_gate') if isinstance(out, dict) else None
+            if torch.is_tensor(fg):
+                # store for gating hook
+                self.metacog.last_gate = fg.detach()
+                # also expose summary + first vector
+                self.last_stats['feedback_gate_mean'] = float(fg.mean().item())
+                try:
+                    self.last_stats['feedback_gate'] = fg[0].detach().float().cpu().tolist()
+                except Exception:
+                    pass
+        except Exception:
+            self.metacog.last_gate = None
+        # Compute decoding parameters from policy
+        try:
+            policy_raw = out.get('policy_raw') if isinstance(out, dict) else None
+            conf = out.get('confidence') if isinstance(out, dict) else None
+            H_e = out.get('H_e') if isinstance(out, dict) else None
+            Bm = out.get('budget') if isinstance(out, dict) else None
+            if torch.is_tensor(Bm):
+                Bm_val = int(Bm[0].item())
+            else:
+                Bm_val = None
+            ctrl = DecodingController()
+            dec = ctrl.compute(plan_logits=out.get('plan_logits') if isinstance(out, dict) else None,
+                               confidence=conf,
+                               policy_raw=policy_raw,
+                               selector_entropy=(H_e.mean() if torch.is_tensor(H_e) else H_e),
+                               B_max=Bm_val)
+            # Normalize tensor values to floats
+            def _to_float(v):
+                try:
+                    import torch as _t
+                    return float(v.detach().item()) if _t.is_tensor(v) else float(v)
+                except Exception:
+                    return v
+            self._decode_params = {
+                'temperature': _to_float(dec.get('temperature')),
+                'top_p': _to_float(dec.get('top_p')),
+                'repetition_penalty': _to_float(dec.get('repetition_penalty')),
+                'think_ratio': _to_float(dec.get('think_ratio')),
+                'selector_entropy': _to_float(dec.get('selector_entropy')) if dec.get('selector_entropy') is not None else None,
+                'B_max': int(dec.get('B_max')) if dec.get('B_max') is not None else None,
+            }
+            # Telemetry
+            self.last_stats.update({
+                'gen_temperature': self._decode_params.get('temperature'),
+                'gen_top_p': self._decode_params.get('top_p'),
+                'gen_rep_penalty': self._decode_params.get('repetition_penalty'),
+                'think_ratio': self._decode_params.get('think_ratio'),
+                'B_max': self._decode_params.get('B_max'),
+            })
+            if self._decode_params.get('selector_entropy') is not None:
+                self.last_stats['selector_entropy'] = self._decode_params['selector_entropy']
+        except Exception:
+            self._decode_params = {}
         out = self._postprocess_heads(out)
         try:
             st = out.get("state") if isinstance(out, dict) else None
@@ -590,8 +821,14 @@ class IntrospectiveEngine:
                 pass
             eos_id = None if ignore_eos else getattr(self.tok, "eos_token_id", None)
 
-            # Decide reasoning budget
+            # Decide reasoning budget and dynamic decoding params
             think_budget = self._estimate_budget(input_ids) if self.cfg.use_dynamic_budget else self.cfg.max_think_tokens
+            # Apply optional think_ratio from policy
+            try:
+                tr = float(self._decode_params.get('think_ratio', 1.0)) if isinstance(getattr(self, '_decode_params', None), dict) else 1.0
+                think_budget = max(self.cfg.min_think_tokens, int(think_budget * max(0.05, min(1.0, tr))))
+            except Exception:
+                pass
             think_budget = min(think_budget, self.cfg.budget_cap)
 
             # Step 1: THINK — stop at </think> OR budget
@@ -601,14 +838,18 @@ class IntrospectiveEngine:
             out1 = None
             if stream and self.cfg.visible_cot:
                 streamer1 = TextIteratorStreamer(self.tok, skip_prompt=True, skip_special_tokens=True)
+                # use controller-derived decoding params when available
+                _temp = float(self._decode_params.get('temperature', temperature))
+                _top_p = float(self._decode_params.get('top_p', top_p))
+                _rep = float(self._decode_params.get('repetition_penalty', repetition_penalty))
                 gen_kwargs1 = dict(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     max_new_tokens=max_new_tokens,
-                    do_sample=temperature > 0,
-                    temperature=temperature,
-                    top_p=top_p,
-                    repetition_penalty=repetition_penalty,
+                    do_sample=_temp > 0,
+                    temperature=_temp,
+                    top_p=_top_p,
+                    repetition_penalty=_rep,
                     eos_token_id=eos_id,
                     pad_token_id=self.tok.pad_token_id,
                     stopping_criteria=StoppingCriteriaList([stop_think, soft_cap]),
@@ -666,14 +907,17 @@ class IntrospectiveEngine:
                     except Exception:
                         pass
                     with self.scaffold.think():
+                        _temp = float(self._decode_params.get('temperature', temperature))
+                        _top_p = float(self._decode_params.get('top_p', top_p))
+                        _rep = float(self._decode_params.get('repetition_penalty', repetition_penalty))
                         out1 = self.model.generate(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
                         max_new_tokens=max_new_tokens,  # upper bound; stopping criteria will cut earlier
-                        do_sample=temperature > 0,
-                        temperature=temperature,
-                        top_p=top_p,
-                        repetition_penalty=repetition_penalty,
+                        do_sample=_temp > 0,
+                        temperature=_temp,
+                        top_p=_top_p,
+                        repetition_penalty=_rep,
                         eos_token_id=eos_id,
                         pad_token_id=self.tok.pad_token_id,
                         stopping_criteria=StoppingCriteriaList([stop_think, soft_cap]),
@@ -736,14 +980,17 @@ class IntrospectiveEngine:
             text2 = ""
             if stream:
                 streamer2 = TextIteratorStreamer(self.tok, skip_prompt=True, skip_special_tokens=True)
+                _temp2 = float(self._decode_params.get('temperature', temperature))
+                _top_p2 = float(self._decode_params.get('top_p', top_p))
+                _rep2 = float(self._decode_params.get('repetition_penalty', repetition_penalty))
                 gen_kwargs2 = dict(
                     input_ids=full_prompt_ids,
                     attention_mask=full_attn,
                     max_new_tokens=max_new_tokens,
-                    do_sample=temperature > 0,
-                    temperature=temperature,
-                    top_p=top_p,
-                    repetition_penalty=repetition_penalty,
+                    do_sample=_temp2 > 0,
+                    temperature=_temp2,
+                    top_p=_top_p2,
+                    repetition_penalty=_rep2,
                     eos_token_id=eos_id,
                     pad_token_id=self.tok.pad_token_id,
                     stopping_criteria=StoppingCriteriaList([stop_answer]),

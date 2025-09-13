@@ -297,6 +297,18 @@ def compute_losses(
     think_tokens_used: Optional[torch.Tensor] = None,
     target_budget: Optional[torch.Tensor] = None,
     budget_penalty_w: float = 0.0,
+    # length shaping (CoT-space inspired)
+    target_L_opt: Optional[torch.Tensor] = None,
+    solution_incomplete: Optional[torch.Tensor] = None,
+    # correctness/verifier shaping
+    correct_labels: Optional[torch.Tensor] = None,
+    verifier_logits: Optional[torch.Tensor] = None,
+    # expert diversity aux from heads
+    aux: Optional[Dict[str, Any]] = None,
+    # optional anchor KL to base logits on a small anchor set
+    anchor_logits: Optional[torch.Tensor] = None,
+    anchor_mask: Optional[torch.Tensor] = None,
+    anchor_weight: float = 0.0,
     # quiet-star override (phase-driven)
     quiet_star_w: float = 0.0,
 ):
@@ -315,6 +327,8 @@ def compute_losses(
                           "plan_ce": 0.0, "budget_reg": 0.0, "conf_cal": 0.0, "style_inv": 0.0,
                           "rubric": 0.0, "evidence": 0.0, "wrongthink": 0.0, "noise_marker": 0.0,
                           "var_reg": 0.0,
+                          # new shaping weights
+                          "correct": 0.0, "len_over": 0.0, "len_under": 0.0, "expert_entropy_reg": 0.0,
                           "rewrite_consistency": 0.0}
     loss_total = torch.tensor(0.0, dtype=logits.dtype, device=logits.device)
     out = {}
@@ -336,6 +350,24 @@ def compute_losses(
         loss_total = loss_total + greg
     else:
         out["gate_reg"] = torch.tensor(0.0)
+
+    # Correctness / verifier shaping
+    w_corr = float(weights.get("correct", 0.0) or 0.0)
+    if w_corr > 0.0 and (correct_labels is not None or verifier_logits is not None):
+        try:
+            if verifier_logits is not None and correct_labels is not None:
+                x = verifier_logits.view(-1).float()
+                y = correct_labels.view(-1).float().clamp(0.0, 1.0)
+                lc = torch.nn.functional.binary_cross_entropy_with_logits(x, y)
+            else:
+                y = correct_labels.view(-1).float()
+                lc = 1.0 - y.mean()
+        except Exception:
+            lc = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
+        out["loss_correct"] = lc
+        loss_total = loss_total + w_corr * lc
+    else:
+        out["loss_correct"] = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
 
     # Optional Quiet-Star auxiliary consistency loss (training-only)
     # Blends self-distillation on a sampled subset of think tokens, encouraging robustness to short 'silent thoughts'.
@@ -566,8 +598,83 @@ def compute_losses(
     else:
         out["think_ce"] = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
 
+    # Length shaping: overlength and underlength penalties
+    try:
+        w_over = float(weights.get("len_over", 0.0) or 0.0)
+        w_under = float(weights.get("len_under", 0.0) or 0.0)
+    except Exception:
+        w_over, w_under = 0.0, 0.0
+    if (w_over > 0.0 or w_under > 0.0):
+        try:
+            used = (think_tokens_used.view(-1).float() if isinstance(think_tokens_used, torch.Tensor) else torch.zeros(B, device=logits.device, dtype=loss_total.dtype))
+            Lopt = None
+            if isinstance(target_L_opt, torch.Tensor):
+                Lopt = target_L_opt.view(-1).float()
+            elif isinstance(target_budget, torch.Tensor):
+                Lopt = target_budget.view(-1).float()
+            else:
+                Lopt = torch.ones_like(used)
+            over_pen = ((used - Lopt).clamp_min(0.0) / Lopt.clamp_min(1.0)).mean()
+        except Exception:
+            over_pen = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
+        try:
+            if isinstance(solution_incomplete, torch.Tensor):
+                under_pen = solution_incomplete.view(-1).float().clamp(0.0, 1.0).mean()
+            else:
+                under_pen = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
+        except Exception:
+            under_pen = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
+        len_loss = w_over * over_pen + w_under * under_pen
+        out["len_over_pen"] = over_pen
+        out["len_under_pen"] = under_pen
+        out["len_loss"] = len_loss
+        loss_total = loss_total + len_loss
+    else:
+        out["len_over_pen"] = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
+        out["len_under_pen"] = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
+        out["len_loss"] = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
+
+    # Expert diversity: encourage higher selector entropy (if provided via aux)
+    try:
+        w_exp = float(weights.get("expert_entropy_reg", 0.0) or 0.0)
+    except Exception:
+        w_exp = 0.0
+    if w_exp != 0.0 and isinstance(aux, dict):
+        try:
+            eH = aux.get("expert_entropy")
+            if isinstance(eH, torch.Tensor):
+                ediv = -w_exp * eH
+            else:
+                ediv = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
+        except Exception:
+            ediv = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
+        out["expert_diversity"] = ediv
+        loss_total = loss_total + ediv
+    else:
+        out["expert_diversity"] = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
+
+    # Optional anchor KL to base logits
+    w_kl = float(anchor_weight or 0.0)
+    if w_kl > 0.0 and isinstance(anchor_logits, torch.Tensor):
+        try:
+            val_list = []
+            if logits.dim() == 3 and anchor_logits.dim() == 3 and logits.shape[:2] == anchor_logits.shape[:2]:
+                for b in range(logits.shape[0]):
+                    m = anchor_mask[b] if isinstance(anchor_mask, torch.Tensor) and anchor_mask.dim() >= 2 else torch.ones(logits.shape[1], device=logits.device, dtype=logits.dtype)
+                    val_list.append(masked_symmetric_kl(logits[b], anchor_logits[b], m))
+                akl = torch.stack(val_list).mean() if val_list else torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
+            else:
+                akl = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
+        except Exception:
+            akl = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
+        out["anchor_kl"] = w_kl * akl
+        loss_total = loss_total + (w_kl * akl)
+    else:
+        out["anchor_kl"] = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
+
     out["total"] = loss_total
     return out
+
 
 # Training-time context for Quiet-Star auxiliary consistency
 _QUIET_STAR_CTX: ContextVar[Optional[Dict[str, Any]]] = ContextVar("QUIET_STAR_CTX", default=None)

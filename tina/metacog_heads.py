@@ -16,6 +16,12 @@ class MetacogConfig:
     agg: str = "attn"           # 'attn' | 'mean'
     dump_per_layer: bool = False
     var_reg: float = 0.0
+    # Multi-expert + feedback (new)
+    num_experts: int = 3                 # number of expert heads (default 3 for specialization)
+    expert_temp: float = 1.0             # temperature for expert softmax
+    expert_entropy_reg: float = 0.0      # optional reg weight (used by trainer)
+    feedback: bool = False               # whether to compute feedback gating vector
+    feedback_dim: Optional[int] = None   # optional projection dim for feedback (defaults to hidden_size)
 
 
 class LinkedTrunk(nn.Module):
@@ -108,6 +114,55 @@ class LayerAggregator(nn.Module):
         g = (alpha.unsqueeze(-1) * z).sum(dim=1)  # [B,D]
         return g, alpha
 
+
+class ExpertSelector(nn.Module):
+    """
+    Select mixture weights over E experts from aggregated embedding g.
+    logits = W2(tanh(W1 g)); weights = softmax(logits / T)
+    Returns (weights[B,E], entropy[B]) where entropy is -sum p log p.
+    """
+    def __init__(self, proj_dim: int, num_experts: int, temp: float = 1.0):
+        super().__init__()
+        self.l1 = nn.Linear(proj_dim, proj_dim)
+        self.l2 = nn.Linear(proj_dim, num_experts)
+        self.register_buffer("_temp", torch.tensor(float(max(temp, 1e-6))))
+
+    def forward(self, g: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = torch.tanh(self.l1(g))
+        logits = self.l2(x)
+        w = torch.softmax(logits / self._temp, dim=-1)
+        # entropy per sample
+        eps = 1e-12
+        H = -(w * (w.clamp_min(eps).log())).sum(dim=-1)
+        return w, H
+
+
+class ExpertHeads(nn.Module):
+    """
+    Parallel expert heads.
+    For each expert e: plan_e[B,K], budget_raw_e[B,1], conf_raw_e[B,1].
+    Forward returns stacked tensors: [B,E,K], [B,E,1], [B,E,1].
+    """
+    def __init__(self, proj_dim: int, num_experts: int, num_plans: int = 4):
+        super().__init__()
+        self.num_experts = int(max(1, num_experts))
+        self.plan_heads = nn.ModuleList([nn.Linear(proj_dim, num_plans) for _ in range(self.num_experts)])
+        self.budget_heads = nn.ModuleList([nn.Linear(proj_dim, 1) for _ in range(self.num_experts)])
+        self.conf_heads = nn.ModuleList([nn.Linear(proj_dim, 1) for _ in range(self.num_experts)])
+
+    def forward(self, g: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        plans = []
+        buds = []
+        confs = []
+        for pe, be, ce in zip(self.plan_heads, self.budget_heads, self.conf_heads):
+            plans.append(pe(g))         # [B,K]
+            buds.append(be(g))          # [B,1]
+            confs.append(ce(g))         # [B,1]
+        plan_e = torch.stack(plans, dim=1)  # [B,E,K]
+        bud_e = torch.stack(buds, dim=1)    # [B,E,1]
+        conf_e = torch.stack(confs, dim=1)  # [B,E,1]
+        return plan_e, bud_e, conf_e
+
 class MetacogHeads(nn.Module):
     """
     Small heads for plan/budget/confidence, reading a compact pooled z.
@@ -124,10 +179,24 @@ class MetacogHeads(nn.Module):
         self.plan = nn.Linear(D, 4)         # outline/verify/decompose/stop
         self.budget = nn.Linear(D, 1)       # raw budget logit → scaled via sigmoid to [0..Bmax]
         self.confidence = nn.Linear(D, 1)   # scalar
+        # lightweight policy head: temperature, top_p, repetition_penalty, think_ratio
+        self.policy_head = nn.Linear(D, 4)
 
         self._tap_cache = {}  # layer_idx -> last hidden (B,T,H)
         # Non-trainable temperature for budget head (can be tuned via calibration)
         self._budget_temp = nn.Parameter(torch.tensor(float(cfg.budget_head_temperature)), requires_grad=False)
+
+        # Experts (optional)
+        self.num_experts = max(int(getattr(cfg, "num_experts", 1) or 1), 1)
+        self._expert_temp = float(getattr(cfg, "expert_temp", 1.0) or 1.0)
+        if self.num_experts > 1:
+            self.selector = ExpertSelector(D, self.num_experts, temp=self._expert_temp)
+            self.expert_heads = ExpertHeads(D, self.num_experts, num_plans=self.plan.out_features)
+
+        # Feedback projection (optional), maps aggregated metacog state back to hidden space (or custom dim)
+        if bool(getattr(cfg, "feedback", False)):
+            out_dim = int(getattr(cfg, "feedback_dim", None) or cfg.hidden_size)
+            self.feedback_proj = nn.Linear(D, out_dim)
 
         # Linked-all-layers components
         if bool(getattr(cfg, "linked_all_layers", False)):
@@ -182,19 +251,72 @@ class MetacogHeads(nn.Module):
             pl = self._pl_heads(z_pl)
             # Aggregate embedding
             g, alpha = self._aggregator(z_pl)
-            # Final heads from aggregated state
+            # Final heads from aggregated state (single or multi-expert)
             temp = max(float(self.cfg.head_temp), 1e-6)
-            plan_logits = (self.plan(g) / temp).clamp(-20, 20)  # [B,K]
-            raw = self.budget(g) / torch.clamp(self._budget_temp, min=torch.tensor(1e-6, dtype=self._budget_temp.dtype, device=self._budget_temp.device))
+            # Prepare B_max tensor once
+            _denom = torch.clamp(self._budget_temp, min=torch.tensor(1e-6, dtype=self._budget_temp.dtype, device=self._budget_temp.device))
+            # ensure dtype/device alignment for B_max
             if not torch.is_tensor(B_max):
-                Bm = torch.tensor(float(B_max), dtype=raw.dtype, device=raw.device)
+                Bm = torch.tensor(float(B_max), dtype=g.dtype, device=g.device)
             else:
-                Bm = B_max.to(dtype=raw.dtype, device=raw.device)
-            budget = torch.sigmoid(raw) * Bm
-            zero = torch.zeros_like(budget)
-            budget = torch.maximum(zero, torch.minimum(budget, Bm))
-            confidence = torch.sigmoid(self.confidence(g))
-            out.update({"plan_logits": plan_logits, "budget": budget, "confidence": confidence})
+                Bm = B_max.to(dtype=g.dtype, device=g.device)
+
+            if self.num_experts > 1:
+                weights_e, H_e = self.selector(g)  # [B,E], [B]
+                plan_e, bud_e_raw, conf_e_raw = self.expert_heads(g)  # [B,E,K], [B,E,1], [B,E,1]
+                # Mixtures
+                plan_logits = (weights_e.unsqueeze(-1) * plan_e).sum(dim=1)               # [B,K]
+                bud_mix_raw = (weights_e * (bud_e_raw.squeeze(-1) / _denom)).sum(dim=1)   # [B]
+                conf_mix_raw = (weights_e * conf_e_raw.squeeze(-1)).sum(dim=1)            # [B]
+                budget = torch.sigmoid(bud_mix_raw).unsqueeze(-1) * Bm                    # [B,1]
+                zero = torch.zeros_like(budget)
+                budget = torch.maximum(zero, torch.minimum(budget, Bm))
+                confidence = torch.sigmoid(conf_mix_raw).unsqueeze(-1)                    # [B,1]
+                plan_logits = (plan_logits / temp).clamp(-20, 20)
+                out.update({
+                    "plan_logits": plan_logits,
+                    "budget": budget,
+                    "confidence": confidence,
+                    "expert_weights": weights_e,
+                    "weights_e": weights_e,
+                    "H_e": H_e,
+                })
+                # Optional aux losses (selector entropy)
+                try:
+                    out.setdefault("aux", {})["expert_entropy"] = H_e.mean()
+                except Exception:
+                    pass
+            else:
+                plan_logits = (self.plan(g) / temp).clamp(-20, 20)  # [B,K]
+                raw = self.budget(g) / _denom
+                budget = torch.sigmoid(raw) * Bm
+                zero = torch.zeros_like(budget)
+                budget = torch.maximum(zero, torch.minimum(budget, Bm))
+                confidence = torch.sigmoid(self.confidence(g))
+                out.update({"plan_logits": plan_logits, "budget": budget, "confidence": confidence})
+
+            # Optional feedback gating vector from aggregated state
+            if bool(getattr(self.cfg, "feedback", False)) and hasattr(self, "feedback_proj"):
+                gate = torch.sigmoid(self.feedback_proj(g))
+                out["feedback_gate"] = gate
+            # Lightweight policy summary from g
+            try:
+                pvec = self.policy_head(g)  # [B,4]
+                # Map to safe ranges with sigmoid
+                sig = torch.sigmoid
+                temp_v = 0.1 + 1.9 * sig(pvec[:, 0:1])         # [0.1, 2.0]
+                top_p_v = 0.5 + 0.5 * sig(pvec[:, 1:2])        # [0.5, 1.0]
+                rep_v = 0.8 + 0.7 * sig(pvec[:, 2:3])          # [0.8, 1.5]
+                think_ratio_v = 0.1 + 0.9 * sig(pvec[:, 3:4])  # [0.1, 1.0]
+                out["policy"] = {
+                    "temperature": temp_v,
+                    "top_p": top_p_v,
+                    "repetition_penalty": rep_v,
+                    "think_ratio": think_ratio_v,
+                }
+                out["policy_raw"] = pvec
+            except Exception:
+                pass
             if return_state:
                 out["state"] = g
             if bool(getattr(self.cfg, "dump_per_layer", False)):
@@ -238,6 +360,23 @@ class MetacogHeads(nn.Module):
         budget = torch.maximum(zero, torch.minimum(budget, Bm))
         confidence = torch.sigmoid(self.confidence(z))  # [B,1]
         out = {"plan_logits": plan_logits, "budget": budget, "confidence": confidence}
+        # Policy head from z (legacy path)
+        try:
+            pvec = self.policy_head(z)  # [B,4]
+            sig = torch.sigmoid
+            temp_v = 0.1 + 1.9 * sig(pvec[:, 0:1])
+            top_p_v = 0.5 + 0.5 * sig(pvec[:, 1:2])
+            rep_v = 0.8 + 0.7 * sig(pvec[:, 2:3])
+            think_ratio_v = 0.1 + 0.9 * sig(pvec[:, 3:4])
+            out["policy"] = {
+                "temperature": temp_v,
+                "top_p": top_p_v,
+                "repetition_penalty": rep_v,
+                "think_ratio": think_ratio_v,
+            }
+            out["policy_raw"] = pvec
+        except Exception:
+            pass
         if return_state:
             out["state"] = z
         return out
