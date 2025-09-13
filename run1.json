@@ -1,6 +1,6 @@
 {
   "model": {
-    "base": "model/Tina/checkpoint-2000"
+    "base": "model/Base"
   },
   "trainer": {
     "mode": "supervised",
@@ -12,12 +12,12 @@
   "eval_interval": 100,
   "data": {
     "dataset_name": "jsonl",
-    "jsonl": "HF",
+    "jsonl": "data/train.jsonl",
     "limit_train": 100000
   },
   "metacog": {
-    "num_experts": 2,
-    "feedback": true,
+    "num_experts": 1,
+    "feedback": false,
     "feedback_dim": null,
     "linked_all_layers": true,
     "agg": "attn",

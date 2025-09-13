@@ -1212,10 +1212,19 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
         limit_train_val = int(_lim_raw) if _lim_raw is not None else None
     except Exception:
         limit_train_val = None
+    if limit_train_val is not None and int(limit_train_val) <= 0:
+        raise ValueError(f"limit_train must be > 0 or None; got {limit_train_val}")
     from train.data import make_collate_fn
     strict = bool((data_cfg.get("strict") is not False))
     collate = make_collate_fn(tok, loss_on="answer", strict=strict)
     batch = None
+    bs = int((data_cfg.get('batch_size') or 8))
+    examples_base: list[dict] = []
+    # Prefetch only what we need for 'steps' training iterations
+    try:
+        needed_total = max(bs, int(steps) * bs)
+    except Exception:
+        needed_total = bs
     if ds_name == 'glaive':
         # Stream a small batch from the glaive dataset
         try:
@@ -1224,21 +1233,22 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
             path_opt = data_cfg.get('path')
             streaming = bool(data_cfg.get('streaming', False))
             ds = GlaiveDataset(split=split, path=path_opt, streaming=streaming)
-            # Collect up to batch_size examples (respect limit_train when provided)
-            bs = int((data_cfg.get('batch_size') or 8))
+            # Collect enough examples to cover all steps, capped by limit_train when provided
+            prefetch_limit = int(needed_total)
             if limit_train_val is not None:
-                try:
-                    print(f"[DATA] limiting dataset to {limit_train_val} examples")
-                except Exception:
-                    pass
-                bs = min(bs, int(limit_train_val))
+                prefetch_limit = min(prefetch_limit, int(limit_train_val))
+            try:
+                print(f"[DATA] prefetching {prefetch_limit} examples for {int(steps)} steps @ batch_size={bs}")
+            except Exception:
+                pass
             examples = []
             for i, rec in enumerate(ds):
                 examples.append({'text': rec.get('text') or ''})
-                if len(examples) >= bs:
+                if len(examples) >= prefetch_limit:
                     break
             if not examples:
-                examples = [{"text": "<think> alpha beta </think> <answer> ok </answer>"}]
+                raise ValueError('Dataset yielded no examples—check dataset name/path and limit_train')
+            examples_base = list(examples)
             batch = collate(examples)
         except Exception:
             batch = None
@@ -1248,6 +1258,13 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
         try:
             if data_path:
                 count = 0
+                prefetch_limit = int(needed_total)
+                if limit_train_val is not None:
+                    prefetch_limit = min(prefetch_limit, int(limit_train_val))
+                try:
+                    print(f"[DATA] prefetching {prefetch_limit} examples for {int(steps)} steps @ batch_size={bs}")
+                except Exception:
+                    pass
                 for line in Path(data_path).read_text(encoding="utf-8").splitlines():
                     line = line.strip()
                     if not line:
@@ -1257,17 +1274,23 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
                     except Exception:
                         pass
                     count += 1
-                    if limit_train_val is not None and count >= int(limit_train_val):
-                        try:
-                            print(f"[DATA] limiting dataset to {limit_train_val} examples")
-                        except Exception:
-                            pass
+                    if count >= prefetch_limit:
                         break
             if not examples:
-                examples = [{"text": "<think> alpha beta </think> <answer> ok </answer>"}]
+                raise ValueError('Dataset yielded no examples—check dataset name/path and limit_train')
         except Exception:
-            examples = [{"text": "<think> alpha beta </think> <answer> ok </answer>"}]
-        batch = collate(examples)
+            examples = []
+        # Normalize and store base examples
+        for rec in examples:
+            if isinstance(rec, dict) and 'text' in rec:
+                examples_base.append({'text': rec['text']})
+            elif isinstance(rec, dict):
+                txt = rec.get('text') or f"{rec.get('prompt','')} {rec.get('response','')}".strip()
+                if txt:
+                    examples_base.append({'text': txt})
+        if not examples_base:
+            raise ValueError('Dataset yielded no examples—check dataset name/path and limit_train')
+        batch = collate(examples_base[:bs])
 
     # Report trainable parameters and probe max token length before loop
     try:
@@ -1331,9 +1354,31 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
             print(f"note: dashboard disabled ({type(_e).__name__}: {_e}). Install rich>=13.4 to enable.")
             dash_ctx = _nullcontext()
 
+    # Build a cyclic iterator over examples so limited datasets can run many steps
+    try:
+        from itertools import cycle as _cycle
+        data_iter = _cycle(examples_base if 'examples_base' in locals() and examples_base else (examples if 'examples' in locals() else []))
+    except Exception:
+        data_iter = None
+
     last_rl_stats: Dict[str, Any] = {}
     with dash_ctx as _dash:
         for t in range(int(steps)):
+            # Rebuild a small batch each step by cycling examples
+            try:
+                cur = []
+                if data_iter is not None:
+                    for _ in range(bs):
+                        rec = next(data_iter)
+                        if isinstance(rec, dict) and 'text' in rec:
+                            cur.append({'text': rec['text']})
+                        elif isinstance(rec, dict):
+                            txt = rec.get('text') or f"{rec.get('prompt','')} {rec.get('response','')}".strip()
+                            cur.append({'text': txt or '<think> a </think> <answer> b </answer>'})
+                if cur:
+                    batch = collate(cur)
+            except Exception:
+                pass
             if sample_every > 0 and (t % int(sample_every) == 0):
                 try:
                     out = decode_with_budget(

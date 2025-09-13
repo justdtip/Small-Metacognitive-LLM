@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
+import queue
+import sys as _sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -26,14 +30,39 @@ except Exception as e:  # pragma: no cover
     )
     raise SystemExit(1)
 
-import sys as _sys
 from pathlib import Path as _Path
 # Ensure project root is importable when launching as a script
 _ROOT = _Path(__file__).resolve().parents[1]
 if str(_ROOT) not in _sys.path:
     _sys.path.insert(0, str(_ROOT))
-import sys as _sys
 from pathlib import Path as _P
+
+
+class _QueueWriter(io.TextIOBase):
+    """File-like writer that enqueues lines into a queue (for stdout capture)."""
+
+    def __init__(self, q: "queue.Queue[str]") -> None:
+        super().__init__()
+        self._q = q
+        self._buf = ""
+
+    def write(self, s: str) -> int:  # type: ignore[override]
+        self._buf += s
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            try:
+                self._q.put_nowait(line)
+            except Exception:
+                pass
+        return len(s)
+
+    def flush(self) -> None:  # type: ignore[override]
+        if self._buf:
+            try:
+                self._q.put_nowait(self._buf)
+            except Exception:
+                pass
+            self._buf = ""
 
 
 class RunConfigForm(Static):
@@ -135,22 +164,73 @@ class RunConfigForm(Static):
         try:
             cfg_path = Path(f"{self.run_name or 'run'}.json")
             cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-            self.status.update("Starting training…")
+            self.status.update("Starting training… (streaming logs)")
 
-            def _run_wrapper(path: str, steps: int) -> None:
+            # Streaming queue and writer
+            q: "queue.Queue[str]" = queue.Queue()
+            writer = _QueueWriter(q)
+
+            def _runner(path: str, steps: int) -> None:
                 # Ensure repo root on sys.path for import
                 root = _P(__file__).resolve().parents[1]
                 if str(root) not in _sys.path:
                     _sys.path.insert(0, str(root))
+                # Redirect stdout inside this thread
+                old = _sys.stdout
                 try:
+                    _sys.stdout = writer  # type: ignore[assignment]
                     from train.runner import run_from_config as _run
+                    _run(path, steps=int(steps))
                 except Exception as _e:
-                    # Re-raise with context so it surfaces in UI
-                    raise RuntimeError(f"Import failure: {type(_e).__name__}: {_e}")
-                _run(path, steps=int(steps))
+                    try:
+                        q.put_nowait(json.dumps({"error": f"{type(_e).__name__}: {_e}"}))
+                    except Exception:
+                        pass
+                finally:
+                    _sys.stdout = old
 
-            await asyncio.to_thread(_run_wrapper, str(cfg_path), int(self.steps))
-            self.status.update("Training finished.")
+            # Start background runner
+            thr = threading.Thread(target=_runner, args=(str(cfg_path), int(self.steps)), daemon=True)
+            thr.start()
+
+            # Drainer thread: consume stdout and update status live
+            def _drain() -> None:
+                while thr.is_alive() or not q.empty():
+                    try:
+                        line = q.get(timeout=0.25)
+                    except Exception:
+                        continue
+                    # Parse JSON if possible
+                    try:
+                        rec = json.loads(line)
+                        if isinstance(rec, dict):
+                            if "train_step" in rec:
+                                msg = f"step={rec.get('train_step')}"
+                            elif "onpolicy" in rec:
+                                msg = f"onpolicy: {rec['onpolicy']}"
+                            elif "manifest" in rec:
+                                msg = "manifest written"
+                            elif "error" in rec:
+                                msg = f"Error: {rec['error']}"
+                            else:
+                                msg = json.dumps(rec)
+                        else:
+                            msg = str(rec)
+                    except Exception:
+                        msg = line
+                    # Update UI from thread
+                    try:
+                        self.app.call_from_thread(self.status.update, msg)
+                    except Exception:
+                        pass
+                try:
+                    self.app.call_from_thread(self.status.update, "Training finished.")
+                except Exception:
+                    pass
+
+            dthr = threading.Thread(target=_drain, daemon=True)
+            dthr.start()
+            # Return immediately; background threads will keep updating the UI
         except Exception as e:  # surface any error in the UI
             self.status.update(f"Error: {type(e).__name__}: {e}")
 
