@@ -100,7 +100,7 @@ class StatusPanel(Static):
 class TrainingApp(App):
     CSS = """
     Screen { background: black; color: cyan; }
-    .header { color: bright_cyan; }
+    .header { color: ansi_bright_cyan; }
     .label { width: 24; }
     .input { width: 48; }
     .narrow { width: 20; }
@@ -201,7 +201,14 @@ class TrainingApp(App):
 
         # Worker thread: run training and push stdout lines to queue
         def _worker():
-            from train.runner import run_from_config as _run
+            # Push a starting message so the UI doesn't appear idle
+            self._q.put_nowait("[INFO] Starting training...")
+            # Import inside thread and report failures
+            try:
+                from train.runner import run_from_config as _run
+            except Exception as e:
+                self._q.put_nowait(f"[ERROR] Failed to import training runner: {type(e).__name__}: {e}")
+                return
             qwriter = _QueueWriter(self._q)
             old_stdout = sys.stdout
             try:
@@ -242,4 +249,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
