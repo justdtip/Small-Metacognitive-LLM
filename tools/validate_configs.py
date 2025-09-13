@@ -188,6 +188,34 @@ def _coherence_checks() -> list[str]:
 
 def main() -> int:
     all_errors: list[str] = []
+    # Extra validators for training config (metacog, data)
+    def _validate_metacog(cfg: Dict[str, Any]) -> None:
+        mc = cfg.get('metacog', {})
+        try:
+            if int(mc.get('num_experts', 1)) < 1:
+                raise ValueError('num_experts must be >= 1')
+        except Exception:
+            raise ValueError('num_experts must be >= 1')
+        fd = mc.get('feedback_dim')
+        if fd is not None:
+            if not isinstance(fd, int) or int(fd) <= 0:
+                raise ValueError('feedback_dim must be null or positive int')
+        agg = mc.get('agg')
+        if agg is not None and agg not in ('attn', 'mean'):
+            raise ValueError("metacog.agg must be 'attn' or 'mean'")
+
+    def _validate_data(cfg: Dict[str, Any]) -> None:
+        data = cfg.get('data', {})
+        lt = data.get('limit_train')
+        if lt is not None:
+            try:
+                if int(lt) <= 0:
+                    raise ValueError('data.limit_train must be positive or null')
+            except Exception:
+                raise ValueError('data.limit_train must be positive or null')
+        st = data.get('streaming', True)
+        if not isinstance(st, bool):
+            raise ValueError('data.streaming must be boolean')
     for name, (cfg_path, schema_path) in FILES.items():
         if not cfg_path.exists():
             all_errors.append(f"missing config: {cfg_path}")
@@ -204,6 +232,12 @@ def main() -> int:
         if errs:
             all_errors.append(f"[{name}] validation errors:")
             all_errors += [f"  - {e}" for e in errs]
+        # Apply training-specific validations if this is the service file plus optional train_config
+        try:
+            _validate_metacog(inst)
+            _validate_data(inst)
+        except Exception as e:
+            all_errors.append(f"training config invalid in {cfg_path.name}: {type(e).__name__}: {e}")
     all_errors += _coherence_checks()
     if all_errors:
         sys.stderr.write("\n".join(all_errors) + "\n")

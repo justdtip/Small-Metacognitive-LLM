@@ -19,8 +19,9 @@ try:
         Button,
         Checkbox,
         Label,
+        Log,
     )
-    from textual.containers import Horizontal, Vertical
+    from textual.containers import Horizontal, Vertical, VerticalScroll
     from textual.reactive import reactive
 except Exception as e:  # pragma: no cover
     print(
@@ -74,16 +75,31 @@ class RunConfigForm(Static):
     data_limit = reactive(100000)
     save_interval = reactive(1000)
     eval_interval = reactive(100)
-    num_experts = reactive(1)
-    feedback = reactive(False)
+    num_experts = reactive(3)
+    feedback = reactive(True)
     run_name = reactive("run1")
+    streaming = reactive(True)
+    feedback_dim = reactive("")
+    lm_adapt = reactive(True)
+    adapt_mode = reactive("ln_only")
+    adapt_layers = reactive(2)
+    agg = reactive("attn")
+    var_reg = reactive("0.001")
+    mix_dataset = reactive("glaive")
+    link_all = reactive(True)
+    dump_per_layer = reactive(True)
+    apply_all_layers = reactive(False)
+    adapt_layers_list = reactive("")
 
     def compose(self) -> ComposeResult:
-        with Vertical():
+        with VerticalScroll(id="form"):
             yield Label("Model Path:")
             yield Input(id="model_path", placeholder="e.g. models/Qwen1.5B or model/Base", value=self.model_path)
             yield Label("Data Path (HF or local):")
             yield Input(id="data_path", placeholder="e.g. glaive or data/train.jsonl", value=self.data_path)
+            yield Checkbox(label="Streaming (HF datasets)", value=self.streaming, id="streaming_chk")
+            yield Label("Dataset Name or Mixture Key:")
+            yield Input(id="mix_dataset", value=self.mix_dataset)
             yield Label("Steps:")
             yield Input(id="steps", value=str(self.steps))
             yield Label("Dataset Limit (#examples):")
@@ -95,11 +111,35 @@ class RunConfigForm(Static):
             yield Label("Number of Experts:")
             yield Input(id="num_experts", value=str(self.num_experts))
             yield Checkbox(label="Enable Feedback", value=self.feedback, id="feedback_chk")
+            yield Label("Feedback Dim (blank for auto):")
+            yield Input(id="feedback_dim", value=self.feedback_dim)
+            yield Label("LM Adaptation:")
+            yield Checkbox(label="Enable LM Adaptation", value=self.lm_adapt, id="lm_adapt_chk")
+            yield Label("Adaptation Mode (ln_only/lora):")
+            yield Input(id="adapt_mode", value=self.adapt_mode)
+            yield Label("Last K Layers to Adapt:")
+            yield Input(id="adapt_layers", value=str(self.adapt_layers))
+            yield Label("Aggregator (attn or mean):")
+            yield Input(id="agg", value=self.agg)
+            yield Label("Variance Regularizer:")
+            yield Input(id="var_reg", value=self.var_reg)
+            yield Checkbox(label="Attach heads to all layers (linked_all_layers)", value=self.link_all, id="link_all_chk")
+            yield Checkbox(label="Dump per-layer diagnostics", value=self.dump_per_layer, id="dump_pl_chk")
+            yield Checkbox(label="Adaptation: apply to all layers", value=self.apply_all_layers, id="apply_all_layers_chk")
+            yield Label("Adapt Layers List (comma-separated indices):")
+            yield Input(id="adapt_layers_list", value=self.adapt_layers_list)
             yield Label("Run Name:")
             yield Input(id="run_name", value=self.run_name)
             yield Button("Start Training", id="start_btn", variant="success")
-            self.status = Static("Ready", id="status")
+            self.status = Log(id="status", highlight=False, auto_scroll=True)
             yield self.status
+
+    async def on_mount(self) -> None:  # type: ignore[override]
+        # Write initial line once the app is active
+        try:
+            self.status.write_line("Ready")
+        except Exception:
+            pass
 
     def on_input_changed(self, event: Input.Changed) -> None:  # type: ignore[override]
         """Update reactive fields when inputs change."""
@@ -120,6 +160,23 @@ class RunConfigForm(Static):
                 self.data_path = event.value.strip()
             elif event.input.id == "run_name":
                 self.run_name = event.value.strip()
+            elif event.input.id == "feedback_dim":
+                self.feedback_dim = event.value.strip()
+            elif event.input.id == "adapt_mode":
+                self.adapt_mode = event.value.strip()
+            elif event.input.id == "adapt_layers":
+                try:
+                    self.adapt_layers = int(event.value)
+                except ValueError:
+                    pass
+            elif event.input.id == "agg":
+                self.agg = event.value.strip()
+            elif event.input.id == "var_reg":
+                self.var_reg = event.value.strip()
+            elif event.input.id == "mix_dataset":
+                self.mix_dataset = event.value.strip()
+            elif event.input.id == "adapt_layers_list":
+                self.adapt_layers_list = event.value.strip()
         except ValueError:
             # Ignore non-integer input but keep previous state
             pass
@@ -127,18 +184,34 @@ class RunConfigForm(Static):
     def on_checkbox_changed(self, event: Checkbox.Changed) -> None:  # type: ignore[override]
         if event.checkbox.id == "feedback_chk":
             self.feedback = event.value
+        elif event.checkbox.id == "streaming_chk":
+            self.streaming = event.value
+        elif event.checkbox.id == "lm_adapt_chk":
+            self.lm_adapt = event.value
+        elif event.checkbox.id == "link_all_chk":
+            self.link_all = event.value
+        elif event.checkbox.id == "dump_pl_chk":
+            self.dump_per_layer = event.value
+        elif event.checkbox.id == "apply_all_layers_chk":
+            self.apply_all_layers = event.value
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:  # type: ignore[override]
         if event.button.id != "start_btn":
             return
         # Build a config dict and run training asynchronously
-        # If data_path equals a known dataset name, use it; else treat as jsonl path
-        dp = (self.data_path or "").strip()
+        # Dataset selection precedence:
+        # - If mix_dataset is a known HF key (not 'jsonl'), use it
+        # - Else if data_path ends with .jsonl or not in known keys, use local JSONL path
+        # - Else fall back to jsonl default
         known = {"glaive", "gsm8k", "math", "jsonl"}
-        if dp in known and dp != "jsonl":
-            data_cfg = {"dataset_name": dp, "limit_train": int(self.data_limit), "split": "train", "streaming": False}
-        else:
+        md = (self.mix_dataset or "").strip().lower()
+        dp = (self.data_path or "").strip()
+        if md in known and md != "jsonl":
+            data_cfg = {"dataset_name": md, "limit_train": int(self.data_limit), "split": "train", "streaming": bool(self.streaming)}
+        elif dp.lower().endswith('.jsonl') or dp not in known:
             data_cfg = {"dataset_name": "jsonl", "jsonl": dp or "data/train.jsonl", "limit_train": int(self.data_limit)}
+        else:
+            data_cfg = {"dataset_name": "jsonl", "jsonl": "data/train.jsonl", "limit_train": int(self.data_limit)}
 
         cfg: dict[str, Any] = {
             "model": {"base": self.model_path or "model/Base"},
@@ -155,16 +228,24 @@ class RunConfigForm(Static):
             "metacog": {
                 "num_experts": int(self.num_experts),
                 "feedback": bool(self.feedback),
-                "feedback_dim": None,
-                "linked_all_layers": True,
-                "agg": "attn",
-                "var_reg": 0.0,
+                "feedback_dim": (int(self.feedback_dim) if self.feedback_dim.strip().isdigit() else None),
+                "linked_all_layers": bool(self.link_all),
+                "agg": (self.agg or "attn"),
+                "var_reg": float(self.var_reg or 0.0),
+                "dump_per_layer": bool(self.dump_per_layer),
+            },
+            "lm_adaptation": {
+                "enabled": bool(self.lm_adapt),
+                "mode": (self.adapt_mode or "ln_only"),
+                "last_k_layers": int(self.adapt_layers),
+                "apply_to_all_layers": bool(self.apply_all_layers),
+                "layer_indices": [int(x) for x in self.adapt_layers_list.split(',') if x.strip().isdigit()],
             },
         }
         try:
             cfg_path = Path(f"{self.run_name or 'run'}.json")
             cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-            self.status.update("Starting training… (streaming logs)")
+            self.status.write_line("Starting training… (streaming logs)")
 
             # Streaming queue and writer
             q: "queue.Queue[str]" = queue.Queue()
@@ -182,10 +263,18 @@ class RunConfigForm(Static):
                     from train.runner import run_from_config as _run
                     _run(path, steps=int(steps))
                 except Exception as _e:
+                    # Capture full stack trace and ship it to the log queue
                     try:
-                        q.put_nowait(json.dumps({"error": f"{type(_e).__name__}: {_e}"}))
+                        import traceback as _tb
+                        trace_lines = _tb.format_exc().splitlines()
+                        record = {"error": f"{type(_e).__name__}: {_e}", "trace": trace_lines}
+                        q.put_nowait(json.dumps(record))
                     except Exception:
-                        pass
+                        # As a last resort, send the repr
+                        try:
+                            q.put_nowait(f"[EXC] {type(_e).__name__}: {_e}")
+                        except Exception:
+                            pass
                 finally:
                     _sys.stdout = old
 
@@ -204,27 +293,44 @@ class RunConfigForm(Static):
                     try:
                         rec = json.loads(line)
                         if isinstance(rec, dict):
+                            # Known structured lines
                             if "train_step" in rec:
                                 msg = f"step={rec.get('train_step')}"
-                            elif "onpolicy" in rec:
+                                self.app.call_from_thread(self.status.write_line, msg)
+                                continue
+                            if "onpolicy" in rec:
                                 msg = f"onpolicy: {rec['onpolicy']}"
-                            elif "manifest" in rec:
-                                msg = "manifest written"
-                            elif "error" in rec:
-                                msg = f"Error: {rec['error']}"
-                            else:
-                                msg = json.dumps(rec)
+                                self.app.call_from_thread(self.status.write_line, msg)
+                                continue
+                            if "manifest" in rec:
+                                self.app.call_from_thread(self.status.write_line, "manifest written")
+                                continue
+                            if "error" in rec:
+                                # Print error then full stack trace if present
+                                self.app.call_from_thread(self.status.write_line, f"Error: {rec['error']}")
+                                tr = rec.get("trace")
+                                if isinstance(tr, list) and tr:
+                                    for tl in tr:
+                                        self.app.call_from_thread(self.status.write_line, tl)
+                                else:
+                                    # If trace is a string, split lines
+                                    if isinstance(tr, str):
+                                        for tl in tr.splitlines():
+                                            self.app.call_from_thread(self.status.write_line, tl)
+                                continue
+                            # Default: echo JSON compactly
+                            msg = json.dumps(rec)
                         else:
                             msg = str(rec)
                     except Exception:
                         msg = line
                     # Update UI from thread
                     try:
-                        self.app.call_from_thread(self.status.update, msg)
+                        self.app.call_from_thread(self.status.write_line, msg)
                     except Exception:
                         pass
                 try:
-                    self.app.call_from_thread(self.status.update, "Training finished.")
+                    self.app.call_from_thread(self.status.write_line, "Training finished.")
                 except Exception:
                     pass
 
@@ -232,7 +338,7 @@ class RunConfigForm(Static):
             dthr.start()
             # Return immediately; background threads will keep updating the UI
         except Exception as e:  # surface any error in the UI
-            self.status.update(f"Error: {type(e).__name__}: {e}")
+            self.status.write_line(f"Error: {type(e).__name__}: {e}")
 
 
 class TrainingLauncherApp(App):

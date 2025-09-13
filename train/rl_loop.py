@@ -79,7 +79,11 @@ def reinforce_step(
     loss = -((R - baseline).detach() * logp).mean()
     if optimizer is not None:
         optimizer.zero_grad()
-        loss.backward()
+        try:
+            if torch.is_tensor(loss) and bool(getattr(loss, 'requires_grad', False)):
+                loss.backward()
+        except Exception:
+            pass
         optimizer.step()
     with torch.no_grad():
         mu_after = policy(feats).mean().item()
@@ -109,7 +113,11 @@ def dpo_step(
     loss = -torch.nn.functional.logsigmoid(diff).mean()
     if optimizer is not None:
         optimizer.zero_grad()
-        loss.backward()
+        try:
+            if torch.is_tensor(loss) and bool(getattr(loss, 'requires_grad', False)):
+                loss.backward()
+        except Exception:
+            pass
         optimizer.step()
     with torch.no_grad():
         gap = float((mu_rej.mean() - mu_pref.mean()).item())

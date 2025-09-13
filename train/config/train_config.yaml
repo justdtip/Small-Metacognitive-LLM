@@ -16,6 +16,30 @@ data_mixture:
   probe_first_n: 10000
   target_depth_mix: {short: 0.35, mid: 0.45, long: 0.20}
 
+data:
+  dataset_name: glaive         # default HF dataset
+  split: train
+  limit_train: null            # no limit unless user sets
+  streaming: true              # enable streaming by default
+
+metacog:
+  # Enable multi-expert mixing + feedback by default
+  num_experts: 3
+  feedback: true
+  feedback_dim: null       # auto-expand to hidden size if None
+  linked_all_layers: true
+  agg: attn               # keep attention aggregator
+  var_reg: 0.001          # small variance regularisation
+
+trainer:
+  mode: supervised
+  dashboard: true
+
+lm_adaptation:
+  enabled: true
+  mode: ln_only           # restrict adaptation to LayerNorms by default
+  last_k_layers: 2
+
 losses:
   lambda_over: 0.2
   lambda_under: 0.5

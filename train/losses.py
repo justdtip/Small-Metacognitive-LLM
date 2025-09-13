@@ -706,6 +706,34 @@ def compute_losses(
     else:
         out["expert_diversity"] = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
 
+    # Budget regression to realized think length (encourage realistic budgets)
+    try:
+        w_br = float(weights.get("lambda_budget_reg", 0.0) or 0.0)
+    except Exception:
+        w_br = 0.0
+    if w_br > 0.0 and (budget_pred is not None) and (think_tokens_used is not None):
+        try:
+            bp = budget_pred.view(-1).float()
+            if isinstance(think_tokens_used, torch.Tensor):
+                tu = think_tokens_used.view(-1).float().to(device=bp.device)
+            else:
+                tu = torch.tensor(think_tokens_used, dtype=bp.dtype, device=bp.device).view(-1)
+            # Match lengths if shapes differ (broadcast-safe)
+            n = min(int(bp.numel()), int(tu.numel()))
+            if n <= 0:
+                br = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
+            else:
+                br = torch.nn.functional.mse_loss(bp[:n], tu[:n])
+        except Exception:
+            br = torch.tensor(0.0, dtype=loss_total.dtype, device=loss_total.device)
+        # Accumulate into 'budget_reg' key (adds to any supervised budget_reg if present)
+        prev = out.get("budget_reg")
+        if torch.is_tensor(prev):
+            out["budget_reg"] = prev + br
+        else:
+            out["budget_reg"] = br
+        loss_total = loss_total + (w_br * br)
+
     # Optional anchor KL to base logits
     w_kl = float(anchor_weight or 0.0)
     if w_kl > 0.0 and isinstance(anchor_logits, torch.Tensor):

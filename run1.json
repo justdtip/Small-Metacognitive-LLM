@@ -11,16 +11,25 @@
   "save_interval": 1000,
   "eval_interval": 100,
   "data": {
-    "dataset_name": "jsonl",
-    "jsonl": "data/train.jsonl",
-    "limit_train": 100000
+    "dataset_name": "glaive",
+    "limit_train": 100000,
+    "split": "train",
+    "streaming": true
   },
   "metacog": {
-    "num_experts": 1,
-    "feedback": false,
+    "num_experts": 3,
+    "feedback": true,
     "feedback_dim": null,
     "linked_all_layers": true,
     "agg": "attn",
-    "var_reg": 0.0
+    "var_reg": 0.001,
+    "dump_per_layer": true
+  },
+  "lm_adaptation": {
+    "enabled": true,
+    "mode": "ln_only",
+    "last_k_layers": 2,
+    "apply_to_all_layers": true,
+    "layer_indices": []
   }
 }

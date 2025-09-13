@@ -71,13 +71,21 @@ class GlaiveDataset:
     The upstream dataset has fields: {'prompt': str, 'response': str}, where response
     contains a '<think>...</think>' block followed by the final answer text.
     """
-    def __init__(self, split: str = 'train', path: Optional[str] = None, streaming: bool = False):
+    def __init__(self, split: str = 'train', path: Optional[str] = None, streaming: bool = True):
+        """Load the Glaive dataset.
+
+        Parameters
+        - split: dataset split to read
+        - path: optional local path to data files
+        - streaming: when True (default), enable HF streaming to avoid full downloads
+        """
         if load_dataset is None:
             raise RuntimeError("datasets is not installed; cannot load glaive dataset")
         kwargs: Dict[str, Any] = {}
         self.split = split
         if path:
             kwargs['data_files'] = {split: path}
+        # Respect streaming flag from caller; default to True to avoid full materialization
         self.ds = load_dataset('glaiveai/reasoning-v1-20m', split=split, streaming=bool(streaming), **kwargs)
         self.streaming = bool(streaming)
 
@@ -113,7 +121,7 @@ class ReasoningV1Dataset:
         self,
         split: str = 'train',
         path: Optional[str] = None,
-        streaming: bool = False,
+        streaming: bool = True,
         *,
         fewshot: Optional[List[Dict[str, str]]] = None,
         fewshot_sep: str = "\n\n",
@@ -127,6 +135,7 @@ class ReasoningV1Dataset:
         self.split = split
         if path:
             kwargs['data_files'] = {split: path}
+        # Respect streaming flag from caller; default True to minimize downloads
         self.ds = load_dataset(dataset_name, split=split, streaming=bool(streaming), **kwargs)
         self.streaming = bool(streaming)
         self.fewshot = list(fewshot) if fewshot else []

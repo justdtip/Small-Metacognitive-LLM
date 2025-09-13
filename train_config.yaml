@@ -7,7 +7,7 @@ data:
   jsonl: data/train.jsonl
   split: train
   path: null
-  streaming: false
+  streaming: true
   val_split: null
   limit_train: null
   batch_size: 8

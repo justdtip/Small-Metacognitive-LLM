@@ -16,6 +16,7 @@ serve-time/eval-time parity (stop sequences, slack ratios, tag atomicity).
 
 from __future__ import annotations
 from dataclasses import dataclass
+import copy as _copy
 from typing import Sequence, Dict, Any, Optional
 from enum import Enum
 from pathlib import Path as _Path
@@ -130,7 +131,14 @@ class TrainerMode(str, Enum):
 
 class Trainer:
     def __init__(self, cfg: Dict[str, Any]):
-        self.cfg = cfg
+        # Work on a deep copy to avoid mutating caller's configuration
+        try:
+            self._orig_cfg = _copy.deepcopy(cfg)
+            self.cfg = _copy.deepcopy(cfg)
+        except Exception:
+            # Fallback to shallow references if deepcopy fails
+            self._orig_cfg = dict(cfg)
+            self.cfg = dict(cfg)
         self.root = _Path(__file__).resolve().parents[1]
         self.device = (
             "cuda" if torch.cuda.is_available() else
@@ -146,7 +154,7 @@ class Trainer:
     def build_model(self):
         from transformers import AutoModelForCausalLM, AutoTokenizer
         model_cfg = (self.cfg.get("model") or {})
-        base = str(model_cfg.get("base") or "model/Base")
+        base = str(model_cfg.get("model_name_or_path") or model_cfg.get("base") or "model/Base")
         adapter_path = str((model_cfg.get("adapter") or {}).get("path") or "")
         base_path = _Path(base)
         self.tok = AutoTokenizer.from_pretrained(str(base_path), use_fast=True, trust_remote_code=True, local_files_only=True)
@@ -203,13 +211,22 @@ class Trainer:
         adapt_enabled = bool(adapt_cfg.get("enabled", False))
         adapt_mode = str(adapt_cfg.get("mode", "ln_only") or "ln_only").lower()
         last_k = int(adapt_cfg.get("last_k_layers", 2) or 2)
+        apply_all = bool(adapt_cfg.get("apply_to_all_layers", False))
+        layer_indices = adapt_cfg.get("layer_indices")
         lr_scale = float(adapt_cfg.get("lr_scale", 0.05) or 0.05)
         lm_params: list = []
         if adapt_enabled:
             try:
                 dec = self.engine.scaffold._get_decoder_layers(self.model)
                 if dec:
-                    target_idx = list(range(max(0, len(dec) - last_k), len(dec)))
+                    if apply_all:
+                        target_idx = list(range(len(dec)))
+                    elif isinstance(layer_indices, (list, tuple)) and layer_indices:
+                        target_idx = [int(i) for i in layer_indices if 0 <= int(i) < len(dec)]
+                        if not target_idx:
+                            target_idx = list(range(max(0, len(dec) - last_k), len(dec)))
+                    else:
+                        target_idx = list(range(max(0, len(dec) - last_k), len(dec)))
                     if adapt_mode == 'ln_only':
                         import torch.nn as _nn
                         for i in target_idx:
@@ -281,9 +298,18 @@ class Trainer:
             if bool(adapt_cfg.get("enabled", False)):
                 mode = str(adapt_cfg.get("mode", "ln_only") or "ln_only").lower()
                 last_k = int(adapt_cfg.get("last_k_layers", 2) or 2)
+                apply_all = bool(adapt_cfg.get("apply_to_all_layers", False))
+                layer_indices = adapt_cfg.get("layer_indices")
                 dec = self.engine.scaffold._get_decoder_layers(self.model)
                 if dec:
-                    target_idx = list(range(max(0, len(dec) - last_k), len(dec)))
+                    if apply_all:
+                        target_idx = list(range(len(dec)))
+                    elif isinstance(layer_indices, (list, tuple)) and layer_indices:
+                        target_idx = [int(i) for i in layer_indices if 0 <= int(i) < len(dec)]
+                        if not target_idx:
+                            target_idx = list(range(max(0, len(dec) - last_k), len(dec)))
+                    else:
+                        target_idx = list(range(max(0, len(dec) - last_k), len(dec)))
                     if mode == 'ln_only':
                         import torch.nn as _nn
                         for i in target_idx:
@@ -380,16 +406,7 @@ class Trainer:
                 labels = input_ids.clone(); labels[:, :-1] = input_ids[:, 1:]; labels[:, -1] = -100
                 labels = torch.where(batch["loss_mask"].to(self.device).bool(), labels, torch.full_like(labels, -100))
 
-                # Optional on-policy sampling
-                if bool(phase.get("use_on_policy", False)) and on_pol_int > 0 and (t % on_pol_int == 0):
-                    try:
-                        out = decode_with_budget(self.tok, self.model, input_ids, think_budget=int(((self.cfg.get("schedule") or {}).get("budget_cap") or 16)), max_new_tokens=32, temperature=0.2, top_p=0.95, visible_cot=False)
-                        used = int(out.get("think_tokens_used") or 0)
-                        import torch as _t
-                        B = int(input_ids.shape[0])
-                        batch["think_tokens_used"] = _t.tensor([used for _ in range(B)], dtype=_t.long, device=self.device)
-                    except Exception:
-                        pass
+            # Optional on-policy sampling — moved after heads to allow budget-conditioned decode
 
                 # Forward
                 with torch.autocast(device_type=self.device, dtype=self.dtype, enabled=(self.dtype != torch.float32)):
@@ -400,21 +417,27 @@ class Trainer:
                 hidden_size = int(outputs.hidden_states[-1].shape[-1]) if isinstance(outputs.hidden_states, (list, tuple)) else int(getattr(self.model.config, 'hidden_size', 2048))
                 taps_use = tuple((self.cfg.get("taps") or (6, 10, 14)))
                 # Build heads honoring linked_all_layers/proj_dim/agg from config when available
+                _mc_user = (self.cfg.get("metacog") or {})
                 mc_cfg = _MC(
                     hidden_size=hidden_size,
                     taps=taps_use,
-                    proj_dim=int(((cfg.get("metacog") or {}).get("proj_dim") or 128)),
+                    proj_dim=int((_mc_user.get("proj_dim") or 128)),
                     head_temp=1.0,
-                    linked_all_layers=bool(((cfg.get("metacog") or {}).get("linked_all_layers") or False)),
-                    agg=str(((cfg.get("metacog") or {}).get("agg") or 'attn')),
-                    dump_per_layer=True,
+                    linked_all_layers=bool((_mc_user.get("linked_all_layers") or False)),
+                    agg=str((_mc_user.get("agg") or 'attn')),
+                    dump_per_layer=bool((_mc_user.get("dump_per_layer") or True)),
                 )
                 heads = _MH(mc_cfg).to(logits.device, dtype=logits.dtype)
                 heads.clear_cache()
                 hs_list = list(outputs.hidden_states) if isinstance(outputs.hidden_states, (list, tuple)) else []
-                for ti in taps_use:
-                    if 0 <= int(ti) < len(hs_list):
-                        heads.register_tap(int(ti), hs_list[int(ti)])
+                # If linked_all_layers is enabled, register every layer; else only taps
+                if bool(getattr(mc_cfg, 'linked_all_layers', False)):
+                    for li in range(len(hs_list)):
+                        heads.register_tap(li, hs_list[li])
+                else:
+                    for ti in taps_use:
+                        if 0 <= int(ti) < len(hs_list):
+                            heads.register_tap(int(ti), hs_list[int(ti)])
                 B_max_use = int(((self.cfg.get("schedule") or {}).get("budget_cap") or 16))
                 head_out = heads(B_max=B_max_use)
                 plan_logits = head_out.get("plan_logits")
@@ -422,6 +445,25 @@ class Trainer:
                 conf_prob = head_out.get("confidence")
                 conf_logits = torch.logit(conf_prob.clamp(1e-6, 1 - 1e-6)) if conf_prob is not None else None
                 per_layer = head_out.get("per_layer") if isinstance(head_out, dict) else None
+
+            # Use predicted budget to cap THINK during training-time decoding (optional)
+            if bool(phase.get("use_on_policy", False)) and on_pol_int > 0 and (t % on_pol_int == 0):
+                try:
+                    sched_cap = int(((self.cfg.get("schedule") or {}).get("budget_cap") or 16))
+                    use_pred = bool(self.cfg.get('use_predicted_budget', True)) and bool((_mc_user.get('feedback', False)) if '_mc_user' in locals() else (self.cfg.get('metacog', {}) or {}).get('feedback', False))
+                    if use_pred and isinstance(budget_pred, torch.Tensor):
+                        cap = int(budget_pred.detach().float().mean().clamp(1, sched_cap).item())
+                    else:
+                        cap = int(sched_cap)
+                    out_dec = decode_with_budget(self.tok, self.model, input_ids,
+                                                 think_budget=int(cap), max_new_tokens=32,
+                                                 temperature=0.2, top_p=0.95, visible_cot=False)
+                    used = int(out_dec.get("think_tokens_used") or 0)
+                    import torch as _t
+                    B = int(input_ids.shape[0])
+                    batch["think_tokens_used"] = _t.tensor([used for _ in range(B)], dtype=_t.long, device=self.device)
+                except Exception:
+                    pass
 
                 # Targets
                 plan_targets = batch.get("plan_targets").to(self.device) if isinstance(batch.get("plan_targets"), torch.Tensor) else None
@@ -519,32 +561,45 @@ class Trainer:
                 except Exception:
                     pass
 
-                opt.zero_grad(set_to_none=True)
-                out_losses["total"].backward()
-                if clip_norm and clip_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=float(clip_norm))
-                opt.step()
-
-                # Periodic tiny eval with logic-like prompts and record decoding params + batch metrics
-                if eval_interval > 0 and (t % eval_interval == 0):
+            opt.zero_grad(set_to_none=True)
+            try:
+                tot = out_losses.get("total")
+                if torch.is_tensor(tot) and bool(getattr(tot, 'requires_grad', False)):
+                    tot.backward()
+                else:
                     try:
-                        # Run light eval using the full engine + DecodingController
-                        from eval.light_eval import run as light_eval_run  # type: ignore
-                        le = light_eval_run(self.engine, self.tok, visible_cot=False, temperature=0.2, top_p=0.95, max_new_tokens=64)
-                        # Batch token/entropy stats
-                        try:
-                            from train.metrics import cot_length_stats, expert_weights_stats, alpha_stats
-                            bstats = cot_length_stats(think_mask=batch.get('think_mask'), answer_mask=batch.get('answer_mask'), think_tokens_used=batch.get('think_tokens_used'))
-                            ews = expert_weights_stats(head_out.get('expert_weights') if isinstance(head_out, dict) else None)
-                            ast = alpha_stats(per_layer.get('alpha') if isinstance(per_layer, dict) else None)
-                        except Exception:
-                            bstats, ews, ast = {}, {}, {}
-                        # Emit a compact record for TUI/JSON logs
-                        print(json.dumps({"light_eval": {"step": int(t), "accuracy": float(le.get('accuracy') or 0.0), "n": len(le.get('results') or []), "batch_stats": {**bstats, **ews, **ast}}}))
-                        # Also dump full results once in a while
-                        print(json.dumps({"light_eval_results": le}))
+                        print(json.dumps({"warn": "total loss has no grad; skipping backward", "step": int(t)}))
                     except Exception:
                         pass
+            except Exception as _e:
+                try:
+                    print(json.dumps({"error": f"backward_failed: {type(_e).__name__}: {_e}", "step": int(t)}))
+                except Exception:
+                    pass
+            if clip_norm and clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=float(clip_norm))
+            opt.step()
+
+            # Periodic tiny eval with logic-like prompts and record decoding params + batch metrics
+            if eval_interval > 0 and (t % eval_interval == 0):
+                try:
+                    # Run light eval using the full engine + DecodingController
+                    from eval.light_eval import run as light_eval_run  # type: ignore
+                    le = light_eval_run(self.engine, self.tok, visible_cot=False, temperature=0.2, top_p=0.95, max_new_tokens=64)
+                    # Batch token/entropy stats
+                    try:
+                        from train.metrics import cot_length_stats, expert_weights_stats, alpha_stats
+                        bstats = cot_length_stats(think_mask=batch.get('think_mask'), answer_mask=batch.get('answer_mask'), think_tokens_used=batch.get('think_tokens_used'))
+                        ews = expert_weights_stats(head_out.get('expert_weights') if isinstance(head_out, dict) else None)
+                        ast = alpha_stats(per_layer.get('alpha') if isinstance(per_layer, dict) else None)
+                    except Exception:
+                        bstats, ews, ast = {}, {}, {}
+                    # Emit a compact record for TUI/JSON logs
+                    print(json.dumps({"light_eval": {"step": int(t), "accuracy": float(le.get('accuracy') or 0.0), "n": len(le.get('results') or []), "batch_stats": {**bstats, **ews, **ast}}}))
+                    # Also dump full results once in a while
+                    print(json.dumps({"light_eval_results": le}))
+                except Exception:
+                    pass
 
                 # Periodic checkpoint saving
                 if ckpt_interval > 0 and (t > 0) and (t % ckpt_interval == 0):
@@ -561,6 +616,11 @@ class Trainer:
                     except Exception:
                         pass
 
+        # Restore original config after training to avoid persisting runtime tweaks
+        try:
+            self.cfg = _copy.deepcopy(self._orig_cfg)
+        except Exception:
+            self.cfg = dict(self._orig_cfg)
         return {"last_losses": {k: float(v.item()) if torch.is_tensor(v) else float(v) for k, v in out_losses.items()}}
 
 
@@ -650,7 +710,15 @@ def sft_one_step_smoke() -> Dict[str, Any]:
         conf_logits=conf_logits, conf_labels=conf_labels,
     )
     opt.zero_grad()
-    losses["total"].backward()
+    try:
+        tot = losses.get("total")
+        if torch.is_tensor(tot) and bool(getattr(tot, 'requires_grad', False)):
+            tot.backward()
+        else:
+            # Safe no-op if smoke loss has no grad (shouldn't happen, but be robust)
+            pass
+    except Exception:
+        pass
     opt.step()
 
     # Eval extraction parity
@@ -1062,7 +1130,7 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
     cfg = _load_train_config(cfg_path)
     # Resolve fields with defaults
     model_cfg = (cfg.get("model") or {})
-    model_base = str(model_cfg.get("base") or "model/Base")
+    model_base = str(model_cfg.get("model_name_or_path") or model_cfg.get("base") or "model/Base")
     adapter_path = str((model_cfg.get("adapter") or {}).get("path") or (cfg.get("adapter") or {}).get("path") or "")
     data_path = str(((cfg.get("data") or {}).get("jsonl") or ""))
     sched = cfg.get("schedule") or {}
@@ -1207,13 +1275,15 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
     data_cfg = cfg.get("data") or {}
     ds_name = (data_cfg.get("dataset_name") or "jsonl").lower()
     # Optional training set limit from config
-    try:
-        _lim_raw = (data_cfg.get("limit_train") if isinstance(data_cfg, dict) else None)
-        limit_train_val = int(_lim_raw) if _lim_raw is not None else None
-    except Exception:
-        limit_train_val = None
-    if limit_train_val is not None and int(limit_train_val) <= 0:
-        raise ValueError(f"limit_train must be > 0 or None; got {limit_train_val}")
+    _lim_raw = (data_cfg.get("limit_train") if isinstance(data_cfg, dict) else None)
+    limit_train_val = None
+    if _lim_raw is not None:
+        try:
+            limit_train_val = int(_lim_raw)
+        except Exception:
+            raise ValueError("limit_train must be positive or null")
+        if int(limit_train_val) <= 0:
+            raise ValueError(f"limit_train must be > 0 or None; got {limit_train_val}")
     from train.data import make_collate_fn
     strict = bool((data_cfg.get("strict") is not False))
     collate = make_collate_fn(tok, loss_on="answer", strict=strict)
@@ -1361,6 +1431,16 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
     except Exception:
         data_iter = None
 
+    # Intermediate length probing to adjust max_len during long streams
+    try:
+        probe_interval = int(cfg.get('probe_interval', 1000) or 1000)
+    except Exception:
+        probe_interval = 1000
+    try:
+        max_len_so_far = int(cfg.get('max_len', 1024) or 1024)
+    except Exception:
+        max_len_so_far = 1024
+
     last_rl_stats: Dict[str, Any] = {}
     with dash_ctx as _dash:
         for t in range(int(steps)):
@@ -1467,15 +1547,30 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
                 B, T = input_ids.shape
                 h_list = [torch.zeros(B, T, 16, device=logits.device, dtype=logits.dtype)]
 
-        # Metacog heads on pooled taps
+        # Metacog heads on pooled taps (respect linked_all_layers / dump_per_layer)
         from tina.metacog_heads import MetacogHeads as _MH, MetacogConfig as _MC
         hidden_size = int(h_list[-1].shape[-1])
         taps_use = tuple(cfg.get("taps") or (6, 10, 14))
-        heads = _MH(_MC(hidden_size=hidden_size, taps=taps_use, proj_dim=128, head_temp=1.0)).to(logits.device, dtype=logits.dtype)
+        _mc_user = (cfg.get("metacog") or {})
+        mcfg = _MC(
+            hidden_size=hidden_size,
+            taps=taps_use,
+            proj_dim=int(_mc_user.get("proj_dim") or 128),
+            head_temp=1.0,
+            linked_all_layers=bool(_mc_user.get("linked_all_layers") or False),
+            agg=str(_mc_user.get("agg") or 'attn'),
+            dump_per_layer=bool(_mc_user.get("dump_per_layer") or False),
+        )
+        heads = _MH(mcfg).to(logits.device, dtype=logits.dtype)
         heads.clear_cache()
-        for ti in taps_use:
-            if 0 <= int(ti) < len(h_list):
-                heads.register_tap(int(ti), h_list[int(ti)])
+        # Register taps: either every layer (linked) or selected taps
+        if bool(getattr(mcfg, 'linked_all_layers', False)):
+            for li in range(len(h_list)):
+                heads.register_tap(li, h_list[li])
+        else:
+            for ti in taps_use:
+                if 0 <= int(ti) < len(h_list):
+                    heads.register_tap(int(ti), h_list[int(ti)])
         # Choose B_max from batch target or config budget_cap
         try:
             B_max_use = int(budget_cap)
@@ -1611,7 +1706,20 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
             pass
         # Backprop and step
         opt.zero_grad()
-        out_losses["total"].backward()
+        try:
+            tot = out_losses.get("total")
+            if torch.is_tensor(tot) and bool(getattr(tot, 'requires_grad', False)):
+                tot.backward()
+            else:
+                try:
+                    print(json.dumps({"warn": "total loss has no grad; skipping backward", "step": int(t)}))
+                except Exception:
+                    pass
+        except Exception as _e:
+            try:
+                print(json.dumps({"error": f"backward_failed: {type(_e).__name__}: {_e}", "step": int(t)}))
+            except Exception:
+                pass
         opt.step()
 
         # Periodic checkpoint saving
@@ -1637,6 +1745,33 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
                 except Exception:
                     pass
                 print(f"[CKPT] saved at step {t+1} to {ckpt}")
+        except Exception:
+            pass
+
+        # Intermittent probe of longest sequence length during streaming
+        try:
+            if probe_interval > 0 and ((t + 1) % int(probe_interval) == 0):
+                # sample a few upcoming examples from the iterator (cycle-safe)
+                probe_examples = []
+                if data_iter is not None:
+                    for _ in range(10):
+                        try:
+                            rec = next(data_iter)
+                            if isinstance(rec, dict) and rec.get('text'):
+                                probe_examples.append(rec)
+                        except Exception:
+                            break
+                # compute lengths and update max_len if needed
+                for rec in probe_examples:
+                    try:
+                        ids = tok.encode(rec['text'], add_special_tokens=False)
+                        L = len(ids) if isinstance(ids, list) else int(getattr(ids, 'shape', [0])[0])
+                        if int(L) + 32 > int(max_len_so_far):
+                            max_len_so_far = int(L) + 32
+                            cfg['max_len'] = int(max_len_so_far)
+                            print(f"[PROBE] New max_len updated to {int(max_len_so_far)}")
+                    except Exception:
+                        pass
         except Exception:
             pass
 
