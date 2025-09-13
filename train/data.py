@@ -18,6 +18,13 @@ mask). Stopping and masking for training remain based on </think> and
 """
 
 from typing import List, Dict, Tuple, Any, Optional, Callable, Iterator
+
+__all__ = [
+    'ReasoningDataset',
+    'make_collate_fn',
+    'pad_and_stack',
+    'GlaiveDataset',
+]
 import os
 
 try:
