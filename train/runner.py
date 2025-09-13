@@ -316,6 +316,13 @@ class Trainer:
         phase = phases[0] if phases else {"freeze_base": True, "train_adapters": True, "train_heads": True, "use_on_policy": False}
         self._set_train_flags(phase)
 
+        # Periodic simple evaluation prompts (optional)
+        try:
+            eval_prompts = self.cfg.get('eval_prompts', [])
+            eval_interval = int(self.cfg.get('eval_interval', 100) or 100)
+        except Exception:
+            eval_prompts, eval_interval = [], 100
+
         # Optional Rich dashboard (supervised trainer path)
         tr_cfg = self.cfg.get("trainer") or {}
         use_dashboard = bool(tr_cfg.get("dashboard", False))
@@ -484,6 +491,31 @@ class Trainer:
                         "expert_weights": head_out.get("weights_e") if isinstance(head_out, dict) else None,
                         "expert_entropy": float(head_out.get("H_e").mean().item()) if isinstance(head_out.get("H_e"), torch.Tensor) else None,
                     })
+                except Exception:
+                    pass
+
+                # Periodic evaluation on simple prompts (before backward)
+                try:
+                    if eval_prompts and eval_interval > 0 and ((t + 1) % int(eval_interval) == 0):
+                        for prompt in (eval_prompts or []):
+                            try:
+                                enc = self.tok(str(prompt), return_tensors='pt', add_special_tokens=True)
+                                inp = enc['input_ids'].to(self.device)
+                                res = decode_with_budget(self.tok, self.model, inp,
+                                                          think_budget=int(((self.cfg.get("schedule") or {}).get("budget_cap") or 32)),
+                                                          max_new_tokens=32,
+                                                          temperature=0.0,
+                                                          top_p=1.0,
+                                                          visible_cot=False)
+                                ans = res.get('text') or ''
+                                print(f"[EVAL step {t+1}] {prompt} -> {ans}")
+                                try:
+                                    if _dash is not None:
+                                        _dash.update({'eval_output': f'{str(prompt)[:30]} -> {str(ans)[:30]}'})
+                                except Exception:
+                                    pass
+                            except Exception as _e:
+                                print(f"[EVAL ERROR step {t+1}] {_e}")
                 except Exception:
                     pass
 

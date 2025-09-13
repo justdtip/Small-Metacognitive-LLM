@@ -295,13 +295,15 @@ def compute_losses(
     think_ce_w: float = 0.0,
     # over-budget penalty
     think_tokens_used: Optional[torch.Tensor] = None,
-    # alias for clarity in some call-sites
+    # alias for clarity in some call-sites and new synonym
     used_think_tokens: Optional[torch.Tensor] = None,
+    used_tokens: Optional[torch.Tensor] = None,
     target_budget: Optional[torch.Tensor] = None,
     budget_penalty_w: float = 0.0,
     # length shaping (CoT-space inspired)
     target_L_opt: Optional[torch.Tensor] = None,
     target_length_bin: Optional[Any] = None,
+    target_bin: Optional[Any] = None,
     solution_incomplete: Optional[torch.Tensor] = None,
     # correctness/verifier shaping
     correct_labels: Optional[torch.Tensor] = None,
@@ -631,24 +633,25 @@ def compute_losses(
                 return (0.6 * Bi), Bi
             # Fallback static bins
             if label == "short":
-                return torch.tensor(0.0, device=logits.device), torch.tensor(16.0, device=logits.device)
+                return torch.tensor(0.0, device=logits.device), torch.tensor(64.0, device=logits.device)
             if label == "mid":
-                return torch.tensor(16.0, device=logits.device), torch.tensor(64.0, device=logits.device)
-            return torch.tensor(64.0, device=logits.device), torch.tensor(256.0, device=logits.device)
+                return torch.tensor(65.0, device=logits.device), torch.tensor(256.0, device=logits.device)
+            return torch.tensor(257.0, device=logits.device), torch.tensor(512.0, device=logits.device)
 
         # Expand labels to a list per batch
         labels_list: list[str] = []
-        if isinstance(target_length_bin, str):
-            labels_list = [target_length_bin for _ in range(len(used))]
-        elif isinstance(target_length_bin, (list, tuple)):
-            labels_list = [str(x) for x in target_length_bin]
+        target = target_bin if (target_bin is not None) else target_length_bin
+        if isinstance(target, str):
+            labels_list = [target for _ in range(len(used))]
+        elif isinstance(target, (list, tuple)):
+            labels_list = [str(x) for x in target]
             # pad/trim to batch
             if len(labels_list) < len(used):
                 labels_list = labels_list + [labels_list[-1] if labels_list else "long"] * (len(used) - len(labels_list))
             labels_list = labels_list[: len(used)]
-        elif isinstance(target_length_bin, torch.Tensor):
+        elif isinstance(target, torch.Tensor):
             # map integer bins {0,1,2} -> short/mid/long
-            arr = target_length_bin.view(-1).tolist()
+            arr = target.view(-1).tolist()
             map_int = {0: "short", 1: "mid", 2: "long"}
             labels_list = [map_int.get(int(v), "long") for v in arr]
             if len(labels_list) < len(used):

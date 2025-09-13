@@ -45,8 +45,16 @@ python tools/observe_infer.py \
   --debug-per-layer --jsonl-out logs/obs.jsonl
 ```
 
-Training (phases)
+Training (phases / TUI)
 -----------------
+- Interactive TUI (Textual):
+
+```
+python tools/run_training_tui.py
+```
+
+Use the form to set model/data paths, steps, save/eval intervals, experts, and aggregator; click Run to start. A live status panel prints training updates.
+
 - One‑cycle smoke: `python train/one_cycle.py --data data/train.jsonl`
 - Full trainer (optional): set `trainer.enabled: true` in `train_config.yaml`, then run:
 
