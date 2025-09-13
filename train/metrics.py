@@ -284,6 +284,38 @@ def rewrite_kl_mean(records: List[Dict[str, Any]]) -> float:
         return float(sum(vals) / max(1, len(vals)))
 
 
+# --------- Self-play statistics --------------------------------------------------
+def self_play_report(tasks: List[Dict[str, Any]] | None) -> Dict[str, float]:
+    """
+    Aggregate simple self-play stats from a list of task dicts or ProgramTask-like objects.
+    Returns per-mode averages when possible; otherwise overall.
+    """
+    if not tasks:
+        return {"learnability": 0.0, "solver_acc": 0.0, "format_penalty_rate": 0.0}
+    learn: List[float] = []
+    acc: List[float] = []
+    fmt: List[float] = []
+    for t in tasks:
+        try:
+            rl = float(t.get("reward_learnability") if isinstance(t, dict) else getattr(t, "reward_learnability", 0.0))
+            rs = float(t.get("reward_solver") if isinstance(t, dict) else getattr(t, "reward_solver", 0.0))
+            program = t.get("program") if isinstance(t, dict) else getattr(t, "program", "")
+            intros = float(t.get("introspection_score") if isinstance(t, dict) else getattr(t, "introspection_score", 0.0))
+        except Exception:
+            rl, rs, program, intros = 0.0, 0.0, "", 0.0
+        learn.append(rl)
+        acc.append(1.0 if rs >= 1.0 else 0.0)
+        fmt.append(0.0 if ("def solve" in str(program)) else 1.0)
+    intros_mean = float(sum(intros if isinstance(intros, list) else [])) if False else float(sum([t.get("introspection_score") if isinstance(t, dict) else getattr(t, "introspection_score", 0.0) for t in tasks]) / max(1,len(tasks)))
+    return {
+        "learnability": float(sum(learn) / max(1, len(learn))),
+        "solver_acc": float(sum(acc) / max(1, len(acc))),
+        "format_penalty_rate": float(sum(fmt) / max(1, len(fmt))),
+        "n": float(len(tasks)),
+        "introspection_mean": intros_mean,
+    }
+
+
 # --------- Calibration artifact helpers ---------
 def fit_confidence_temperature(logits: torch.Tensor, labels: torch.Tensor) -> float:
     """

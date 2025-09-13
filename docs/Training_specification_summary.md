@@ -39,3 +39,9 @@ Quality vs Budget
 -----------------
 - `train/eval_loop.py::run_budget_sweep` writes JSON/CSV summaries per budget; `tools/plot_quality_budget.py` plots
 
+AZR Self‑Play Integration (Summary)
+-----------------------------------
+- Propose→Solve Loop: The model proposes small programmatic reasoning tasks and attempts to solve them.
+- Safety: Programs are sandboxed by `train/safe_executor.py` (AST validation, restricted builtins, subprocess, timeout).
+- Rewards: combined learnability (executor success, MC trials) + solver correctness − format penalty. Introspection signals (plan/budget/confidence) optionally modulate learnability to prioritize challenging tasks.
+- Advantage Estimation: TRR++‑style advantage can be approximated by reward‑weighted teacher forcing on solver prompts (surrogate in our minimal implementation).

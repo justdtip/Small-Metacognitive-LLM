@@ -17,6 +17,7 @@ serve-time/eval-time parity (stop sequences, slack ratios, tag atomicity).
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Sequence, Dict, Any, Optional
+from enum import Enum
 from pathlib import Path as _Path
 import sys as _sys
 _ROOT = _Path(__file__).resolve().parents[1]
@@ -758,7 +759,53 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
     decode_max_new = int(cfg.get("decode_max_new") or 32)
     lambdas = dict(cfg.get("lambdas") or {})
 
-    # Optional: if trainer is enabled, use integrated trainer path
+    # Trainer mode routing
+    tr_cfg = cfg.get("trainer") or {}
+    mode = TrainerMode((tr_cfg.get("mode") or "supervised").lower())
+    if mode == TrainerMode.SELF_PLAY or mode == TrainerMode.HYBRID:
+        # Build model/tokenizer akin to Trainer
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        base_path = _Path(model_base)
+        tok = AutoTokenizer.from_pretrained(str(base_path), use_fast=True, trust_remote_code=True, local_files_only=True)
+        if getattr(tok, "pad_token", None) is None and getattr(tok, "eos_token", None) is not None:
+            tok.pad_token = tok.eos_token
+        device = (
+            "cuda" if torch.cuda.is_available() else
+            "mps" if getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available() else
+            "cpu"
+        )
+        model = AutoModelForCausalLM.from_pretrained(str(base_path), device_map=None, torch_dtype=torch.float32, trust_remote_code=True, local_files_only=True)
+        model.to(device)
+        # Self-play trainer
+        from train.self_play_azr import SelfPlayAZRTrainer, TaskBuffer
+        from train.safe_executor import execute as _safe_exec
+        buffers = {m: TaskBuffer() for m in (cfg.get('self_play', {}) or {}).get('task_types', ['deduction','abduction','induction'])}
+        sp = SelfPlayAZRTrainer(model, tok, cfg, safe_exec=_safe_exec, buffers=buffers)
+        if mode == TrainerMode.SELF_PLAY:
+            stats = sp.train_loop(steps=int(max(1, steps)))
+            print(json.dumps({"self_play": {"steps": int(steps), "stats": stats}}))
+            return {"self_play": stats}
+        # HYBRID: alternate supervised↔self-play per schedule
+        sched = (tr_cfg.get("hybrid_schedule") or {"supervised_steps": 1000, "self_play_iters": 200})
+        sup_steps = int(sched.get("supervised_steps", 1000) or 1000)
+        sp_iters = int(sched.get("self_play_iters", 200) or 200)
+        # Initialize supervised trainer using same cfg/model setup
+        tr = Trainer(cfg)
+        tr.build_model()
+        remaining = int(max(1, steps))
+        cycle = sup_steps + sp_iters if (sup_steps + sp_iters) > 0 else 1
+        while remaining > 0:
+            take_sup = min(sup_steps, remaining)
+            if take_sup > 0:
+                _ = tr.train(steps=int(take_sup))
+                remaining -= take_sup
+            take_sp = min(sp_iters, remaining)
+            if take_sp > 0:
+                _ = sp.train_loop(steps=int(take_sp))
+                remaining -= take_sp
+        print(json.dumps({"hybrid": {"done": True}}))
+        return {"hybrid": True}
+    # Optional: if trainer is enabled, use integrated supervised trainer path
     if isinstance(cfg.get("trainer"), dict) and bool(cfg["trainer"].get("enabled", False)):
         tr = Trainer(cfg)
         tr.build_model()
@@ -1149,6 +1196,12 @@ def main_train_loop(steps: int = 3, sample_every: int = 1, budget_cap: int = 16)
             # Inject think length (B copies)
             B = int(batch["input_ids"].shape[0]) if hasattr(batch["input_ids"], 'shape') else 1
             import torch as _t
+# Trainer mode switch
+class TrainerMode(str, Enum):
+    SUPERVISED = "supervised"
+    SELF_PLAY = "self_play"
+    HYBRID = "hybrid"
+
             batch["think_tokens_used"] = _t.tensor([used for _ in range(B)], dtype=_t.long)
             # correctness default to 1 (can be arbitrary for smoke)
             if not isinstance(batch.get("correctness"), _t.Tensor):

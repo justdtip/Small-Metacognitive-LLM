@@ -22,6 +22,20 @@ __all__ = [
 
 @dataclass
 class EngineConfig:
+    """Runtime engine configuration.
+
+    Fields
+    - visible_cot: default visibility of <think> (False hides CoT)
+    - max_think_tokens / budget_cap / min_think_tokens: THINK budget controls
+    - taps: indices for metacog taps (legacy three-tap mode)
+    - linked_all_layers / proj_dim / agg / dump_per_layer: metacog settings passed to MetacogConfig
+      (see tina.metacog_heads.MetacogConfig). When linked_all_layers=True, heads pool last-token
+      hidden states from every decoder layer and aggregate via 'attn' or 'mean'. When dump_per_layer=True,
+      per-layer diagnostics (alpha, per-layer plans) are returned for debugging/telemetry.
+    - conditioning_film*: optional FiLM modulation settings (applied during THINK only)
+    - calibration_path: optional JSON path for confidence temperature, plan thresholds, budget clip
+    - style_tag: optional style hint injected before THINK
+    """
     # reasoning behavior
     visible_cot: Optional[bool] = None
     max_think_tokens: int = 256
@@ -43,11 +57,6 @@ class EngineConfig:
     conditioning_film: bool = False
     conditioning_film_scale: float = 0.05
     conditioning_per_layer: bool = True
-    # linked-all-layers metacog options
-    linked_all_layers: bool = False
-    proj_dim: int = 128
-    agg: str = "attn"  # 'attn' | 'mean'
-    dump_per_layer: bool = False
     # optional calibration blob path (JSON): {"conf_temp": float}
     calibration_path: Optional[str] = None
     # optional reasoning style tag to hint at serve (e.g., 'checklist','explainer')

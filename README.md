@@ -103,4 +103,57 @@ Key References
 - Training: `train/runner.py`, `train/one_cycle.py`, `train/losses.py`
 - Observation: `tools/observe_infer.py`
 - Config validator: `tools/validate_configs.py`
+- Self‑Play (AZR)
+-----------------
+We also support an Absolute Zero Reasoner (AZR) self‑play mode that can complement supervised training:
 
+- The proposer samples code‑based reasoning tasks (program + inputs/outputs) conditioned on one of three modes: deduction, abduction, induction.
+- A safe executor validates tasks by sandboxed execution and determinism checks (no imports/attributes; subprocess with a timeout).
+- The solver attempts to answer tasks; rewards combine a learnability score (MC success under the executor) and solver correctness, with a small format penalty.
+- A lightweight policy update maximizes reward by increasing likelihood of correct answers under the solver prompt.
+
+Enable modes via config:
+
+```
+trainer:
+  mode: self_play   # supervised | self_play | hybrid
+self_play:
+  buffer_size: 4096
+  num_propose: 16
+  num_mc_rollouts: 4
+  lambda_learnability: 1.0
+  lambda_solver: 1.0
+  lambda_format: 0.1
+  task_types: [deduction, abduction, induction]
+```
+
+Then run:
+
+```
+python train/runner.py --train-config train_config.yaml --steps 200
+```
+
+Hybrid schedule alternates supervised and self‑play chunks (defaults shown in train_config.yaml):
+
+```
+trainer:
+  mode: hybrid
+  hybrid_schedule:
+    supervised_steps: 1000
+    self_play_iters: 200
+```
+
+Safety constraints are enforced by `train/safe_executor.py` (AST validation, restricted builtins, sandboxed subprocess, timeout, determinism).
+
+Self‑play Training (AZR)
+------------------------
+The Absolute Zero Reasoner (AZR) paradigm trains via self‑play without external labels. We implement a propose→solve loop:
+
+- Proposer: samples or composes small code‑based reasoning tasks (program + inputs/outputs). Tasks are validated by safe execution and determinism checks (no I/O, no imports).
+- Solver: attempts to produce the correct answer for each task. The safe executor acts as a verifier for correctness.
+- Rewards: combine a learnability signal (executor success rate under small Monte‑Carlo runs) and solver correctness, minus a format penalty for malformed programs. See `train/self_play_azr.py`.
+- Modes: three reasoning modes are supported—deduction, abduction, induction—so you can probe different task structures.
+
+Introspection guidance: the metacognitive heads (plan/budget/confidence) optionally guide task selection by boosting learnability on tasks where the model predicts “stop”, low confidence, or very small think budgets. This encourages exploration of challenging tasks.
+
+References: see the AZR paper for the propose/solve paradigm and TRR++ variants for advantage estimation.

@@ -30,3 +30,15 @@ telemetry:
 artifacts:
   calibration: artifacts/metacog_calibration.json
   budget_sweep: artifacts/budget_sweep_*.{json,csv}
+self_play_guidelines:
+  when_to_run: |
+    Use self-play (AZR) to complement supervised training once supervised losses stabilize and calibration is in place.
+    Self-play can bootstrap additional reasoning diversity without new labeled data.
+  hardware: |
+    The safe executor runs code in a CPU subprocess with a timeout. Expect extra CPU usage and minor overhead.
+    Keep GPU reserved for the model; consider adjusting steps/iters per phase based on available cores.
+  seeding_buffers: |
+    Buffers can start empty; for faster convergence, seed with a few trivial identity programs (e.g., add, multiply).
+  monitoring: |
+    Track learnability, solver accuracy, format penalty rate, and buffer sizes per mode.
+    Use train/metrics.self_play_report and per-iteration stats from SelfPlayAZRTrainer.

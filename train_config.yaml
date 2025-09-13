@@ -51,6 +51,20 @@ trainer:
   epochs: 3
   steps_per_eval: 1000
   on_policy_interval: 200
+  mode: supervised  # supervised | self_play | hybrid
+  hybrid_schedule:
+    supervised_steps: 1000
+    self_play_iters: 200
+self_play:
+  buffer_size: 4096
+  num_propose: 16
+  num_mc_rollouts: 4
+  lambda_learnability: 1.0
+  lambda_solver: 1.0
+  lambda_format: 0.1
+  task_types: [deduction, abduction, induction]
+  max_program_len: 128
+  introspection_coeff: 0.1  # weight to boost learnability based on metacog signals
 phases:
   - {name: A, freeze_base: true,  train_adapters: true,  train_heads: true,  train_base_top: false, use_on_policy: false, budget_penalty_w: 0.0, think_ce_w: 0.0, quiet_star_w: 0.0}
   - {name: B, freeze_base: true,  train_adapters: true,  train_heads: true,  train_base_top: false, use_on_policy: true,  budget_penalty_w: 0.1, think_ce_w: 0.0, quiet_star_w: 0.05}
