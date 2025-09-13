@@ -38,7 +38,8 @@ class LinkedTrunk(nn.Module):
         if not torch.is_tensor(h_last) or h_last.dim() != 3:
             raise ValueError("LinkedTrunk expects Tensor[B,L,H]")
         B, L, H = h_last.shape
-        x = h_last.reshape(B * L, H).float()
+        # Preserve incoming dtype to match module weights (bf16/fp16) and avoid matmul mismatch
+        x = h_last.reshape(B * L, H)
         z = self.proj(x)
         return z.view(B, L, -1)
 

@@ -71,6 +71,12 @@ class TinyLM(nn.Module):
 
 # ---- Trainer integration (optional) ---------------------------------------------
 
+# Unified trainer mode selection
+class TrainerMode(str, Enum):
+    SUPERVISED = "supervised"
+    SELF_PLAY = "self_play"
+    HYBRID = "hybrid"
+
 class Trainer:
     def __init__(self, cfg: Dict[str, Any]):
         self.cfg = cfg
@@ -101,6 +107,16 @@ class Trainer:
             pass
         self.model = AutoModelForCausalLM.from_pretrained(str(base_path), device_map=None, torch_dtype=self.dtype, trust_remote_code=True, local_files_only=True)
         self.model.to(self.device)
+        # Enable gradient checkpointing to reduce memory if configured (default: on)
+        try:
+            if bool(((self.cfg.get('fp') or {}).get('grad_ckpt', True))):
+                if hasattr(self.model, 'gradient_checkpointing_enable'):
+                    self.model.gradient_checkpointing_enable()
+                # Disable attention cache so checkpointing is effective
+                if hasattr(self.model, 'config') and hasattr(self.model.config, 'use_cache'):
+                    self.model.config.use_cache = False
+        except Exception:
+            pass
         ensure_reasoning_tokens(self.tok, self.model)
         hidden = getattr(getattr(self.model, 'config', None), 'hidden_size', 2048)
         layers = getattr(getattr(self.model, 'config', None), 'num_hidden_layers', 24)
@@ -187,7 +203,7 @@ class Trainer:
                     pass
 
             # Forward
-            with torch.autocast(device_type=("cuda" if self.device=="cuda" else "cpu"), dtype=(torch.bfloat16 if self.dtype==torch.bfloat16 else torch.float32), enabled=(self.dtype!=torch.float32)):
+            with torch.autocast(device_type=self.device, dtype=self.dtype, enabled=(self.dtype != torch.float32)):
                 outputs = self.model(input_ids=input_ids, output_hidden_states=True, return_dict=True)
                 logits = outputs.logits
             # Heads
@@ -238,7 +254,7 @@ class Trainer:
                 conf_logits=conf_logits if conf_labels is not None else None,
                 conf_labels=conf_labels,
                 answer_mask=batch.get("answer_mask").to(self.device) if isinstance(batch.get("answer_mask"), torch.Tensor) else None,
-                think_mask=batch.get("think_mask").to(self.device) if isinstance(batch.get("think_mask"), torch.Tensor) else None,
+                think_mask_tce=batch.get("think_mask").to(self.device) if isinstance(batch.get("think_mask"), torch.Tensor) else None,
                 think_tokens_used=batch.get("think_tokens_used") if isinstance(batch.get("think_tokens_used"), torch.Tensor) else None,
                 budget_penalty_w=float(phase.get("budget_penalty_w", 0.0) or 0.0),
                 think_ce_w=float(phase.get("think_ce_w", 0.0) or 0.0),
@@ -776,6 +792,15 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
         )
         model = AutoModelForCausalLM.from_pretrained(str(base_path), device_map=None, torch_dtype=torch.float32, trust_remote_code=True, local_files_only=True)
         model.to(device)
+        # Gradient checkpointing for self-play as well (default on)
+        try:
+            if bool(((cfg.get('fp') or {}).get('grad_ckpt', True))):
+                if hasattr(model, 'gradient_checkpointing_enable'):
+                    model.gradient_checkpointing_enable()
+                if hasattr(model, 'config') and hasattr(model.config, 'use_cache'):
+                    model.config.use_cache = False
+        except Exception:
+            pass
         # Self-play trainer
         from train.self_play_azr import SelfPlayAZRTrainer, TaskBuffer
         from train.safe_executor import execute as _safe_exec
@@ -1196,11 +1221,6 @@ def main_train_loop(steps: int = 3, sample_every: int = 1, budget_cap: int = 16)
             # Inject think length (B copies)
             B = int(batch["input_ids"].shape[0]) if hasattr(batch["input_ids"], 'shape') else 1
             import torch as _t
-# Trainer mode switch
-class TrainerMode(str, Enum):
-    SUPERVISED = "supervised"
-    SELF_PLAY = "self_play"
-    HYBRID = "hybrid"
 
             batch["think_tokens_used"] = _t.tensor([used for _ in range(B)], dtype=_t.long)
             # correctness default to 1 (can be arbitrary for smoke)

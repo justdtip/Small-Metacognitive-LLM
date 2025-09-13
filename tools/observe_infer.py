@@ -212,10 +212,11 @@ def main():
     gate_stats = collect_gate_stats(eng.scaffold)
     stats = getattr(eng, "last_stats", {}) or {}
 
+    model_id = f"{base_path}::{adapter_path}" if adapter_path.exists() else str(base_path)
     rec = {
         "request_id": rid,
         "ts_ms": int(time.time()*1000),
-        "model": args.model,
+        "model": model_id,
         "device": device,
         "decode": {"temperature": args.temperature, "top_p": args.top_p, "max_new_tokens": args.max_new},
         "timing": {

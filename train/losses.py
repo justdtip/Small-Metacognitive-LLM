@@ -291,7 +291,7 @@ def compute_losses(
     # per-layer diagnostics (optional)
     per_layer: Optional[Dict[str, torch.Tensor]] = None,
     # on-policy + think auxiliaries
-    think_mask: Optional[torch.Tensor] = None,
+    think_mask_tce: Optional[torch.Tensor] = None,
     think_ce_w: float = 0.0,
     # over-budget penalty
     think_tokens_used: Optional[torch.Tensor] = None,
@@ -550,10 +550,10 @@ def compute_losses(
 
     # Think CE on masked region (optional)
     w_tce = float(think_ce_w or 0.0)
-    if w_tce > 0.0 and (think_mask is not None):
+    if w_tce > 0.0 and (think_mask_tce is not None):
         try:
             B, T, V = logits.shape
-            m = think_mask.to(device=logits.device)
+            m = think_mask_tce.to(device=logits.device)
             lbl = labels.to(dtype=torch.long, device=logits.device)
             # mask labels outside vocab and outside think
             invalid = (lbl >= V) | (lbl < 0)
