@@ -58,6 +58,9 @@ trainer:
   steps_per_eval: 1000
   on_policy_interval: 200
   mode: supervised  # supervised | self_play | hybrid
+  # Enable a live Rich-based dashboard during training.
+  # Set to true to render a TUI showing losses, budgets, confidence, and per-layer stats.
+  dashboard: false
   hybrid_schedule:
     supervised_steps: 1000
     self_play_iters: 200

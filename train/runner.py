@@ -24,6 +24,7 @@ _ROOT = _Path(__file__).resolve().parents[1]
 if str(_ROOT) not in _sys.path:
     _sys.path.insert(0, str(_ROOT))
 import math
+from contextlib import nullcontext as _nullcontext
 
 import torch
 import torch.nn as nn
@@ -185,88 +186,134 @@ class Trainer:
         phase = phases[0] if phases else {"freeze_base": True, "train_adapters": True, "train_heads": True, "use_on_policy": False}
         self._set_train_flags(phase)
 
-        # Training steps loop
-        for t in range(int(steps)):
-            input_ids = batch["input_ids"].to(self.device)
-            labels = input_ids.clone(); labels[:, :-1] = input_ids[:, 1:]; labels[:, -1] = -100
-            labels = torch.where(batch["loss_mask"].to(self.device).bool(), labels, torch.full_like(labels, -100))
+        # Optional Rich dashboard (supervised trainer path)
+        tr_cfg = self.cfg.get("trainer") or {}
+        use_dashboard = bool(tr_cfg.get("dashboard", False))
+        dash_ctx = _nullcontext()
+        if use_dashboard:
+            try:
+                from tools.training_ui import TrainingDashboard  # type: ignore
+                n_layers = int(getattr(getattr(self.model, 'config', None), 'num_hidden_layers', 24))
+                dash_ctx = TrainingDashboard(n_layers)
+            except Exception as _e:
+                print(f"note: dashboard disabled ({type(_e).__name__}: {_e}). Install rich>=13.4 to enable.")
+                dash_ctx = _nullcontext()
 
-            # Optional on-policy sampling
-            if bool(phase.get("use_on_policy", False)) and on_pol_int > 0 and (t % on_pol_int == 0):
+        # Training steps loop
+        with dash_ctx as _dash:
+            for t in range(int(steps)):
+                input_ids = batch["input_ids"].to(self.device)
+                labels = input_ids.clone(); labels[:, :-1] = input_ids[:, 1:]; labels[:, -1] = -100
+                labels = torch.where(batch["loss_mask"].to(self.device).bool(), labels, torch.full_like(labels, -100))
+
+                # Optional on-policy sampling
+                if bool(phase.get("use_on_policy", False)) and on_pol_int > 0 and (t % on_pol_int == 0):
+                    try:
+                        out = decode_with_budget(self.tok, self.model, input_ids, think_budget=int(((self.cfg.get("schedule") or {}).get("budget_cap") or 16)), max_new_tokens=32, temperature=0.2, top_p=0.95, visible_cot=False)
+                        used = int(out.get("think_tokens_used") or 0)
+                        import torch as _t
+                        B = int(input_ids.shape[0])
+                        batch["think_tokens_used"] = _t.tensor([used for _ in range(B)], dtype=_t.long, device=self.device)
+                    except Exception:
+                        pass
+
+                # Forward
+                with torch.autocast(device_type=self.device, dtype=self.dtype, enabled=(self.dtype != torch.float32)):
+                    outputs = self.model(input_ids=input_ids, output_hidden_states=True, return_dict=True)
+                    logits = outputs.logits
+                # Heads
+                from tina.metacog_heads import MetacogHeads as _MH, MetacogConfig as _MC
+                hidden_size = int(outputs.hidden_states[-1].shape[-1]) if isinstance(outputs.hidden_states, (list, tuple)) else int(getattr(self.model.config, 'hidden_size', 2048))
+                taps_use = tuple((self.cfg.get("taps") or (6, 10, 14)))
+                # Build heads honoring linked_all_layers/proj_dim/agg from config when available
+                mc_cfg = _MC(
+                    hidden_size=hidden_size,
+                    taps=taps_use,
+                    proj_dim=int(((cfg.get("metacog") or {}).get("proj_dim") or 128)),
+                    head_temp=1.0,
+                    linked_all_layers=bool(((cfg.get("metacog") or {}).get("linked_all_layers") or False)),
+                    agg=str(((cfg.get("metacog") or {}).get("agg") or 'attn')),
+                    dump_per_layer=True,
+                )
+                heads = _MH(mc_cfg).to(logits.device, dtype=logits.dtype)
+                heads.clear_cache()
+                hs_list = list(outputs.hidden_states) if isinstance(outputs.hidden_states, (list, tuple)) else []
+                for ti in taps_use:
+                    if 0 <= int(ti) < len(hs_list):
+                        heads.register_tap(int(ti), hs_list[int(ti)])
+                B_max_use = int(((self.cfg.get("schedule") or {}).get("budget_cap") or 16))
+                head_out = heads(B_max=B_max_use)
+                plan_logits = head_out.get("plan_logits")
+                budget_pred = head_out.get("budget")
+                conf_prob = head_out.get("confidence")
+                conf_logits = torch.logit(conf_prob.clamp(1e-6, 1 - 1e-6)) if conf_prob is not None else None
+                per_layer = head_out.get("per_layer") if isinstance(head_out, dict) else None
+
+                # Targets
+                plan_targets = batch.get("plan_targets").to(self.device) if isinstance(batch.get("plan_targets"), torch.Tensor) else None
+                budget_target = batch.get("target_budget").to(self.device) if isinstance(batch.get("target_budget"), torch.Tensor) else None
+                if isinstance(budget_target, torch.Tensor) and budget_target.dim() == 1:
+                    budget_target = budget_target.view(-1, 1)
+                conf_labels = batch.get("correctness").to(self.device) if isinstance(batch.get("correctness"), torch.Tensor) else None
+
+                # Losses (include var_reg when configured)
+                var_reg = float(((self.cfg.get("metacog") or {}).get("var_reg") or 0.0) or 0.0)
+                weights = {"answer_ce": 1.0, "plan_ce": 0.5, "budget_reg": 0.1, "conf_cal": 0.1, "var_reg": var_reg}
+                out_losses = compute_losses(
+                    logits, labels,
+                    weights=weights,
+                    plan_logits=plan_logits if plan_targets is not None else None,
+                    plan_targets=plan_targets,
+                    budget_pred=budget_pred if budget_target is not None else None,
+                    budget_target=budget_target,
+                    conf_logits=conf_logits if conf_labels is not None else None,
+                    conf_labels=conf_labels,
+                    answer_mask=batch.get("answer_mask").to(self.device) if isinstance(batch.get("answer_mask"), torch.Tensor) else None,
+                    think_mask_tce=batch.get("think_mask").to(self.device) if isinstance(batch.get("think_mask"), torch.Tensor) else None,
+                    think_tokens_used=batch.get("think_tokens_used") if isinstance(batch.get("think_tokens_used"), torch.Tensor) else None,
+                    budget_penalty_w=float(phase.get("budget_penalty_w", 0.0) or 0.0),
+                    think_ce_w=float(phase.get("think_ce_w", 0.0) or 0.0),
+                    quiet_star_w=float(phase.get("quiet_star_w", 0.0) or 0.0),
+                    per_layer=per_layer,
+                )
+
+                # Optional dashboard update
                 try:
-                    out = decode_with_budget(self.tok, self.model, input_ids, think_budget=int(((self.cfg.get("schedule") or {}).get("budget_cap") or 16)), max_new_tokens=32, temperature=0.2, top_p=0.95, visible_cot=False)
-                    used = int(out.get("think_tokens_used") or 0)
-                    import torch as _t
-                    B = int(input_ids.shape[0])
-                    batch["think_tokens_used"] = _t.tensor([used for _ in range(B)], dtype=_t.long, device=self.device)
+                    if _dash is not None:
+                        # Compose compact metrics
+                        think_used = None
+                        try:
+                            if isinstance(batch.get("think_tokens_used"), torch.Tensor):
+                                think_used = int(batch["think_tokens_used"].max().item())
+                        except Exception:
+                            think_used = None
+                        alpha = None
+                        per_pl = None
+                        if isinstance(per_layer, dict):
+                            alpha = per_layer.get("alpha")
+                            per_pl = per_layer.get("plan_logits_pl")
+                        _dash.update({
+                            "step": t,
+                            "loss_total": float(out_losses["total"].item()),
+                            "loss_answer": float(out_losses.get("answer_ce", torch.tensor(0.0)).item()) if isinstance(out_losses.get("answer_ce"), torch.Tensor) else out_losses.get("answer_ce"),
+                            "loss_rl": float(out_losses.get("budget_reg", torch.tensor(0.0)).item()) if isinstance(out_losses.get("budget_reg"), torch.Tensor) else out_losses.get("budget_reg"),
+                            "reward_mean": None,
+                            "think_tokens": think_used,
+                            "budget_pred": float(budget_pred.mean().item()) if isinstance(budget_pred, torch.Tensor) else None,
+                            "budget_target": float(budget_target.mean().item()) if isinstance(budget_target, torch.Tensor) else None,
+                            "plan_pred": int(plan_logits.argmax(dim=-1)[0].item()) if isinstance(plan_logits, torch.Tensor) and plan_logits.numel() > 0 else None,
+                            "confidence": float(conf_prob.mean().item()) if isinstance(conf_prob, torch.Tensor) else None,
+                            "alpha": alpha,
+                            "per_layer_plan": per_pl,
+                        })
                 except Exception:
                     pass
 
-            # Forward
-            with torch.autocast(device_type=self.device, dtype=self.dtype, enabled=(self.dtype != torch.float32)):
-                outputs = self.model(input_ids=input_ids, output_hidden_states=True, return_dict=True)
-                logits = outputs.logits
-            # Heads
-            from tina.metacog_heads import MetacogHeads as _MH, MetacogConfig as _MC
-            hidden_size = int(outputs.hidden_states[-1].shape[-1]) if isinstance(outputs.hidden_states, (list, tuple)) else int(getattr(self.model.config, 'hidden_size', 2048))
-            taps_use = tuple((self.cfg.get("taps") or (6, 10, 14)))
-            # Build heads honoring linked_all_layers/proj_dim/agg from config when available
-            mc_cfg = _MC(
-                hidden_size=hidden_size,
-                taps=taps_use,
-                proj_dim=int(((cfg.get("metacog") or {}).get("proj_dim") or 128)),
-                head_temp=1.0,
-                linked_all_layers=bool(((cfg.get("metacog") or {}).get("linked_all_layers") or False)),
-                agg=str(((cfg.get("metacog") or {}).get("agg") or 'attn')),
-                dump_per_layer=True,
-            )
-            heads = _MH(mc_cfg).to(logits.device, dtype=logits.dtype)
-            heads.clear_cache()
-            hs_list = list(outputs.hidden_states) if isinstance(outputs.hidden_states, (list, tuple)) else []
-            for ti in taps_use:
-                if 0 <= int(ti) < len(hs_list):
-                    heads.register_tap(int(ti), hs_list[int(ti)])
-            B_max_use = int(((self.cfg.get("schedule") or {}).get("budget_cap") or 16))
-            head_out = heads(B_max=B_max_use)
-            plan_logits = head_out.get("plan_logits")
-            budget_pred = head_out.get("budget")
-            conf_prob = head_out.get("confidence")
-            conf_logits = torch.logit(conf_prob.clamp(1e-6, 1 - 1e-6)) if conf_prob is not None else None
-            per_layer = head_out.get("per_layer") if isinstance(head_out, dict) else None
-
-            # Targets
-            plan_targets = batch.get("plan_targets").to(self.device) if isinstance(batch.get("plan_targets"), torch.Tensor) else None
-            budget_target = batch.get("target_budget").to(self.device) if isinstance(batch.get("target_budget"), torch.Tensor) else None
-            if isinstance(budget_target, torch.Tensor) and budget_target.dim() == 1:
-                budget_target = budget_target.view(-1, 1)
-            conf_labels = batch.get("correctness").to(self.device) if isinstance(batch.get("correctness"), torch.Tensor) else None
-
-            # Losses (include var_reg when configured)
-            var_reg = float(((self.cfg.get("metacog") or {}).get("var_reg") or 0.0) or 0.0)
-            weights = {"answer_ce": 1.0, "plan_ce": 0.5, "budget_reg": 0.1, "conf_cal": 0.1, "var_reg": var_reg}
-            out_losses = compute_losses(
-                logits, labels,
-                weights=weights,
-                plan_logits=plan_logits if plan_targets is not None else None,
-                plan_targets=plan_targets,
-                budget_pred=budget_pred if budget_target is not None else None,
-                budget_target=budget_target,
-                conf_logits=conf_logits if conf_labels is not None else None,
-                conf_labels=conf_labels,
-                answer_mask=batch.get("answer_mask").to(self.device) if isinstance(batch.get("answer_mask"), torch.Tensor) else None,
-                think_mask_tce=batch.get("think_mask").to(self.device) if isinstance(batch.get("think_mask"), torch.Tensor) else None,
-                think_tokens_used=batch.get("think_tokens_used") if isinstance(batch.get("think_tokens_used"), torch.Tensor) else None,
-                budget_penalty_w=float(phase.get("budget_penalty_w", 0.0) or 0.0),
-                think_ce_w=float(phase.get("think_ce_w", 0.0) or 0.0),
-                quiet_star_w=float(phase.get("quiet_star_w", 0.0) or 0.0),
-                per_layer=per_layer,
-            )
-
-            opt.zero_grad(set_to_none=True)
-            out_losses["total"].backward()
-            if clip_norm and clip_norm > 0:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=float(clip_norm))
-            opt.step()
+                opt.zero_grad(set_to_none=True)
+                out_losses["total"].backward()
+                if clip_norm and clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=float(clip_norm))
+                opt.step()
 
         return {"last_losses": {k: float(v.item()) if torch.is_tensor(v) else float(v) for k, v in out_losses.items()}}
 
@@ -777,6 +824,7 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
 
     # Trainer mode routing
     tr_cfg = cfg.get("trainer") or {}
+    use_dashboard = bool(tr_cfg.get("dashboard", False))
     mode = TrainerMode((tr_cfg.get("mode") or "supervised").lower())
     if mode == TrainerMode.SELF_PLAY or mode == TrainerMode.HYBRID:
         # Build model/tokenizer akin to Trainer
@@ -960,56 +1008,70 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
             budget_warmup_steps = int(warmup_cfg)
         except Exception:
             budget_warmup_steps = max(1, int(0.1 * float(total_steps)))
-    for t in range(int(steps)):
-        if sample_every > 0 and (t % int(sample_every) == 0):
-            try:
-                out = decode_with_budget(
-                    tok, model, batch["input_ids"],
-                    think_budget=int(budget_cap),
-                    max_new_tokens=int(decode_max_new),
-                    temperature=float(decode_temperature),
-                    top_p=float(decode_top_p),
-                    visible_cot=False,
-                )
-                used = int(out.get("think_tokens_used") or 0)
-            except Exception:
-                used = 0
-            B = int(batch["input_ids"].shape[0]) if hasattr(batch["input_ids"], 'shape') else 1
-            import torch as _t
-            batch["think_tokens_used"] = _t.tensor([used for _ in range(B)], dtype=_t.long)
-            if not isinstance(batch.get("correctness"), _t.Tensor):
-                batch["correctness"] = _t.ones((B,), dtype=_t.long)
-            # RL budget update under no_grad features
-            pol, stats = rl_phase_step(model, batch, policy=pol, B_max=int(budget_cap))
-            rl_stats.append(stats)
-            # Log RL stats line (include decomp telemetry if present)
-            try:
-                # Optional decomposition telemetry from batch masks
+    # Optional Rich dashboard for this path
+    dash_ctx = _nullcontext()
+    if use_dashboard:
+        try:
+            from tools.training_ui import TrainingDashboard  # type: ignore
+            n_layers = int(getattr(getattr(model, 'config', None), 'num_hidden_layers', 24))
+            dash_ctx = TrainingDashboard(n_layers)
+        except Exception as _e:
+            print(f"note: dashboard disabled ({type(_e).__name__}: {_e}). Install rich>=13.4 to enable.")
+            dash_ctx = _nullcontext()
+
+    last_rl_stats: Dict[str, Any] = {}
+    with dash_ctx as _dash:
+        for t in range(int(steps)):
+            if sample_every > 0 and (t % int(sample_every) == 0):
+                try:
+                    out = decode_with_budget(
+                        tok, model, batch["input_ids"],
+                        think_budget=int(budget_cap),
+                        max_new_tokens=int(decode_max_new),
+                        temperature=float(decode_temperature),
+                        top_p=float(decode_top_p),
+                        visible_cot=False,
+                    )
+                    used = int(out.get("think_tokens_used") or 0)
+                except Exception:
+                    used = 0
+                B = int(batch["input_ids"].shape[0]) if hasattr(batch["input_ids"], 'shape') else 1
                 import torch as _t
-                denom = None
-                if isinstance(batch.get("think_mask"), _t.Tensor):
-                    denom = float(batch["think_mask"].to(dtype=_t.float32).sum().item())
-                def _sum_mask(m):
-                    if isinstance(m, _t.Tensor):
-                        return float(m.to(dtype=_t.float32).sum().item())
-                    return None
-                plan_tok = _sum_mask(batch.get("plan_mask"))
-                exec_tok = _sum_mask(batch.get("exec_mask"))
-                eval_tok = _sum_mask(batch.get("eval_mask"))
-                plan_frac = (plan_tok/denom) if (denom and denom>0 and plan_tok is not None) else None
-                exec_frac = (exec_tok/denom) if (denom and denom>0 and exec_tok is not None) else None
-                eval_frac = (eval_tok/denom) if (denom and denom>0 and eval_tok is not None) else None
-                print(json.dumps({
-                    "train_step": int(t),
-                    "rl": {
-                        "think_tokens_used": int(used),
-                        **{k: float(v) for k, v in stats.items() if isinstance(v, (int, float))},
-                        "plan_tokens": plan_tok, "exec_tokens": exec_tok, "eval_tokens": eval_tok,
-                        "plan_fraction": plan_frac, "exec_fraction": exec_frac, "eval_fraction": eval_frac,
-                    }
-                }))
-            except Exception:
-                pass
+                batch["think_tokens_used"] = _t.tensor([used for _ in range(B)], dtype=_t.long)
+                if not isinstance(batch.get("correctness"), _t.Tensor):
+                    batch["correctness"] = _t.ones((B,), dtype=_t.long)
+                # RL budget update under no_grad features
+                pol, stats = rl_phase_step(model, batch, policy=pol, B_max=int(budget_cap))
+                rl_stats.append(stats)
+                last_rl_stats = stats
+                # Log RL stats line (include decomp telemetry if present)
+                try:
+                    # Optional decomposition telemetry from batch masks
+                    import torch as _t
+                    denom = None
+                    if isinstance(batch.get("think_mask"), _t.Tensor):
+                        denom = float(batch["think_mask"].to(dtype=_t.float32).sum().item())
+                    def _sum_mask(m):
+                        if isinstance(m, _t.Tensor):
+                            return float(m.to(dtype=_t.float32).sum().item())
+                        return None
+                    plan_tok = _sum_mask(batch.get("plan_mask"))
+                    exec_tok = _sum_mask(batch.get("exec_mask"))
+                    eval_tok = _sum_mask(batch.get("eval_mask"))
+                    plan_frac = (plan_tok/denom) if (denom and denom>0 and plan_tok is not None) else None
+                    exec_frac = (exec_tok/denom) if (denom and denom>0 and exec_tok is not None) else None
+                    eval_frac = (eval_tok/denom) if (denom and denom>0 and eval_tok is not None) else None
+                    print(json.dumps({
+                        "train_step": int(t),
+                        "rl": {
+                            "think_tokens_used": int(used),
+                            **{k: float(v) for k, v in stats.items() if isinstance(v, (int, float))},
+                            "plan_tokens": plan_tok, "exec_tokens": exec_tok, "eval_tokens": eval_tok,
+                            "plan_fraction": plan_frac, "exec_fraction": exec_frac, "eval_fraction": eval_frac,
+                        }
+                    }))
+                except Exception:
+                    pass
         # Full training step: forward with hidden states → heads → compute_losses → backward/step
         device = next(model.parameters()).device if hasattr(model, 'parameters') else torch.device('cpu')
         input_ids = batch["input_ids"].to(device)
@@ -1119,6 +1181,48 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
         # Step debug log for budget lambda
         try:
             print(json.dumps({"train_step": int(t), "lambda_budget_current": lam_budget_cur}))
+        except Exception:
+            pass
+        # Dashboard update (best-effort)
+        try:
+            if _dash is not None:
+                think_used = None
+                try:
+                    import torch as _t
+                    if isinstance(batch.get("think_tokens_used"), _t.Tensor):
+                        think_used = int(batch["think_tokens_used"].max().item())
+                except Exception:
+                    think_used = None
+                per = head_out.get("per_layer") if isinstance(head_out, dict) else None
+                alpha = per.get("alpha") if isinstance(per, dict) else None
+                per_pl = per.get("plan_logits_pl") if isinstance(per, dict) else None
+                plan_pred_val = None
+                try:
+                    if isinstance(plan_logits, torch.Tensor) and plan_logits.numel() > 0:
+                        plan_pred_val = int(plan_logits.argmax(dim=-1)[0].item())
+                except Exception:
+                    plan_pred_val = None
+                conf_val = None
+                try:
+                    if isinstance(conf_prob, torch.Tensor):
+                        conf_val = float(conf_prob.mean().item())
+                except Exception:
+                    conf_val = None
+                _dash.update({
+                    "step": t,
+                    "loss_total": float(out_losses["total"].item()),
+                    "loss_answer": float(out_losses.get("answer_ce", torch.tensor(0.0)).item()) if isinstance(out_losses.get("answer_ce"), torch.Tensor) else out_losses.get("answer_ce"),
+                    "loss_rl": float(out_losses.get("budget_reg", torch.tensor(0.0)).item()) if isinstance(out_losses.get("budget_reg"), torch.Tensor) else out_losses.get("budget_reg"),
+                    "reward_mean": last_rl_stats.get("reward_mean"),
+                    "think_tokens": think_used,
+                    "budget_pred": float(budget_pred.mean().item()) if isinstance(budget_pred, torch.Tensor) else None,
+                    "budget_target": float(budget_target.mean().item()) if isinstance(budget_target, torch.Tensor) else None,
+                    "plan_pred": plan_pred_val,
+                    "confidence": conf_val,
+                    "alpha": alpha,
+                    "per_layer_plan": per_pl,
+                    "plan_logits": plan_logits,
+                })
         except Exception:
             pass
         # Backprop and step
