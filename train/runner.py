@@ -1206,6 +1206,12 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
     # Data
     data_cfg = cfg.get("data") or {}
     ds_name = (data_cfg.get("dataset_name") or "jsonl").lower()
+    # Optional training set limit from config
+    try:
+        _lim_raw = (data_cfg.get("limit_train") if isinstance(data_cfg, dict) else None)
+        limit_train_val = int(_lim_raw) if _lim_raw is not None else None
+    except Exception:
+        limit_train_val = None
     from train.data import make_collate_fn
     strict = bool((data_cfg.get("strict") is not False))
     collate = make_collate_fn(tok, loss_on="answer", strict=strict)
@@ -1218,8 +1224,14 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
             path_opt = data_cfg.get('path')
             streaming = bool(data_cfg.get('streaming', False))
             ds = GlaiveDataset(split=split, path=path_opt, streaming=streaming)
-            # Collect up to batch_size examples
+            # Collect up to batch_size examples (respect limit_train when provided)
             bs = int((data_cfg.get('batch_size') or 8))
+            if limit_train_val is not None:
+                try:
+                    print(f"[DATA] limiting dataset to {limit_train_val} examples")
+                except Exception:
+                    pass
+                bs = min(bs, int(limit_train_val))
             examples = []
             for i, rec in enumerate(ds):
                 examples.append({'text': rec.get('text') or ''})
@@ -1235,6 +1247,7 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
         examples: list[dict] = []
         try:
             if data_path:
+                count = 0
                 for line in Path(data_path).read_text(encoding="utf-8").splitlines():
                     line = line.strip()
                     if not line:
@@ -1243,6 +1256,13 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
                         examples.append(json.loads(line))
                     except Exception:
                         pass
+                    count += 1
+                    if limit_train_val is not None and count >= int(limit_train_val):
+                        try:
+                            print(f"[DATA] limiting dataset to {limit_train_val} examples")
+                        except Exception:
+                            pass
+                        break
             if not examples:
                 examples = [{"text": "<think> alpha beta </think> <answer> ok </answer>"}]
         except Exception:
