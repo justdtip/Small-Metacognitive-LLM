@@ -157,7 +157,14 @@ class Trainer:
         model_cfg = (self.cfg.get("model") or {})
         base = str(model_cfg.get("model_name_or_path") or model_cfg.get("base") or "model/Base")
         adapter_path = str((model_cfg.get("adapter") or {}).get("path") or "")
-        base_path = _Path(base)
+        # Validate base/adapters exist before attempting to load
+        base_path = _Path(base).expanduser().resolve()
+        if (not base_path.exists()) or (not base_path.is_dir()):
+            raise FileNotFoundError(f"Base model directory is missing: {str(base_path)}")
+        if adapter_path:
+            ap = _Path(adapter_path).expanduser().resolve()
+            if (not ap.exists()) or (not ap.is_dir()):
+                raise FileNotFoundError(f"Adapter directory is missing: {str(ap)}")
         self.tok = AutoTokenizer.from_pretrained(str(base_path), use_fast=True, trust_remote_code=True, local_files_only=True)
         if getattr(self.tok, "pad_token", None) is None and getattr(self.tok, "eos_token", None) is not None:
             self.tok.pad_token = self.tok.eos_token
@@ -401,7 +408,10 @@ class Trainer:
         # Training steps loop
         with dash_ctx as _dash:
             eval_interval = int(((self.cfg.get("trainer") or {}).get("eval_interval") or 100))
-            ckpt_interval = int(((self.cfg.get("trainer") or {}).get("ckpt_interval") or 1000))
+            # Checkpoint saving configuration (aligned with project directive)
+            # Prefer top-level keys: save_interval (int), save_dir (str)
+            save_interval = int(self.cfg.get("save_interval") or 0)
+            save_dir = Path(self.cfg.get("save_dir", "checkpoints"))
             for t in range(int(steps)):
                 step = t + 1
                 input_ids = batch["input_ids"].to(self.device)
@@ -603,19 +613,24 @@ class Trainer:
                 except Exception:
                     pass
 
-                # Periodic checkpoint saving
-                if ckpt_interval > 0 and (step > 0) and (step % ckpt_interval == 0):
+                # Periodic checkpoint saving aligned to save_interval/save_dir
+                if save_interval > 0 and (step % save_interval == 0):
                     try:
-                        ckpt_dir = Path(self.root) / "artifacts" / "checkpoints"
+                        # Create a directory per checkpoint: <save_dir>/checkpoint-<step>
+                        save_dir.mkdir(parents=True, exist_ok=True)
+                        ckpt_dir = save_dir / f"checkpoint-{int(step)}"
                         ckpt_dir.mkdir(parents=True, exist_ok=True)
+                        # Persist real training state to enable resume
                         state = {
                             'model': self.model.state_dict(),
                             'optimizer': opt.state_dict(),
                             'step': int(step),
                         }
-                        torch.save(state, ckpt_dir / f"step-{int(step):06d}.pt")
-                        print(json.dumps({"checkpoint": {"path": str(ckpt_dir / f'step-{int(step):06d}.pt')}}))
+                        torch.save(state, ckpt_dir / "state.pt")
+                        # Log path of the checkpoint directory for CI tooling
+                        print(json.dumps({"checkpoint": {"path": str(ckpt_dir)}}))
                     except Exception:
+                        # Best-effort; do not crash training loop on checkpoint failure
                         pass
 
         # Restore original config after training to avoid persisting runtime tweaks
@@ -856,6 +871,8 @@ def _train_step(model: nn.Module, batch: Dict[str, Any], *, step: int = 0, total
     # confidence is a probability; convert to logits for calibration loss
     conf_prob = head_out.get("confidence")
     conf_logits = torch.logit(conf_prob.clamp(1e-6, 1 - 1e-6)) if conf_prob is not None else None
+    # Per-layer diagnostics dictionary (may be None)
+    per_layer = head_out.get("per_layer") if isinstance(head_out, dict) else None
     # Targets from batch (may be -1); set None if all entries missing/invalid
     plan_targets = batch.get("plan_targets") if (isinstance(batch.get("plan_targets"), torch.Tensor) and (batch["plan_targets"] >= 0).any()) else None
     budget_target = batch.get("target_budget") if (isinstance(batch.get("target_budget"), torch.Tensor) and (batch["target_budget"] >= 0).any()) else None
@@ -1416,6 +1433,7 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-4)
 
     # Checkpoint configuration
+    # Checkpoint configuration: honor cfg['save_interval'] and cfg['save_dir']
     try:
         save_interval = int(cfg.get('save_interval', 1000) or 1000)
     except Exception:
@@ -1540,271 +1558,298 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
                     }))
                 except Exception:
                     pass
-        # Full training step: forward with hidden states → heads → compute_losses → backward/step
-        device = next(model.parameters()).device if hasattr(model, 'parameters') else torch.device('cpu')
-        input_ids = batch["input_ids"].to(device)
-        # teacher forcing, labels shifted left and masked to answers
-        labels = input_ids.clone()
-        labels[:, :-1] = input_ids[:, 1:]
-        labels[:, -1] = -100
-        labels = torch.where(batch["loss_mask"].to(device).bool(), labels, torch.full_like(labels, -100))
+            # Full training step: forward with hidden states → heads → compute_losses → backward/step
+            device = next(model.parameters()).device if hasattr(model, 'parameters') else torch.device('cpu')
+            input_ids = batch["input_ids"].to(device)
+            # teacher forcing, labels shifted left and masked to answers
+            labels = input_ids.clone()
+            labels[:, :-1] = input_ids[:, 1:]
+            labels[:, -1] = -100
+            labels = torch.where(batch["loss_mask"].to(device).bool(), labels, torch.full_like(labels, -100))
 
-        from train.hooks import think_mask_context as _tmc
-        with _tmc(batch["think_mask"].to(device).float() if hasattr(batch["think_mask"], 'float') else batch["think_mask"]):
-            outputs = None
-            logits = None
-            h_list = None
-            try:
-                outputs = model(input_ids, output_hidden_states=True, return_dict=True)
-                logits = getattr(outputs, "logits", None)
-                h_list = getattr(outputs, "hidden_states", None)
-            except Exception:
+            from train.hooks import think_mask_context as _tmc
+            with _tmc(batch["think_mask"].to(device).float() if hasattr(batch["think_mask"], 'float') else batch["think_mask"]):
                 outputs = None
-            if logits is None:
-                # TinyLM-style fallback
+                logits = None
+                h_list = None
                 try:
-                    x = getattr(model, "embed")(input_ids)
-                    y, _ = getattr(model, "rnn")(x)
-                    logits = getattr(model, "lm_head")(y)
-                    h_base = y
+                    outputs = model(input_ids, output_hidden_states=True, return_dict=True)
+                    logits = getattr(outputs, "logits", None)
+                    h_list = getattr(outputs, "hidden_states", None)
                 except Exception:
-                    B, T = input_ids.shape
-                    h_base = torch.zeros(B, T, 16, device=input_ids.device)
-                    logits = torch.zeros(B, T, 8, device=input_ids.device)
-                taps_use = (6, 10, 14)
-                max_tap = max(taps_use)
-                h_list = [h_base + (0.001 * float(ti)) * torch.ones_like(h_base) for ti in range(max_tap + 1)]
-            if h_list is None:
-                B, T = input_ids.shape
-                h_list = [torch.zeros(B, T, 16, device=logits.device, dtype=logits.dtype)]
-
-        # Metacog heads on pooled taps (respect linked_all_layers / dump_per_layer)
-        from tina.metacog_heads import MetacogHeads as _MH, MetacogConfig as _MC
-        hidden_size = int(h_list[-1].shape[-1])
-        taps_use = tuple(cfg.get("taps") or (6, 10, 14))
-        _mc_user = (cfg.get("metacog") or {})
-        mcfg = _MC(
-            hidden_size=hidden_size,
-            taps=taps_use,
-            proj_dim=int(_mc_user.get("proj_dim") or 128),
-            head_temp=1.0,
-            linked_all_layers=bool(_mc_user.get("linked_all_layers") or False),
-            agg=str(_mc_user.get("agg") or 'attn'),
-            dump_per_layer=bool(_mc_user.get("dump_per_layer") or False),
-        )
-        heads = _MH(mcfg).to(logits.device, dtype=logits.dtype)
-        heads.clear_cache()
-        # Register taps: either every layer (linked) or selected taps
-        if bool(getattr(mcfg, 'linked_all_layers', False)):
-            for li in range(len(h_list)):
-                heads.register_tap(li, h_list[li])
-        else:
-            for ti in taps_use:
-                if 0 <= int(ti) < len(h_list):
-                    heads.register_tap(int(ti), h_list[int(ti)])
-        # Choose B_max from batch target or config budget_cap
-        try:
-            B_max_use = int(budget_cap)
-            if isinstance(batch.get("target_budget"), torch.Tensor) and (batch["target_budget"] >= 0).any():
-                B_max_use = int(batch["target_budget"].max().item())
-        except Exception:
-            B_max_use = int(budget_cap)
-        head_out = heads(B_max=B_max_use)
-        plan_logits = head_out.get("plan_logits")
-        budget_pred = head_out.get("budget")
-        conf_prob = head_out.get("confidence")
-        conf_logits = torch.logit(conf_prob.clamp(1e-6, 1 - 1e-6)) if conf_prob is not None else None
-
-        # Targets from batch
-        plan_targets = batch.get("plan_targets").to(device) if (isinstance(batch.get("plan_targets"), torch.Tensor) and (batch["plan_targets"] >= 0).any()) else None
-        budget_target = batch.get("target_budget").to(device) if (isinstance(batch.get("target_budget"), torch.Tensor) and (batch["target_budget"] >= 0).any()) else None
-        if isinstance(budget_target, torch.Tensor) and budget_target.dim() == 1:
-            budget_target = budget_target.view(-1, 1)
-        conf_labels = batch.get("correctness").to(device) if (isinstance(batch.get("correctness"), torch.Tensor) and (batch["correctness"] >= 0).any()) else None
-
-        # Allow both short keys and *_ce/*_reg names from train_config
-        def _lam(*keys, default=0.0):
-            for k in keys:
-                if k in lambdas and lambdas[k] is not None:
+                    outputs = None
+                if logits is None:
+                    # TinyLM-style fallback
                     try:
-                        return float(lambdas[k])
+                        x = getattr(model, "embed")(input_ids)
+                        y, _ = getattr(model, "rnn")(x)
+                        logits = getattr(model, "lm_head")(y)
+                        h_base = y
                     except Exception:
-                        pass
-            return float(default)
+                        B, T = input_ids.shape
+                        h_base = torch.zeros(B, T, 16, device=input_ids.device)
+                        logits = torch.zeros(B, T, 8, device=input_ids.device)
+                    taps_use = (6, 10, 14)
+                    max_tap = max(taps_use)
+                    h_list = [h_base + (0.001 * float(ti)) * torch.ones_like(h_base) for ti in range(max_tap + 1)]
+                if h_list is None:
+                    B, T = input_ids.shape
+                    h_list = [torch.zeros(B, T, 16, device=logits.device, dtype=logits.dtype)]
 
-        # Budget weight warmup
-        if budget_warmup_steps > 0:
-            lam_budget_cur = float(min(lambda_budget_target, lambda_budget_target * (float(t) / float(budget_warmup_steps))))
-        else:
-            lam_budget_cur = float(lambda_budget_target)
+            # Metacog heads on pooled taps (respect linked_all_layers / dump_per_layer)
+            from tina.metacog_heads import MetacogHeads as _MH, MetacogConfig as _MC
+            hidden_size = int(h_list[-1].shape[-1])
+            taps_use = tuple(cfg.get("taps") or (6, 10, 14))
+            _mc_user = (cfg.get("metacog") or {})
+            mcfg = _MC(
+                hidden_size=hidden_size,
+                taps=taps_use,
+                proj_dim=int(_mc_user.get("proj_dim") or 128),
+                head_temp=1.0,
+                linked_all_layers=bool(_mc_user.get("linked_all_layers") or False),
+                agg=str(_mc_user.get("agg") or 'attn'),
+                dump_per_layer=bool(_mc_user.get("dump_per_layer") or False),
+            )
+            heads = _MH(mcfg).to(logits.device, dtype=logits.dtype)
+            heads.clear_cache()
+            # Register taps: either every layer (linked) or selected taps
+            if bool(getattr(mcfg, 'linked_all_layers', False)):
+                for li in range(len(h_list)):
+                    heads.register_tap(li, h_list[li])
+            else:
+                for ti in taps_use:
+                    if 0 <= int(ti) < len(h_list):
+                        heads.register_tap(int(ti), h_list[int(ti)])
+            # Choose B_max from batch target or config budget_cap
+            try:
+                B_max_use = int(budget_cap)
+                if isinstance(batch.get("target_budget"), torch.Tensor) and (batch["target_budget"] >= 0).any():
+                    B_max_use = int(batch["target_budget"].max().item())
+            except Exception:
+                B_max_use = int(budget_cap)
+            head_out = heads(B_max=B_max_use)
+            plan_logits = head_out.get("plan_logits")
+            budget_pred = head_out.get("budget")
+            conf_prob = head_out.get("confidence")
+            conf_logits = torch.logit(conf_prob.clamp(1e-6, 1 - 1e-6)) if conf_prob is not None else None
 
-        weights = {
-            "answer_ce": _lam("answer_ce", default=1.0),
-            "gate_reg": _lam("gate", "gate_reg", default=0.0),
-            "aux_mix": 0.0,
-            "plan_ce": _lam("plan", "plan_ce", default=0.0),
-            "budget_reg": lam_budget_cur,
-            "conf_cal": _lam("conf", "conf_cal", default=0.0),
-            "rewrite_consistency": _lam("rewrite", default=0.0),
-            "style_inv": _lam("style_inv", default=0.0),
-        }
-        out_losses = compute_losses(
-            logits, labels,
-            gate_modules=None,
-            weights=weights,
-            plan_logits=plan_logits if plan_targets is not None else None,
-            plan_targets=plan_targets,
-            budget_pred=budget_pred if budget_target is not None else None,
-            budget_target=budget_target,
-            conf_logits=conf_logits if conf_labels is not None else None,
-            conf_labels=conf_labels,
-            answer_mask=batch.get("answer_mask").to(device) if isinstance(batch.get("answer_mask"), torch.Tensor) else None,
-            rewrite_groups=(batch.get("batch_meta") or {}).get("rewrite_groups") if isinstance(batch.get("batch_meta"), dict) else None,
-        )
-        # Step debug log for budget lambda
-        try:
-            print(json.dumps({"train_step": int(step), "lambda_budget_current": lam_budget_cur}))
-        except Exception:
-            pass
-        # Periodic evaluation on simple prompts (before backward)
-        try:
-            if eval_prompts and eval_interval > 0 and (step % int(eval_interval) == 0):
-                for prompt in (eval_prompts or []):
-                    try:
-                        enc = tok(str(prompt), return_tensors='pt', add_special_tokens=True)
-                        inp = enc['input_ids'].to(device)
-                        res = decode_with_budget(tok, model, inp,
-                                                  think_budget=int(budget_cap),
-                                                  max_new_tokens=32,
-                                                  temperature=0.0,
-                                                  top_p=1.0,
-                                                  visible_cot=False)
-                        ans = res.get('text') or ''
-                        print(f"[EVAL step {step}] {prompt} -> {ans}")
+            # Targets from batch
+            plan_targets = batch.get("plan_targets").to(device) if (isinstance(batch.get("plan_targets"), torch.Tensor) and (batch["plan_targets"] >= 0).any()) else None
+            budget_target = batch.get("target_budget").to(device) if (isinstance(batch.get("target_budget"), torch.Tensor) and (batch["target_budget"] >= 0).any()) else None
+            if isinstance(budget_target, torch.Tensor) and budget_target.dim() == 1:
+                budget_target = budget_target.view(-1, 1)
+            conf_labels = batch.get("correctness").to(device) if (isinstance(batch.get("correctness"), torch.Tensor) and (batch["correctness"] >= 0).any()) else None
+
+            # Allow both short keys and *_ce/*_reg names from train_config
+            def _lam(*keys, default=0.0):
+                for k in keys:
+                    if k in lambdas and lambdas[k] is not None:
                         try:
-                            if _dash is not None:
-                                _dash.update({'eval_output': f'{str(prompt)[:30]} -> {str(ans)[:30]}'})
+                            return float(lambdas[k])
                         except Exception:
                             pass
-                    except Exception as _e:
-                        print(f"[EVAL ERROR step {step}] {_e}")
-        except Exception:
-            pass
-        # Dashboard update (best-effort)
-        try:
-            if _dash is not None:
-                think_used = None
-                try:
-                    import torch as _t
-                    if isinstance(batch.get("think_tokens_used"), _t.Tensor):
-                        think_used = int(batch["think_tokens_used"].max().item())
-                except Exception:
-                    think_used = None
-                per = head_out.get("per_layer") if isinstance(head_out, dict) else None
-                alpha = per.get("alpha") if isinstance(per, dict) else None
-                per_pl = per.get("plan_logits_pl") if isinstance(per, dict) else None
-                plan_pred_val = None
-                try:
-                    if isinstance(plan_logits, torch.Tensor) and plan_logits.numel() > 0:
-                        plan_pred_val = int(plan_logits.argmax(dim=-1)[0].item())
-                except Exception:
-                    plan_pred_val = None
-                conf_val = None
-                try:
-                    if isinstance(conf_prob, torch.Tensor):
-                        conf_val = float(conf_prob.mean().item())
-                except Exception:
-                    conf_val = None
-                _dash.update({
-                    "step": t,
-                    "loss_total": float(out_losses["total"].item()),
-                    "loss_answer": float(out_losses.get("answer_ce", torch.tensor(0.0)).item()) if isinstance(out_losses.get("answer_ce"), torch.Tensor) else out_losses.get("answer_ce"),
-                    "loss_rl": float(out_losses.get("budget_reg", torch.tensor(0.0)).item()) if isinstance(out_losses.get("budget_reg"), torch.Tensor) else out_losses.get("budget_reg"),
-                    "reward_mean": last_rl_stats.get("reward_mean"),
-                    "think_tokens": think_used,
-                    "budget_pred": float(budget_pred.mean().item()) if isinstance(budget_pred, torch.Tensor) else None,
-                    "budget_target": float(budget_target.mean().item()) if isinstance(budget_target, torch.Tensor) else None,
-                    "plan_pred": plan_pred_val,
-                    "confidence": conf_val,
-                    "alpha": alpha,
-                    "per_layer_plan": per_pl,
-                    "plan_logits": plan_logits,
-                    "policy": head_out.get("policy") if isinstance(head_out, dict) else None,
-                    "expert_weights": head_out.get("weights_e") if isinstance(head_out, dict) else None,
-                    "expert_entropy": float(head_out.get("H_e").mean().item()) if isinstance(head_out.get("H_e"), torch.Tensor) else None,
-                })
-        except Exception:
-            pass
-        # Backprop and step
-        opt.zero_grad()
-        try:
-            tot = out_losses.get("total")
-            if torch.is_tensor(tot) and bool(getattr(tot, 'requires_grad', False)):
-                tot.backward()
+                return float(default)
+
+            # Budget weight warmup
+            if budget_warmup_steps > 0:
+                lam_budget_cur = float(min(lambda_budget_target, lambda_budget_target * (float(t) / float(budget_warmup_steps))))
             else:
-                    try:
-                        print(json.dumps({"warn": "total loss has no grad; skipping backward", "step": int(step)}))
-                    except Exception:
-                        pass
-        except Exception as _e:
+                lam_budget_cur = float(lambda_budget_target)
+
+            weights = {
+                "answer_ce": _lam("answer_ce", default=1.0),
+                "gate_reg": _lam("gate", "gate_reg", default=0.0),
+                "aux_mix": 0.0,
+                "plan_ce": _lam("plan", "plan_ce", default=0.0),
+                "budget_reg": lam_budget_cur,
+                "conf_cal": _lam("conf", "conf_cal", default=0.0),
+                "rewrite_consistency": _lam("rewrite", default=0.0),
+                "style_inv": _lam("style_inv", default=0.0),
+            }
+            out_losses = compute_losses(
+                logits, labels,
+                gate_modules=None,
+                weights=weights,
+                plan_logits=plan_logits if plan_targets is not None else None,
+                plan_targets=plan_targets,
+                budget_pred=budget_pred if budget_target is not None else None,
+                budget_target=budget_target,
+                conf_logits=conf_logits if conf_labels is not None else None,
+                conf_labels=conf_labels,
+                answer_mask=batch.get("answer_mask").to(device) if isinstance(batch.get("answer_mask"), torch.Tensor) else None,
+                rewrite_groups=(batch.get("batch_meta") or {}).get("rewrite_groups") if isinstance(batch.get("batch_meta"), dict) else None,
+            )
+            # Step debug log for budget lambda and per-layer diagnostics
+            try:
+                diag = {}
                 try:
-                    print(json.dumps({"error": f"backward_failed: {type(_e).__name__}: {_e}", "step": int(step)}))
+                    per = head_out.get("per_layer") if isinstance(head_out, dict) else None
+                    if isinstance(per, dict):
+                        alpha = per.get("alpha")
+                        if alpha is not None and hasattr(alpha, 'detach'):
+                            import torch as _t
+                            a = alpha.detach().float()
+                            diag["alpha_mean"] = float(a.mean().item())
+                            diag["alpha_min"] = float(a.min().item())
+                            diag["alpha_max"] = float(a.max().item())
+                        # include sizes to avoid large dumps
+                        for k in ("z", "agg", "plan_logits_pl", "budget_raw_pl", "conf_raw_pl"):
+                            v = per.get(k)
+                            try:
+                                shape = list(v.shape) if hasattr(v, 'shape') else None
+                            except Exception:
+                                shape = None
+                            if shape:
+                                diag[f"{k}_shape"] = shape
                 except Exception:
                     pass
-        opt.step()
-
-        # Periodic checkpoint saving
-        try:
-            if save_interval > 0 and (step % int(save_interval) == 0):
-                ckpt = save_dir / f"checkpoint-{step}"
-                ckpt.mkdir(parents=True, exist_ok=True)
-                # Model
-                try:
-                    if hasattr(model, 'save_pretrained'):
-                        model.save_pretrained(str(ckpt))  # type: ignore[attr-defined]
-                    else:
-                        torch.save(getattr(model, 'state_dict')(), str(ckpt / 'pytorch_model.bin'))
-                except Exception:
-                    try:
-                        torch.save(getattr(model, 'state_dict')(), str(ckpt / 'pytorch_model.bin'))
-                    except Exception:
-                        pass
-                # Tokenizer (optional)
-                try:
-                    if tok is not None and hasattr(tok, 'save_pretrained'):
-                        tok.save_pretrained(str(ckpt))  # type: ignore[attr-defined]
-                except Exception:
-                    pass
-                print(f"[CKPT] saved at step {step} to {ckpt}")
-        except Exception:
-            pass
-
-        # Intermittent probe of longest sequence length during streaming
-        try:
-            if probe_interval > 0 and ((t + 1) % int(probe_interval) == 0):
-                # sample a few upcoming examples from the iterator (cycle-safe)
-                probe_examples = []
-                if data_iter is not None:
-                    for _ in range(10):
+                print(json.dumps({"train_step": int(step), "lambda_budget_current": lam_budget_cur, "per_layer": diag}))
+            except Exception:
+                pass
+            # Periodic evaluation on simple prompts (before backward)
+            try:
+                if eval_prompts and eval_interval > 0 and (step % int(eval_interval) == 0):
+                    for prompt in (eval_prompts or []):
                         try:
-                            rec = next(data_iter)
-                            if isinstance(rec, dict) and rec.get('text'):
-                                probe_examples.append(rec)
-                        except Exception:
-                            break
-                # compute lengths and update max_len if needed
-                for rec in probe_examples:
+                            enc = tok(str(prompt), return_tensors='pt', add_special_tokens=True)
+                            inp = enc['input_ids'].to(device)
+                            res = decode_with_budget(tok, model, inp,
+                                                      think_budget=int(budget_cap),
+                                                      max_new_tokens=32,
+                                                      temperature=0.0,
+                                                      top_p=1.0,
+                                                      visible_cot=False)
+                            ans = res.get('text') or ''
+                            print(f"[EVAL step {step}] {prompt} -> {ans}")
+                            try:
+                                if _dash is not None:
+                                    _dash.update({'eval_output': f'{str(prompt)[:30]} -> {str(ans)[:30]}'})
+                            except Exception:
+                                pass
+                        except Exception as _e:
+                            print(f"[EVAL ERROR step {step}] {_e}")
+            except Exception:
+                pass
+            # Dashboard update (best-effort)
+            try:
+                if _dash is not None:
+                    think_used = None
                     try:
-                        ids = tok.encode(rec['text'], add_special_tokens=False)
-                        L = len(ids) if isinstance(ids, list) else int(getattr(ids, 'shape', [0])[0])
-                        if int(L) + 32 > int(max_len_so_far):
-                            max_len_so_far = int(L) + 32
-                            cfg['max_len'] = int(max_len_so_far)
-                            print(f"[PROBE] New max_len updated to {int(max_len_so_far)}")
+                        import torch as _t
+                        if isinstance(batch.get("think_tokens_used"), _t.Tensor):
+                            think_used = int(batch["think_tokens_used"].max().item())
+                    except Exception:
+                        think_used = None
+                    per = head_out.get("per_layer") if isinstance(head_out, dict) else None
+                    alpha = per.get("alpha") if isinstance(per, dict) else None
+                    per_pl = per.get("plan_logits_pl") if isinstance(per, dict) else None
+                    plan_pred_val = None
+                    try:
+                        if isinstance(plan_logits, torch.Tensor) and plan_logits.numel() > 0:
+                            plan_pred_val = int(plan_logits.argmax(dim=-1)[0].item())
+                    except Exception:
+                        plan_pred_val = None
+                    conf_val = None
+                    try:
+                        if isinstance(conf_prob, torch.Tensor):
+                            conf_val = float(conf_prob.mean().item())
+                    except Exception:
+                        conf_val = None
+                    _dash.update({
+                        "step": t,
+                        "loss_total": float(out_losses["total"].item()),
+                        "loss_answer": float(out_losses.get("answer_ce", torch.tensor(0.0)).item()) if isinstance(out_losses.get("answer_ce"), torch.Tensor) else out_losses.get("answer_ce"),
+                        "loss_rl": float(out_losses.get("budget_reg", torch.tensor(0.0)).item()) if isinstance(out_losses.get("budget_reg"), torch.Tensor) else out_losses.get("budget_reg"),
+                        "reward_mean": last_rl_stats.get("reward_mean"),
+                        "think_tokens": think_used,
+                        "budget_pred": float(budget_pred.mean().item()) if isinstance(budget_pred, torch.Tensor) else None,
+                        "budget_target": float(budget_target.mean().item()) if isinstance(budget_target, torch.Tensor) else None,
+                        "plan_pred": plan_pred_val,
+                        "confidence": conf_val,
+                        "alpha": alpha,
+                        "per_layer_plan": per_pl,
+                        "plan_logits": plan_logits,
+                        "policy": head_out.get("policy") if isinstance(head_out, dict) else None,
+                        "expert_weights": head_out.get("weights_e") if isinstance(head_out, dict) else None,
+                        "expert_entropy": float(head_out.get("H_e").mean().item()) if isinstance(head_out.get("H_e"), torch.Tensor) else None,
+                    })
+            except Exception:
+                pass
+            # Backprop and step
+            opt.zero_grad()
+            try:
+                tot = out_losses.get("total")
+                if torch.is_tensor(tot) and bool(getattr(tot, 'requires_grad', False)):
+                    tot.backward()
+                else:
+                        try:
+                            print(json.dumps({"warn": "total loss has no grad; skipping backward", "step": int(step)}))
+                        except Exception:
+                            pass
+            except Exception as _e:
+                    try:
+                        print(json.dumps({"error": f"backward_failed: {type(_e).__name__}: {_e}", "step": int(step)}))
                     except Exception:
                         pass
-        except Exception:
-            pass
+            opt.step()
+
+            # Periodic checkpoint saving
+            try:
+                # Debug trace for checkpoint cadence
+                try:
+                    print(json.dumps({"ckpt_debug": {"step": int(step), "save_interval": int(save_interval)}}))
+                except Exception:
+                    pass
+                if save_interval > 0 and (step % int(save_interval) == 0):
+                    ckpt = save_dir / f"checkpoint-{step}"
+                    ckpt.mkdir(parents=True, exist_ok=True)
+                    # Model
+                    try:
+                        if hasattr(model, 'save_pretrained'):
+                            model.save_pretrained(str(ckpt))  # type: ignore[attr-defined]
+                        else:
+                            torch.save(getattr(model, 'state_dict')(), str(ckpt / 'pytorch_model.bin'))
+                    except Exception:
+                        try:
+                            torch.save(getattr(model, 'state_dict')(), str(ckpt / 'pytorch_model.bin'))
+                        except Exception:
+                            pass
+                    # Tokenizer (optional)
+                    try:
+                        if tok is not None and hasattr(tok, 'save_pretrained'):
+                            tok.save_pretrained(str(ckpt))  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+                    print(f"[CKPT] saved at step {step} to {ckpt}")
+            except Exception:
+                pass
+
+            # Intermittent probe of longest sequence length during streaming
+            try:
+                if probe_interval > 0 and ((t + 1) % int(probe_interval) == 0):
+                    # sample a few upcoming examples from the iterator (cycle-safe)
+                    probe_examples = []
+                    if data_iter is not None:
+                        for _ in range(10):
+                            try:
+                                rec = next(data_iter)
+                                if isinstance(rec, dict) and rec.get('text'):
+                                    probe_examples.append(rec)
+                            except Exception:
+                                break
+                    # compute lengths and update max_len if needed
+                    for rec in probe_examples:
+                        try:
+                            ids = tok.encode(rec['text'], add_special_tokens=False)
+                            L = len(ids) if isinstance(ids, list) else int(getattr(ids, 'shape', [0])[0])
+                            if int(L) + 32 > int(max_len_so_far):
+                                max_len_so_far = int(L) + 32
+                                cfg['max_len'] = int(max_len_so_far)
+                                print(f"[PROBE] New max_len updated to {int(max_len_so_far)}")
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
     # Manifest: config hashes and service parity digest
     svc = load_service_config()
@@ -1817,6 +1862,7 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
         "sample_every": sample_every,
         "budget_cap": budget_cap,
         "lambdas": {
+            # Internal keys
             "answer_ce": weights["answer_ce"],
             "gate_reg": weights["gate_reg"],
             "plan_ce": weights["plan_ce"],
@@ -1824,6 +1870,11 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
             "conf_cal": weights["conf_cal"],
             "rewrite": weights["rewrite_consistency"],
             "style_inv": weights["style_inv"],
+            # External aliases to match config field names used in tests
+            "plan": weights["plan_ce"],
+            "budget": weights["budget_reg"],
+            "conf": weights["conf_cal"],
+            "gate": weights["gate_reg"],
         },
         "parity": {
             "stop_sequences": list(svc.get("stop_sequences") or []),

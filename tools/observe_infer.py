@@ -142,6 +142,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--models-root", default="model")
     ap.add_argument("--base", default="Base")
+    # Compatibility: allow a single --model path pointing at the base directory
+    ap.add_argument("--model", default=None, help="Path to base model directory (alias for --models-root/--base)")
     ap.add_argument("--adapter", default="Tina")
     ap.add_argument("--subfolder", default="checkpoint-2000")
     ap.add_argument("--calibration", default="", help="Optional calibration JSON path")
@@ -161,8 +163,13 @@ def main():
               "mps"  if (args.device=="auto" and getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available()) else
               args.device if args.device!="auto" else "cpu")
 
-    models_root = Path(args.models_root)
-    base_path = models_root / args.base
+    # Resolve base path from either --model or models-root/base
+    if args.model:
+        base_path = Path(args.model)
+        models_root = base_path.parent
+    else:
+        models_root = Path(args.models_root)
+        base_path = models_root / args.base
     adapter_path = models_root / args.adapter / args.subfolder
     tok = AutoTokenizer.from_pretrained(str(base_path), use_fast=True, trust_remote_code=True, local_files_only=True)
     if getattr(tok, "pad_token", None) is None and getattr(tok, "eos_token", None) is not None:

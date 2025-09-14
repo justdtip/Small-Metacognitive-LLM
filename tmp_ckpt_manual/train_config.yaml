@@ -1,0 +1,9 @@
+{
+  "model": {"base": "/workspace/tmp_ckpt_manual/model/Base"},
+  "data": {"jsonl": "/workspace/tmp_ckpt_manual/data.jsonl"},
+  "save_interval": 2,
+  "save_dir": "/workspace/tmp_ckpt_manual/ckpts",
+  "sample_every": 0,
+  "budget_cap": 8,
+  "lambdas": {"plan": 0.0, "budget": 0.0, "conf": 0.0, "gate": 0.0, "rewrite": 0.0}
+}

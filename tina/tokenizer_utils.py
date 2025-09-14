@@ -7,32 +7,40 @@ except Exception:  # pragma: no cover
 
 REASONING_TOKENS = ["<think>", "</think>", "<answer>", "</answer>"]
 DECOMP_TOKENS = ["<plan>", "</plan>", "<exec>", "</exec>", "<eval>", "</eval>"]
-STOP_SEQUENCES = ["</answer>"]
+# Core closing tags used as stop sequences by default; service config may add more
+STOP_SEQUENCES = ["</think>", "</answer>"]
 # Register both reasoning and decomposition tags as atomic
 SPECIAL_TOKENS = REASONING_TOKENS + DECOMP_TOKENS
 
-def ensure_reasoning_tokens(tokenizer, model=None) -> Dict[str, int]:
+def ensure_reasoning_tokens(tokenizer, model=None, extra: Iterable[str] | None = None) -> Dict[str, int]:
     """
     Ensure reasoning tags are present as atomic (non-splitting) tokens.
     - Registers as additional_special_tokens to guarantee single-token encoding.
     - Resizes model embeddings if a model is provided.
     - Asserts round-trip atomicy: encode(tag, add_special_tokens=False) has length==1 for each tag.
     """
+    # Build full token list to register as atomic
+    tokens_to_add: List[str] = list(SPECIAL_TOKENS)
+    if extra:
+        for t in extra:
+            if t not in tokens_to_add:
+                tokens_to_add.append(str(t))
+
     # Add as additional special tokens (idempotent: tokenizer merges duplicates)
     try:
-        tokenizer.add_special_tokens({"additional_special_tokens": SPECIAL_TOKENS})
+        tokenizer.add_special_tokens({"additional_special_tokens": tokens_to_add})
     except Exception:
         # Fallback: older tokenizers
-        tokenizer.add_tokens(SPECIAL_TOKENS, special_tokens=True)
+        tokenizer.add_tokens(tokens_to_add, special_tokens=True)
 
     # Also guard against splitting during decoding/tokenization
     if hasattr(tokenizer, "unique_no_split_tokens"):
-        for t in SPECIAL_TOKENS:
+        for t in tokens_to_add:
             if t not in tokenizer.unique_no_split_tokens:
                 tokenizer.unique_no_split_tokens.append(t)
 
     # Resolve IDs
-    ids = {t: tokenizer.convert_tokens_to_ids(t) for t in SPECIAL_TOKENS}
+    ids = {t: tokenizer.convert_tokens_to_ids(t) for t in tokens_to_add}
     # Log and assert IDs for telemetry & CI guardrails
     if any(v is None for v in ids.values()):
         raise ValueError(f"Special tag ID resolution failed: {ids}")
@@ -41,7 +49,7 @@ def ensure_reasoning_tokens(tokenizer, model=None) -> Dict[str, int]:
     # Round-trip atomicity check (only if tokenizer supports encoding calls)
     has_encode = hasattr(tokenizer, "encode") or callable(getattr(tokenizer, "__call__", None))
     if has_encode:
-        for t in SPECIAL_TOKENS:
+        for t in tokens_to_add:
             try:
                 tok_ids = tokenizer.encode(t, add_special_tokens=False)
             except Exception:
@@ -54,7 +62,7 @@ def ensure_reasoning_tokens(tokenizer, model=None) -> Dict[str, int]:
 
     # Additional guardrail using tokenizer.tokenize() if available
     if hasattr(tokenizer, "tokenize") and callable(getattr(tokenizer, "tokenize")):
-        for t in SPECIAL_TOKENS:
+        for t in tokens_to_add:
             try:
                 pieces = tokenizer.tokenize(t)
                 if isinstance(pieces, (list, tuple)) and len(pieces) != 1:
@@ -84,7 +92,7 @@ def ensure_reasoning_tokens(tokenizer, model=None) -> Dict[str, int]:
         if seeds and torch is not None:
             with torch.no_grad():
                 avg = old[seeds].mean(dim=0)
-                for t in SPECIAL_TOKENS:
+                for t in tokens_to_add:
                     tid = ids[t]
                     if tid is not None and tid < emb.shape[0]:
                         emb[tid].copy_(avg)

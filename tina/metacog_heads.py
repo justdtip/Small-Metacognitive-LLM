@@ -319,17 +319,20 @@ class MetacogHeads(nn.Module):
                 pass
             if return_state:
                 out["state"] = g
-            if bool(getattr(self.cfg, "dump_per_layer", False)):
-                # Provide compact per-layer diagnostics
-                diag: Dict[str, torch.Tensor] = {
-                    "z": z_pl,
-                    "plan_logits_pl": pl.get("plan_logits_pl"),
-                    "budget_raw_pl": pl.get("budget_raw_pl"),
-                    "conf_raw_pl": pl.get("conf_raw_pl"),
-                }
-                if alpha is not None:
-                    diag["alpha"] = alpha
-                out["per_layer"] = diag
+            # Always provide per-layer diagnostics dict; when dump_per_layer is False, include minimal fields
+            diag: Dict[str, torch.Tensor | None] = {
+                # Per-layer projected embeddings
+                "z": z_pl,
+                # Aggregated vector from attention/mean
+                "agg": g,
+                # Per-layer logits (may be None when not requested)
+                "plan_logits_pl": pl.get("plan_logits_pl") if bool(getattr(self.cfg, "dump_per_layer", False)) else None,
+                "budget_raw_pl": pl.get("budget_raw_pl") if bool(getattr(self.cfg, "dump_per_layer", False)) else None,
+                "conf_raw_pl": pl.get("conf_raw_pl") if bool(getattr(self.cfg, "dump_per_layer", False)) else None,
+            }
+            if alpha is not None:
+                diag["alpha"] = alpha
+            out["per_layer"] = diag
             return out
 
         # Legacy (three-tap) path: average selected taps then project to D
@@ -379,4 +382,16 @@ class MetacogHeads(nn.Module):
             pass
         if return_state:
             out["state"] = z
+        # Always include a minimal per_layer dict for legacy path as well
+        try:
+            out["per_layer"] = {
+                "z": None,
+                "agg": z,
+                "plan_logits_pl": None,
+                "budget_raw_pl": None,
+                "conf_raw_pl": None,
+                "alpha": None,
+            }
+        except Exception:
+            pass
         return out

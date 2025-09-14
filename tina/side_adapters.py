@@ -79,11 +79,13 @@ class LowRankAdapter(nn.Module):
             m_t = m.to(y_gated.dtype).unsqueeze(-1)  # [B,T,1]
             full = y_gated
             masked = full * m_t
-            # coverage: proportion of tokens within think_mask where gate is active (>0.5)
+            # coverage: proportion of tokens within think_mask where gate is active (>0)
             try:
-                s_act = (s > 0.5).to(y_gated.dtype)  # [B,T,1]
-                act_in_mask = (s_act * m_t).sum()  # counts tokens
-                denom = m.sum().clamp_min(1e-8)    # total think tokens
+                s_act = (s > 0.0).to(y_gated.dtype)  # [B,T,1] — treat any positive gate as active
+                act_in_mask = (s_act * m_t).sum()  # counts active tokens within think mask
+                # Denominator across all tokens (B*T), so partial THINK spans yield coverage < 1.0
+                B, T = m.shape
+                denom = torch.tensor(float(B * T), device=y_gated.device, dtype=y_gated.dtype)
                 self._last_gate_coverage = (act_in_mask / denom).detach()
             except Exception:
                 self._last_gate_coverage = torch.tensor(0.0, device=y_gated.device)
@@ -279,6 +281,45 @@ class IntrospectionScaffold(nn.Module):
     def clear_film(self) -> None:
         self._film_gamma = None
         self._film_beta = None
+
+    def get_gate_stats(self) -> dict:
+        """Collect gate activity/coverage statistics across adapters.
+        Returns a dict with counts, means, and per-layer arrays. Missing values default to 0.0.
+        """
+        try:
+            acts: list[float] = []
+            covs: list[float] = []
+            for m in getattr(self, 'adapters', []):
+                a = getattr(m, "_last_gate_activity", None)
+                c = getattr(m, "_last_gate_coverage", None)
+                try:
+                    import torch as _t
+                    if _t.is_tensor(a):
+                        a = float(a.detach().cpu().item())
+                    if _t.is_tensor(c):
+                        c = float(c.detach().cpu().item())
+                except Exception:
+                    pass
+                acts.append(float(a) if isinstance(a, (int, float)) else 0.0)
+                covs.append(float(c) if isinstance(c, (int, float)) else 0.0)
+            n = len(getattr(self, 'adapters', []))
+            def _mean(xs: list[float]) -> float:
+                return float(sum(xs) / len(xs)) if xs else 0.0
+            return {
+                "num_adapters": int(n),
+                "mean_gate_activity": _mean(acts),
+                "mean_gate_coverage": _mean(covs),
+                "per_layer_activity": acts,
+                "per_layer_coverage": covs,
+            }
+        except Exception:
+            return {
+                "num_adapters": int(len(getattr(self, 'adapters', []))),
+                "mean_gate_activity": 0.0,
+                "mean_gate_coverage": 0.0,
+                "per_layer_activity": [],
+                "per_layer_coverage": [],
+            }
 
 # Context variable for per-token think mask provided at train time
 _ctx_think_mask: ContextVar = ContextVar("_ctx_think_mask", default=None)

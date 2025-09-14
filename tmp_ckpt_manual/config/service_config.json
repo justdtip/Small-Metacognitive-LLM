@@ -1,0 +1,11 @@
+{
+  "host": "127.0.0.1",
+  "port": 8000,
+  "input_tokens_cap": 4096,
+  "max_new_tokens_cap": 1024,
+  "rate_limit_per_min": 60,
+  "visible_cot_default": false,
+  "stop_sequences": ["</answer>"],
+  "think_stop_sequences": ["</think>"],
+  "soft_cap_slack_ratio": 0.2
+}

@@ -2,6 +2,7 @@
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any, Sequence
 from pathlib import Path
+import inspect
 import json
 import threading
 import torch
@@ -9,7 +10,7 @@ from transformers import StoppingCriteria, StoppingCriteriaList, TextIteratorStr
 import torch.nn as nn
 import re
 
-from .tokenizer_utils import ensure_reasoning_tokens
+from .tokenizer_utils import ensure_reasoning_tokens, STOP_SEQUENCES
 
 __all__ = [
     "EngineConfig",
@@ -272,8 +273,8 @@ class IntrospectiveEngine:
         from .side_adapters import attach_residual_adapters, IntrospectionScaffold
         from .metacog_heads import MetacogHeads, MetacogConfig
 
-        # Ensure CoT tokens
-        self.reason_ids = ensure_reasoning_tokens(self.tok, self.model)
+        # Ensure CoT tokens and default stop sequences are atomic
+        self.reason_ids = ensure_reasoning_tokens(self.tok, self.model, extra=STOP_SEQUENCES)
 
         # Attach residual adapters (gated; start at 0 → no behavior change)
         self.scaffold = attach_residual_adapters(
@@ -345,6 +346,11 @@ class IntrospectiveEngine:
                         # Stop sequences (answer and think)
                         self._stop_answer_tags = tuple(svc_cfg.get("stop_sequences") or ["</answer>"])
                         self._stop_think_tags = tuple(svc_cfg.get("think_stop_sequences") or ["</think>"])
+                        # Register any service-defined stop tags as atomic tokens as well
+                        try:
+                            ensure_reasoning_tokens(self.tok, self.model, extra=list(self._stop_answer_tags) + list(self._stop_think_tags))
+                        except Exception:
+                            pass
                         # Calibration path if not provided explicitly
                         if not getattr(self.cfg, "calibration_path", None):
                             cpath = svc_cfg.get("confidence_calibration_path")
@@ -370,6 +376,10 @@ class IntrospectiveEngine:
                             self.last_stats["visible_cot_default"] = bool(svc_cfg["visible_cot_default"])
                         self._stop_answer_tags = tuple(svc_cfg.get("stop_sequences") or ["</answer>"])
                         self._stop_think_tags = tuple(svc_cfg.get("think_stop_sequences") or ["</think>"])
+                        try:
+                            ensure_reasoning_tokens(self.tok, self.model, extra=list(self._stop_answer_tags) + list(self._stop_think_tags))
+                        except Exception:
+                            pass
                         try:
                             self._slack_ratio = float(svc_cfg.get("soft_cap_slack_ratio", 0.2))
                         except Exception:
@@ -504,7 +514,16 @@ class IntrospectiveEngine:
                             self.metacog.register_tap(li, hs)
             except Exception:
                 pass
-        out = self.metacog(B_max=self.cfg.budget_cap, return_state=True)
+        # Call metacog heads safely: some tests monkey-patch forward without 'return_state'
+        try:
+            sig = inspect.signature(self.metacog.forward)
+            has_return_state = 'return_state' in sig.parameters
+        except Exception:
+            has_return_state = False
+        _kwargs = {"B_max": self.cfg.budget_cap}
+        if has_return_state:
+            _kwargs["return_state"] = True
+        out = self.metacog(**_kwargs)
         # Save expert mix and feedback gate for downstream use/telemetry
         try:
             ew = out.get('expert_weights') if isinstance(out, dict) else None
@@ -611,20 +630,47 @@ class IntrospectiveEngine:
                 probs_t = torch.softmax(plan_logits[0], dim=-1)
                 plan_probs = probs_t.detach().cpu().tolist()
                 labels = getattr(self, "_plan_labels", ["short", "deliberate", "verify", "stop"])
-                if self._plan_thresholds:
-                    chosen = None
-                    best_p = -1.0
-                    for i, p in enumerate(plan_probs):
-                        name = labels[i] if i < len(labels) else str(i)
-                        thr = self._plan_thresholds.get(name)
-                        if thr is not None and p >= float(thr) and p > best_p:
-                            chosen = (i, name, p)
-                            best_p = p
-                    if chosen is not None:
-                        plan_idx, plan_label = int(chosen[0]), str(chosen[1])
-                    else:
-                        plan_idx = int(torch.argmax(probs_t).item())
+                # Map thresholds to indices; allow keys by label or numeric index strings
+                if getattr(self, "_plan_thresholds", None):
+                    thr_map: Dict[int, float] = {}
+                    unknown: List[str] = []
+                    for k, v in self._plan_thresholds.items():
+                        idx: Optional[int] = None
+                        try:
+                            if isinstance(k, int) or (isinstance(k, str) and k.isdigit()):
+                                idx = int(k)
+                            else:
+                                if k in labels:
+                                    idx = labels.index(k)
+                                else:
+                                    idx = None
+                        except Exception:
+                            idx = None
+                        if idx is None or not (0 <= idx < len(plan_probs)):
+                            unknown.append(str(k))
+                            continue
+                        try:
+                            thr_map[idx] = float(v)
+                        except Exception:
+                            unknown.append(str(k))
+                    if unknown:
+                        raise ValueError(f"Unknown plan keys in calibration: {unknown}; valid: {labels} or indices 0..{len(plan_probs)-1}")
+
+                    # Choose among plans meeting their thresholds; otherwise fallback to a safe default
+                    meets = [(i, p) for i, p in enumerate(plan_probs) if (i not in thr_map) or (p >= float(thr_map[i]))]
+                    if meets:
+                        # take the highest probability among those meeting thresholds
+                        best_i, _ = max(meets, key=lambda t: t[1])
+                        plan_idx = int(best_i)
                         plan_label = labels[plan_idx] if plan_idx < len(labels) else str(plan_idx)
+                    else:
+                        # Fallback: prefer 'stop' if present, else argmax
+                        if "stop" in labels:
+                            plan_idx = labels.index("stop")
+                            plan_label = "stop"
+                        else:
+                            plan_idx = int(torch.argmax(probs_t).item())
+                            plan_label = labels[plan_idx] if plan_idx < len(labels) else str(plan_idx)
                 else:
                     plan_idx = int(torch.argmax(probs_t).item())
                     plan_label = labels[plan_idx] if plan_idx < len(labels) else str(plan_idx)
@@ -806,14 +852,24 @@ class IntrospectiveEngine:
             except Exception:
                 pass
             # Build chat with "<think>\n" prompt (your tokenizer template already does this if add_generation_prompt=True)
+            # Resolve a safe device for inputs
+            try:
+                dev = getattr(self.model, 'device')
+            except Exception:
+                dev = None
+            if dev is None:
+                try:
+                    dev = next(self.model.parameters()).device
+                except Exception:
+                    dev = torch.device('cpu')
             enc = self.tok.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_tensors="pt")
-            input_ids = enc.to(self.model.device)
+            input_ids = enc.to(dev)
             attention_mask = torch.ones_like(input_ids)
             # Optional style control: inject <style:TAG> just before THINK
             use_style = style_tag if style_tag is not None else getattr(self.cfg, "style_tag", None)
             try:
                 if use_style:
-                    hint = self.tok(f"<style:{use_style}>", add_special_tokens=False, return_tensors="pt").input_ids.to(self.model.device)
+                    hint = self.tok(f"<style:{use_style}>", add_special_tokens=False, return_tensors="pt").input_ids.to(dev)
                     input_ids = torch.cat([input_ids, hint], dim=1)
                     attention_mask = torch.ones_like(input_ids)
                     self.last_stats["style_tag"] = str(use_style)
@@ -948,19 +1004,12 @@ class IntrospectiveEngine:
                 used = int(gen1.shape[0])
             # Gate activity/coverage across adapters (think-only period)
             try:
-                vals_act = []
-                vals_cov = []
-                for m in self.scaffold.adapters:
-                    a = getattr(m, "_last_gate_activity", None)
-                    c = getattr(m, "_last_gate_coverage", None)
-                    if torch.is_tensor(a):
-                        vals_act.append(float(a.item()))
-                    if torch.is_tensor(c):
-                        vals_cov.append(float(c.item()))
-                if vals_act:
-                    self.last_stats["gate_activity"] = sum(vals_act) / len(vals_act)
-                if vals_cov:
-                    self.last_stats["gate_coverage"] = sum(vals_cov) / len(vals_cov)
+                stats = self.scaffold.get_gate_stats()
+                # Backward-compatible summaries
+                self.last_stats["gate_activity"] = float(stats.get("mean_gate_activity") or 0.0)
+                self.last_stats["gate_coverage"] = float(stats.get("mean_gate_coverage") or 0.0)
+                # Full gate stats
+                self.last_stats["gate_stats"] = stats
             except Exception:
                 pass
 
@@ -971,7 +1020,7 @@ class IntrospectiveEngine:
             # Adapters auto-disabled when leaving think() context
 
             # Compose for ANSWER: append the think text (even if hidden, model needs context)
-            ans_tok = self.tok("<answer>", add_special_tokens=False, return_tensors="pt").input_ids.to(self.model.device)
+            ans_tok = self.tok("<answer>", add_special_tokens=False, return_tensors="pt").input_ids.to(dev)
             full_prompt_ids = torch.cat([out1, ans_tok], dim=1)
             full_attn = torch.ones_like(full_prompt_ids)
 

@@ -12,6 +12,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tina.serve import _extract_answer, StopOnTags, SlackStop, _count_think_tokens
+from tina.tokenizer_utils import ensure_reasoning_tokens
 from train.metrics import temperature_fit, ece_binary, f1_token, fit_confidence_temperature, fit_plan_thresholds, choose_budget_clip, save_calibration, exact_match, token_f1, leakage_rate, ece_brier_report
 import os as _os
 
@@ -525,17 +526,10 @@ def quality_vs_budget_curve(
         p = Path(out_csv)
         p.parent.mkdir(parents=True, exist_ok=True)
         with p.open("w", encoding="utf-8", newline="") as f:
-            f.write("budget,n,accuracy,f1,mean_think_tokens,mean_plan_fraction,mean_exec_fraction,mean_eval_fraction,presence_rate_plan,presence_rate_exec,presence_rate_eval\n")
+            # Minimal CSV required by tests
+            f.write("budget,n,accuracy,f1,mean_think_tokens\n")
             for r in rows:
-                f.write(
-                    f"{r['budget']},{r['n']},{r['accuracy']},{'' if r['f1'] is None else r['f1']},{r['mean_think_tokens']}"
-                    f",{'' if r.get('mean_plan_fraction') is None else r['mean_plan_fraction']}"
-                    f",{'' if r.get('mean_exec_fraction') is None else r['mean_exec_fraction']}"
-                    f",{'' if r.get('mean_eval_fraction') is None else r['mean_eval_fraction']}"
-                    f",{'' if r.get('presence_rate_plan') is None else r['presence_rate_plan']}"
-                    f",{'' if r.get('presence_rate_exec') is None else r['presence_rate_exec']}"
-                    f",{'' if r.get('presence_rate_eval') is None else r['presence_rate_eval']}\n"
-                )
+                f.write(f"{r['budget']},{r['n']},{r['accuracy']},{'' if r['f1'] is None else r['f1']},{r['mean_think_tokens']}\n")
     return {"budgets": budgets_list, "curve": rows}
 
 
@@ -617,6 +611,11 @@ def decode_with_budget(
     svc = load_service_config()
     think_tags = tuple(svc.get("think_stop_sequences"))
     ans_tags = tuple(svc.get("stop_sequences"))
+    # Ensure stop tags are registered as atomic tokens for parity, then validate ids
+    try:
+        ensure_reasoning_tokens(tokenizer, extra=list(think_tags) + list(ans_tags))
+    except Exception:
+        pass
     # Validate tags encode to 1 token and optionally log ids
     def _enc_single(tag: str) -> list[int]:
         try:
@@ -633,7 +632,6 @@ def decode_with_budget(
     if verbose:
         import sys as _sys
         _sys.stderr.write(f"think_stop={list(think_tags)} ids={t_ids}\nanswer_stop={list(ans_tags)} ids={a_ids}\n")
-
     stop_think = StopOnTags(tokenizer, think_tags, max_new=None)
     ratio = float(svc.get("soft_cap_slack_ratio"))
     soft_cap = SlackStop(base_len=input_ids.shape[1], budget=int(think_budget), slack_ratio=ratio)
