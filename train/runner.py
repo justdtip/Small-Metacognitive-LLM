@@ -201,11 +201,11 @@ class Trainer:
         # Validate base/adapters exist before attempting to load
         base_path = _Path(base).expanduser().resolve()
         if (not base_path.exists()) or (not base_path.is_dir()):
-            raise FileNotFoundError(f"Base model directory is missing: {str(base_path)}")
+            raise FileNotFoundError(f"Base model directory not found: {str(base_path)}")
         if adapter_path:
             ap = _Path(adapter_path).expanduser().resolve()
             if (not ap.exists()) or (not ap.is_dir()):
-                raise FileNotFoundError(f"Adapter directory is missing: {str(ap)}")
+                raise FileNotFoundError(f"Adapter directory not found: {str(ap)}")
         self.tok = AutoTokenizer.from_pretrained(str(base_path), use_fast=True, trust_remote_code=True, local_files_only=True)
         if getattr(self.tok, "pad_token", None) is None and getattr(self.tok, "eos_token", None) is not None:
             self.tok.pad_token = self.tok.eos_token
@@ -326,11 +326,22 @@ class Trainer:
             groups.append({"params": [p for p in lm_params if p.requires_grad], "lr": lm_lr, "weight_decay": wd})
         # filter empty groups to avoid optimizer errors
         groups = [g for g in groups if g["params"]]
-        return torch.optim.AdamW(groups)
+        opt = torch.optim.AdamW(groups)
+        # Summarize trainable params after flags/adapters are applied (for dashboards/tests)
+        try:
+            psum = summarize_trainable_params(self.model)
+            self._param_summary = psum  # type: ignore[attr-defined]
+            print(json.dumps({"trainable_params": int(psum.get("total", 0)), "by_group": psum.get("by_group", {})}))
+        except Exception:
+            pass
+        return opt
 
     def _set_train_flags(self, phase: Dict[str, Any]):
-        # Freeze/unfreeze base
-        freeze = bool(phase.get("freeze_base", False))
+        # Freeze/unfreeze base respecting lm_adaptation.enabled
+        adapt_cfg = (self.cfg.get("lm_adaptation") or {})
+        adapt_enabled = bool(adapt_cfg.get("enabled", False))
+        # If adaptation is disabled, freeze base regardless of phase
+        freeze = bool(phase.get("freeze_base", False) or (not adapt_enabled))
         for p in self.model.parameters():
             p.requires_grad = not freeze
         # Always keep adapters/heads trainable per phase flags
@@ -343,8 +354,7 @@ class Trainer:
                 p.requires_grad = True
         # Re-enable tiny LM adaptation params even if base is frozen
         try:
-            adapt_cfg = (self.cfg.get("lm_adaptation") or {})
-            if bool(adapt_cfg.get("enabled", False)):
+            if adapt_enabled:
                 mode = str(adapt_cfg.get("mode", "ln_only") or "ln_only").lower()
                 last_k = int(adapt_cfg.get("last_k_layers", 2) or 2)
                 apply_all = bool(adapt_cfg.get("apply_to_all_layers", False))
@@ -366,12 +376,15 @@ class Trainer:
                                 if isinstance(mod, _nn.LayerNorm) or ('norm' in name.lower()):
                                     for p in mod.parameters(recurse=True):
                                         p.requires_grad = True
-                    else:
+                    elif mode == 'lora':
                         for n, p in self.model.named_parameters():
                             if 'lora_' in n:
                                 use = any(f"layers.{j}." in n for j in target_idx)
                                 if use:
                                     p.requires_grad = True
+                    else:
+                        # Unknown/none mode: keep base frozen unless explicitly requested elsewhere
+                        pass
         except Exception:
             pass
 
@@ -556,10 +569,35 @@ class Trainer:
                         cap = int(budget_pred.detach().float().mean().clamp(1, sched_cap).item())
                     else:
                         cap = int(sched_cap)
-                    out_dec = decode_with_budget(self.tok, self.model, input_ids,
-                                                 think_budget=int(cap), max_new_tokens=32,
-                                                 temperature=0.2, top_p=0.95, visible_cot=False)
-                    used = int(out_dec.get("think_tokens_used") or 0)
+                    # Set engine cap and decode via engine for full on-policy logging
+                    try:
+                        self.engine.cfg.budget_cap = int(cap)
+                    except Exception:
+                        pass
+                    # Derive a prompt from the training example (prefix before <think>)
+                    try:
+                        raw = str((examples_base[0] or {}).get('text') if isinstance(examples_base[0], dict) else '') if 'examples_base' in locals() and examples_base else ''
+                        i = raw.find('<think>')
+                        prompt = raw[:i].strip() if i != -1 else raw.strip()
+                        if not prompt:
+                            prompt = 'Continue.'
+                        _ = self.engine.generate_cot([{"role": "user", "content": prompt}], max_new_tokens=32, temperature=0.2, top_p=0.95, repetition_penalty=1.1, ignore_eos=False, stream=False, style_tag=None)
+                        last = (getattr(self.engine, "_onpolicy_logs", []) or [])[-1] if getattr(self.engine, "_onpolicy_logs", None) else None
+                        used = int((last or {}).get('think_tokens_used') or 0)
+                        # Enrich on-policy log with flattened gate coverage stats when available
+                        try:
+                            if isinstance(last, dict):
+                                gs = last.get('gate_stats') or {}
+                                if isinstance(gs, dict):
+                                    mgc = gs.get('mean_gate_coverage')
+                                    if mgc is not None:
+                                        last['gate_coverage'] = float(mgc)
+                                        last['gate_coverage_mean'] = float(mgc)
+                        except Exception:
+                            pass
+                        print(json.dumps({"onpolicy": last}))
+                    except Exception:
+                        used = 0
                     import torch as _t
                     B = int(input_ids.shape[0])
                     batch["think_tokens_used"] = _t.tensor([used for _ in range(B)], dtype=_t.long, device=self.device)
@@ -724,20 +762,18 @@ class Trainer:
                 # Periodic checkpoint saving aligned to save_interval/save_dir
                 if save_interval > 0 and (step % save_interval == 0):
                     try:
-                        # Create a directory per checkpoint: <save_dir>/checkpoint-<step>
+                        # Ensure directory exists; write a single .pt file per checkpoint
                         save_dir.mkdir(parents=True, exist_ok=True)
-                        ckpt_dir = save_dir / f"checkpoint-{int(step)}"
-                        ckpt_dir.mkdir(parents=True, exist_ok=True)
-                        # Persist real training state to enable resume
+                        ckpt_path = save_dir / f"checkpoint-{int(step)}.pt"
                         state = {
                             'model': self.model.state_dict(),
                             'optimizer': opt.state_dict(),
                             'step': int(step),
                         }
-                        torch.save(state, ckpt_dir / "state.pt")
-                        # Log path of the checkpoint directory for CI tooling
-                        print(json.dumps({"checkpoint": {"path": str(ckpt_dir)}}))
-                        _debug("ckpt_saved", path=str(ckpt_dir))
+                        torch.save(state, ckpt_path)
+                        # Log path of the checkpoint file for CI/tooling
+                        print(json.dumps({"checkpoint": {"path": str(ckpt_path)}}))
+                        _debug("ckpt_saved", path=str(ckpt_path))
                     except Exception:
                         # Best-effort; do not crash training loop on checkpoint failure
                         pass
@@ -1061,24 +1097,30 @@ def _train_step(model: nn.Module, batch: Dict[str, Any], *, step: int = 0, total
     except Exception:
         pass
 
-    # Adapter gate coverage logging (mean across adapters) if available on model/scaffold
+    # Adapter gate coverage logging via unified scaffold stats when available
     cov = None
     try:
-        adapters = []
-        if hasattr(model, "scaffold") and hasattr(getattr(model, "scaffold"), "adapters"):
-            adapters = list(getattr(model.scaffold, "adapters"))
-        elif hasattr(model, "adapters"):
-            adapters = list(getattr(model, "adapters"))
-        vals = []
-        import torch as _t
-        for m in adapters:
-            v = getattr(m, "_last_gate_coverage", None)
-            if _t.is_tensor(v):
-                vals.append(float(v.item()))
-            elif isinstance(v, (int, float)):
-                vals.append(float(v))
-        if vals:
-            cov = sum(vals) / len(vals)
+        if hasattr(model, 'scaffold') and hasattr(model.scaffold, 'get_gate_stats'):
+            gs = model.scaffold.get_gate_stats()
+            if isinstance(gs, dict) and (gs.get('mean_gate_coverage') is not None):
+                cov = float(gs.get('mean_gate_coverage'))
+        else:
+            # Fallback: average per-adapter last coverage directly
+            adapters = []
+            if hasattr(model, "scaffold") and hasattr(getattr(model, "scaffold"), "adapters"):
+                adapters = list(getattr(model.scaffold, "adapters"))
+            elif hasattr(model, "adapters"):
+                adapters = list(getattr(model, "adapters"))
+            vals = []
+            import torch as _t
+            for m in adapters:
+                v = getattr(m, "_last_gate_coverage", None)
+                if _t.is_tensor(v):
+                    vals.append(float(v.item()))
+                elif isinstance(v, (int, float)):
+                    vals.append(float(v))
+            if vals:
+                cov = sum(vals) / len(vals)
     except Exception:
         cov = None
 
@@ -1290,6 +1332,17 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
     except Exception:
         eval_interval = 100
 
+    # Optional strict path validation: enable via cfg['strict_model_paths'] or env STRICT_MODEL_PATHS=1
+    strict_model_paths = bool(cfg.get('strict_model_paths', False)) or str(os.environ.get('STRICT_MODEL_PATHS', '')).lower() in ("1","true","yes")
+    if strict_model_paths:
+        _bp = _Path(model_base).expanduser().resolve()
+        if (not _bp.exists()) or (not _bp.is_dir()):
+            raise FileNotFoundError(f"Base model directory not found: {str(_bp)}")
+        if adapter_path:
+            _ap = _Path(adapter_path).expanduser().resolve()
+            if (not _ap.exists()) or (not _ap.is_dir()):
+                raise FileNotFoundError(f"Adapter directory not found: {str(_ap)}")
+
     # Trainer mode routing
     tr_cfg = cfg.get("trainer") or {}
     use_dashboard = bool(tr_cfg.get("dashboard", False))
@@ -1358,64 +1411,60 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
         print(json.dumps({"trainer": {"steps": int(steps), **out}}))
         return {"trainer": out}
 
-    # Try to load a real HF model if available; fall back to TinyLM otherwise
+    # Try to load a real HF model if available; fall back to TinyLM otherwise (unless strict_model_paths)
     tok = None
     model = None
     try:
         from transformers import AutoTokenizer, AutoModelForCausalLM  # type: ignore
         base_path = _Path(model_base)
-        if base_path.exists():
-            tok = AutoTokenizer.from_pretrained(str(base_path), use_fast=True, trust_remote_code=True, local_files_only=True)
-            # set PAD if missing
-            if getattr(tok, "pad_token", None) is None and getattr(tok, "eos_token", None) is not None:
-                tok.pad_token = tok.eos_token
+        if (not strict_model_paths) and (not base_path.exists()):
+            raise FileNotFoundError
+        tok = AutoTokenizer.from_pretrained(str(base_path), use_fast=True, trust_remote_code=True, local_files_only=True)
+        if getattr(tok, "pad_token", None) is None and getattr(tok, "eos_token", None) is not None:
+            tok.pad_token = tok.eos_token
+        try:
+            tok.padding_side = "left"
+        except Exception:
+            pass
+        device = (
+            "cuda" if torch.cuda.is_available() else
+            "mps" if getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available() else
+            "cpu"
+        )
+        model = AutoModelForCausalLM.from_pretrained(str(base_path), device_map=None, torch_dtype=torch.float32,
+                                                     trust_remote_code=True, local_files_only=True)
+        model.to(device)
+        if adapter_path:
             try:
-                tok.padding_side = "left"
-            except Exception:
-                pass
-            # Load base on a single device (prefer GPU if available)
-            device = (
-                "cuda" if torch.cuda.is_available() else
-                "mps" if getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available() else
-                "cpu"
-            )
-            model = AutoModelForCausalLM.from_pretrained(str(base_path), device_map=None, torch_dtype=torch.float32,
-                                                         trust_remote_code=True, local_files_only=True)
-            model.to(device)
-            # Attempt to load PEFT adapter if provided
-            if adapter_path:
+                from peft import PeftModel  # type: ignore
+                # Sanitize adapter_config
                 try:
-                    from peft import PeftModel  # type: ignore
-                    # Sanitize adapter_config
-                    try:
-                        from peft.tuners.lora import LoraConfig  # type: ignore
-                        import inspect as _inspect, json as _json
-                        cfg_p = _Path(adapter_path) / "adapter_config.json"
-                        if cfg_p.exists():
-                            d = _json.loads(cfg_p.read_text(encoding="utf-8"))
-                            allowed = set(_inspect.signature(LoraConfig.__init__).parameters.keys()); allowed.discard("self")
-                            allowed |= {"peft_type"}
-                            d2 = {k: v for k, v in d.items() if k in allowed}
-                            if len(d2) != len(d):
-                                cfg_p.write_text(_json.dumps(d2), encoding="utf-8")
-                    except Exception:
-                        pass
-                    model = PeftModel.from_pretrained(model, str(_Path(adapter_path)), is_trainable=True)
-                    # keep model on same device after wrapping
-                    model.to(device)
-                    print(json.dumps({"peft_debug": {"status": "loaded", "adapter_path": str(adapter_path)}}))
-                except Exception as e:
-                    # soft warn and continue with base
-                    print(f"warn: PEFT adapter not loaded ({type(e).__name__}: {e}); continuing with base model")
-                    print(json.dumps({"peft_debug": {"status": "base_only", "reason": f"{type(e).__name__}: {e}", "adapter_path": str(adapter_path)}}))
-            # Ensure reasoning tokens are added and embeddings resized
-            try:
-                ensure_reasoning_tokens(tok, model)
-            except Exception:
-                ensure_reasoning_tokens(tok)
+                    from peft.tuners.lora import LoraConfig  # type: ignore
+                    import inspect as _inspect, json as _json
+                    cfg_p = _Path(adapter_path) / "adapter_config.json"
+                    if cfg_p.exists():
+                        d = _json.loads(cfg_p.read_text(encoding="utf-8"))
+                        allowed = set(_inspect.signature(LoraConfig.__init__).parameters.keys()); allowed.discard("self")
+                        allowed |= {"peft_type"}
+                        d2 = {k: v for k, v in d.items() if k in allowed}
+                        if len(d2) != len(d):
+                            cfg_p.write_text(_json.dumps(d2), encoding="utf-8")
+                except Exception:
+                    pass
+                model = PeftModel.from_pretrained(model, str(_Path(adapter_path)), is_trainable=True)
+                model.to(device)
+                print(json.dumps({"peft_debug": {"status": "loaded", "adapter_path": str(adapter_path)}}))
+            except Exception as e:
+                print(f"warn: PEFT adapter not loaded ({type(e).__name__}: {e}); continuing with base model")
+                print(json.dumps({"peft_debug": {"status": "base_only", "reason": f"{type(e).__name__}: {e}", "adapter_path": str(adapter_path)}}))
+        # Ensure reasoning tokens are added and embeddings resized
+        try:
+            ensure_reasoning_tokens(tok, model)
+        except Exception:
+            ensure_reasoning_tokens(tok)
     except Exception:
-        tok = None; model = None
-    if tok is None or model is None:
+        if strict_model_paths:
+            raise
         # Lightweight fallback for environments without HF weights
         tok = DummyTok()
         ensure_reasoning_tokens(tok)
@@ -1534,7 +1583,11 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
 
     # Report trainable parameters and probe max token length before loop
     try:
-        summarize_trainable_params(model)
+        _psum = summarize_trainable_params(model)
+        try:
+            print(json.dumps({"trainable_params": int(_psum.get("total", 0)), "by_group": _psum.get("by_group", {})}))
+        except Exception:
+            pass
     except Exception:
         pass
     try:
@@ -1554,6 +1607,14 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
 
     # Optimizer for a real parameter update (actual training step)
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-4)
+    try:
+        _psum2 = summarize_trainable_params(model)
+        try:
+            print(json.dumps({"trainable_params_post_opt": int(_psum2.get("total", 0)), "by_group": _psum2.get("by_group", {})}))
+        except Exception:
+            pass
+    except Exception:
+        pass
 
     # Checkpoint configuration
     # Checkpoint configuration: honor cfg['save_interval'] and cfg['save_dir']
@@ -1961,27 +2022,29 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
             except Exception:
                 pass
             if save_interval > 0 and (step % int(save_interval) == 0):
-                ckpt = save_dir / f"checkpoint-{step}"
-                ckpt.mkdir(parents=True, exist_ok=True)
-                # Model
+                save_dir.mkdir(parents=True, exist_ok=True)
+                ckpt_path = save_dir / f"checkpoint-{int(step)}.pt"
+                # Serialize model + optimizer state for resume
                 try:
-                    if hasattr(model, 'save_pretrained'):
-                        model.save_pretrained(str(ckpt))  # type: ignore[attr-defined]
-                    else:
-                        torch.save(getattr(model, 'state_dict')(), str(ckpt / 'pytorch_model.bin'))
+                    state = {
+                        'model': (model.state_dict() if hasattr(model, 'state_dict') else {}),
+                        'optimizer': (opt.state_dict() if hasattr(opt, 'state_dict') else {}),
+                        'step': int(step),
+                    }
+                    torch.save(state, ckpt_path)
                 except Exception:
+                    # As a last resort, write just model state
                     try:
-                        torch.save(getattr(model, 'state_dict')(), str(ckpt / 'pytorch_model.bin'))
+                        torch.save(getattr(model, 'state_dict')(), ckpt_path)
                     except Exception:
                         pass
-                # Tokenizer (optional)
+                # Emit both human-readable and JSON record
+                print(f"[CKPT] saved at step {step} to {ckpt_path}")
                 try:
-                    if tok is not None and hasattr(tok, 'save_pretrained'):
-                        tok.save_pretrained(str(ckpt))  # type: ignore[attr-defined]
+                    print(json.dumps({"checkpoint": {"path": str(ckpt_path)}}))
                 except Exception:
                     pass
-                print(f"[CKPT] saved at step {step} to {ckpt}")
-                _debug("ckpt_saved", path=str(ckpt))
+                _debug("ckpt_saved", path=str(ckpt_path))
         except Exception:
             pass
 

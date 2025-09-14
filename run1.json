@@ -1,6 +1,6 @@
 {
   "model": {
-    "base": "model/Base"
+    "base": "model/Tina"
   },
   "trainer": {
     "mode": "supervised",
@@ -11,12 +11,27 @@
   "save_interval": 1000,
   "eval_interval": 100,
   "sample_every": 0,
-  "budget_cap": 1000,
+  "budget_cap": 16,
   "data": {
     "dataset_name": "glaive",
     "limit_train": 100000,
     "split": "train",
     "streaming": true
+  },
+  "hidden_cot": true,
+  "calibration": {
+    "budget_head_temp": null,
+    "budget_posthoc_clip": null,
+    "plan_thresholds": {}
+  },
+  "service_config": {
+    "stop_sequences": [
+      "</answer>"
+    ],
+    "think_stop_sequences": [
+      "</think>"
+    ],
+    "soft_cap_slack_ratio": 0.2
   },
   "metacog": {
     "num_experts": 3,
@@ -27,6 +42,17 @@
     "var_reg": 0.001,
     "dump_per_layer": true
   },
+  "num_experts": 3,
+  "feedback": true,
+  "linked_all_layers": true,
+  "agg": "attn",
+  "var_reg": 0.001,
+  "dump_per_layer": true,
+  "adapt_mode": "lora",
+  "adapt_last_k_layers": 2,
+  "adapt_layer_indices": [],
+  "adapt_apply_to_all": true,
+  "lm_adaptation_enabled": true,
   "lm_adaptation": {
     "enabled": true,
     "mode": "lora",

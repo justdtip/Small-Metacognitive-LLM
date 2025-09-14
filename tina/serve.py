@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Optional, List, Dict, Any, Sequence
 from pathlib import Path
 import inspect
+import hashlib
 import json
 import threading
 import torch
@@ -269,6 +270,11 @@ class IntrospectiveEngine:
         self._plan_thresholds: Optional[Dict[str, float]] = None
         self._budget_clip: Optional[int] = None
         self._decode_params: Dict[str, Any] = {}
+        # On-policy / budget telemetry
+        self._budget_history: Dict[str, float] = {}
+        self._onpolicy_logs: List[Dict[str, Any]] = []
+        self._last_plan_idx: Optional[int] = None
+        self._last_plan_probs: Optional[List[float]] = None
         # Lazy imports to avoid heavy deps at module import time
         from .side_adapters import attach_residual_adapters, IntrospectionScaffold
         from .metacog_heads import MetacogHeads, MetacogConfig
@@ -629,6 +635,10 @@ class IntrospectiveEngine:
             if plan_logits is not None:
                 probs_t = torch.softmax(plan_logits[0], dim=-1)
                 plan_probs = probs_t.detach().cpu().tolist()
+                try:
+                    self._last_plan_probs = [float(x) for x in plan_probs]
+                except Exception:
+                    self._last_plan_probs = None
                 labels = getattr(self, "_plan_labels", ["short", "deliberate", "verify", "stop"])
                 # Map thresholds to indices; allow keys by label or numeric index strings
                 if getattr(self, "_plan_thresholds", None):
@@ -676,8 +686,18 @@ class IntrospectiveEngine:
                     plan_label = labels[plan_idx] if plan_idx < len(labels) else str(plan_idx)
         except Exception:
             plan_idx, plan_label, conf_val, raw_budget, plan_probs = None, None, None, None, None
-        # pick budget
+        # pick budget (predicted before ratio)
         b = int(raw_budget) if self.cfg.use_dynamic_budget and raw_budget is not None else self.cfg.budget_cap
+        # Per-prompt monotonic clamp
+        try:
+            flat = input_ids.view(-1).detach().cpu().tolist()
+            key = hashlib.sha1((",".join(str(int(x)) for x in flat)).encode("utf-8")).hexdigest()
+            prev = self._budget_history.get(key)
+            if isinstance(prev, (int, float)) and b > int(prev):
+                b = int(prev)
+            self._budget_history[key] = float(b)
+        except Exception:
+            pass
         # Optional calibration-time post-hoc budget clip
         if getattr(self, "_budget_clip", None):
             try:
@@ -701,6 +721,10 @@ class IntrospectiveEngine:
         if plan_probs is not None:
             labels = getattr(self, "_plan_labels", ["short", "deliberate", "verify", "stop"])
             stats["plan_probs"] = {labels[i] if i < len(labels) else str(i): float(plan_probs[i]) for i in range(len(plan_probs))}
+        try:
+            self._last_plan_idx = int(plan_idx) if plan_idx is not None else None
+        except Exception:
+            self._last_plan_idx = None
         if getattr(self, "_budget_clip", None):
             stats["budget_clip"] = int(self._budget_clip)
         self.last_stats.update(stats)
@@ -1002,6 +1026,19 @@ class IntrospectiveEngine:
                 )
             except Exception:
                 used = int(gen1.shape[0])
+            # Record on-policy details
+            try:
+                rec = {
+                    "predicted_budget": int(self.last_stats.get("think_budget") or think_budget),
+                    "think_tokens_used": int(used),
+                    "plan_index": (int(self._last_plan_idx) if self._last_plan_idx is not None else None),
+                    "plan_probs": list(self._last_plan_probs) if isinstance(self._last_plan_probs, list) else None,
+                    "policy": {k: (float(v.detach().item()) if hasattr(v, 'detach') else float(v)) for k, v in (self._decode_params or {}).items() if v is not None},
+                    "gate_stats": (self.scaffold.get_gate_stats() if hasattr(self, 'scaffold') and hasattr(self.scaffold, 'get_gate_stats') else None),
+                }
+                self._onpolicy_logs.append(rec)
+            except Exception:
+                pass
             # Gate activity/coverage across adapters (think-only period)
             try:
                 stats = self.scaffold.get_gate_stats()

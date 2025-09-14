@@ -237,6 +237,19 @@ class RunConfigForm(Static):
             "sample_every": int(self.sample_every),
             "budget_cap": int(self.budget_cap),
             "data": data_cfg,
+            # Hidden CoT by default for parity with CLI runs
+            "hidden_cot": True,
+            # Calibration & service defaults to mirror CLI behaviour
+            "calibration": {
+                "budget_head_temp": None,
+                "budget_posthoc_clip": None,
+                "plan_thresholds": {},
+            },
+            "service_config": {
+                "stop_sequences": ["</answer>"],
+                "think_stop_sequences": ["</think>"],
+                "soft_cap_slack_ratio": 0.2,
+            },
             "metacog": {
                 "num_experts": int(self.num_experts),
                 "feedback": bool(self.feedback),
@@ -246,14 +259,41 @@ class RunConfigForm(Static):
                 "var_reg": float(self.var_reg or 0.0),
                 "dump_per_layer": bool(self.dump_per_layer),
             },
-            "lm_adaptation": {
-                "enabled": bool(self.lm_adapt),
-                "mode": (self.adapt_mode or "ln_only"),
-                "last_k_layers": int(self.adapt_layers),
-                "apply_to_all_layers": bool(self.apply_all_layers),
-                "layer_indices": [int(x) for x in self.adapt_layers_list.split(',') if x.strip().isdigit()],
-            },
         }
+        # Map UI fields to top-level keys Trainer/runner reads directly
+        cfg.update({
+            "num_experts": int(self.num_experts),
+            "feedback": bool(self.feedback),
+            "linked_all_layers": bool(self.link_all),
+            "agg": (self.agg or "attn"),
+            "var_reg": float(self.var_reg or 0.0),
+            "dump_per_layer": bool(self.dump_per_layer),
+            # Adaptation aliases
+            "adapt_mode": (self.adapt_mode or "ln_only"),
+            "adapt_last_k_layers": int(self.adapt_layers),
+            "adapt_layer_indices": [int(x) for x in self.adapt_layers_list.split(',') if x.strip().isdigit()],
+            "adapt_apply_to_all": bool(self.apply_all_layers),
+            "lm_adaptation_enabled": bool(self.lm_adapt),
+        })
+        # Keep nested block for backward compatibility with runner internals
+        cfg["lm_adaptation"] = {
+            "enabled": bool(self.lm_adapt),
+            "mode": (self.adapt_mode or "ln_only"),
+            "last_k_layers": int(self.adapt_layers),
+            "apply_to_all_layers": bool(self.apply_all_layers),
+            "layer_indices": [int(x) for x in self.adapt_layers_list.split(',') if x.strip().isdigit()],
+        }
+        # Defensive normalization of numeric fields
+        try:
+            for k in ("save_interval", "eval_interval", "sample_every", "budget_cap", "num_experts", "adapt_last_k_layers"):
+                if k in cfg:
+                    cfg[k] = int(cfg[k])
+            sc = cfg.get("service_config", {})
+            if isinstance(sc.get("soft_cap_slack_ratio"), str):
+                sc["soft_cap_slack_ratio"] = float(sc["soft_cap_slack_ratio"])  # type: ignore[index]
+            cfg["service_config"] = sc
+        except Exception:
+            pass
         try:
             cfg_path = Path(f"{self.run_name or 'run'}.json")
             cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
@@ -268,12 +308,22 @@ class RunConfigForm(Static):
                 root = _P(__file__).resolve().parents[1]
                 if str(root) not in _sys.path:
                     _sys.path.insert(0, str(root))
+                # Enforce strict model path validation in TUI by default
+                try:
+                    import os as _os
+                    _os.environ.setdefault("STRICT_MODEL_PATHS", "1")
+                except Exception:
+                    pass
                 # Redirect stdout inside this thread
                 old = _sys.stdout
                 try:
                     _sys.stdout = writer  # type: ignore[assignment]
                     from train.runner import run_from_config as _run
-                    _run(path, steps=int(steps))
+                    try:
+                        _run(path, steps=int(steps))
+                    except FileNotFoundError as e:
+                        q.put_nowait(json.dumps({"error": f"{type(e).__name__}: {e}", "trace": []}))
+                        return
                 except Exception as _e:
                     # Capture full stack trace and ship it to the log queue
                     try:
