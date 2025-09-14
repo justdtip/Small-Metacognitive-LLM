@@ -31,7 +31,7 @@ import torch
 import torch.nn as nn
 
 from tina.tokenizer_utils import ensure_reasoning_tokens, segment_and_masks
-from train.data import pad_and_stack
+from train.data import pad_and_stack, make_collate_fn
 from train.losses import compute_losses
 from tina.serve import _extract_answer, StopOnTags, IntrospectiveEngine, EngineConfig
 from train.reward import reward_fn, dry_run_mocked
@@ -48,6 +48,37 @@ try:
 except Exception:  # pragma: no cover
     yaml = None  # type: ignore
 
+
+def _load_jsonl(path: Path) -> list[dict[str, Any]]:
+    """Lightweight JSONL loader used by the Trainer path for local datasets."""
+    out: list[dict[str, Any]] = []
+    try:
+        with Path(path).open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return out
+
+
+def _build_local_dataloader(jsonl_path: Path, tokenizer, batch_size: int = 8):
+    """Minimal iterable that yields exactly one collated batch from a local JSONL file."""
+    examples = _load_jsonl(jsonl_path)
+    for ex in examples:
+        if "text" not in ex:
+            body = ex.get("body") or ""
+            ex["text"] = body if body else "<think> a b </think><answer> ok </answer>"
+    collate = make_collate_fn(tokenizer, loss_on="answer")
+    class _Iter:
+        def __iter__(self):
+            yield collate(examples[: int(batch_size)])
+    return _Iter()
 
 # ---- Utilities: parameter summary and dataset probing -------------------------
 def summarize_trainable_params(model):
@@ -115,11 +146,21 @@ class TinyLM(nn.Module):
         self.rnn = nn.GRU(hidden, hidden, batch_first=True)
         self.lm_head = nn.Linear(hidden, vocab_size)
 
-    def forward(self, input_ids: torch.Tensor):
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        output_hidden_states: bool = False,
+        return_dict: bool = False,
+        **_: Any,
+    ):
         x = self.embed(input_ids)
         y, _ = self.rnn(x)
         logits = self.lm_head(y)
-        return logits
+        hidden_states = [x, y] if output_hidden_states else None
+        if return_dict:
+            from types import SimpleNamespace
+            return SimpleNamespace(logits=logits, hidden_states=hidden_states)
+        return logits if hidden_states is None else (logits, hidden_states)
 
 
 # ---- Trainer integration (optional) ---------------------------------------------
@@ -335,12 +376,15 @@ class Trainer:
             pass
 
     def train(self, steps: int = 100):
+        # Default: enable debug logging and 5-step aggregation unless user overrides
+        try:
+            os.environ.setdefault("TRAIN_DEBUG", "1")
+        except Exception:
+            pass
         # Data stub: single batch from configured data
         data_cfg = self.cfg.get("data") or {}
         path = data_cfg.get("jsonl") or str(self.root / "data/train.jsonl")
-        examples = _load_jsonl(Path(path))
-        collate = make_collate_fn(self.tok, loss_on="answer")
-        batch = next(iter(build_dataloader(Path(path), self.tok, batch_size=int((self.cfg.get("data") or {}).get("batch_size") or 8))))
+        batch = next(iter(_build_local_dataloader(Path(path), self.tok, batch_size=int((self.cfg.get("data") or {}).get("batch_size") or 8))))
 
         opt = self.build_optimizer()
         svc = load_service_config()
@@ -352,10 +396,35 @@ class Trainer:
 
         # Periodic simple evaluation prompts (optional)
         try:
-            eval_prompts = self.cfg.get('eval_prompts', [])
-            eval_interval = int(self.cfg.get('eval_interval', 100) or 100)
+            eval_prompts = list(self.cfg.get('eval_prompts', []) or [])
+            # Default to ~200 steps if not explicitly provided
+            eval_interval = int(self.cfg.get('eval_interval', 200) or 200)
         except Exception:
-            eval_prompts, eval_interval = [], 100
+            eval_prompts, eval_interval = [], 200
+        # If no explicit eval prompts, derive a few from the local data file (prefix before <think>)
+        if not eval_prompts:
+            try:
+                src_path = Path((self.cfg.get('data') or {}).get('jsonl') or path)
+                xs = _load_jsonl(src_path)
+                derived: list[str] = []
+                for ex in xs[:8]:
+                    t = str(ex.get('text') or '')
+                    if not t:
+                        continue
+                    i = t.find('<think>')
+                    prompt = t[:i].strip() if i != -1 else t.strip()
+                    if prompt:
+                        derived.append(prompt)
+                # Fallback: use raw text if no clean prompt found
+                if not derived:
+                    for ex in xs[:4]:
+                        tt = str(ex.get('text') or '')
+                        if tt:
+                            derived.append(tt[:256])
+                # Keep a small, stable set
+                eval_prompts = derived[:4]
+            except Exception:
+                pass
 
         # Optional Rich dashboard (supervised trainer path)
         tr_cfg = self.cfg.get("trainer") or {}
@@ -406,6 +475,24 @@ class Trainer:
             pass
 
         # Training steps loop
+        # Debug helper and aggregation state (defaults: debug on, 5-step window)
+        _debug_on = bool(os.environ.get('TRAIN_DEBUG') or (self.cfg.get('debug', False)))
+        def _debug(tag: str, **kw) -> None:
+            if not _debug_on:
+                return
+            try:
+                rec = {"debug": tag, **{k: (float(v) if isinstance(v, (int, float)) else v) for k, v in kw.items()}}
+                print(json.dumps(rec))
+            except Exception:
+                pass
+        try:
+            agg_every = int(self.cfg.get('log_aggregate_every', 5) or 5)
+        except Exception:
+            agg_every = 5
+        _agg_cnt = 0
+        _agg_sums: Dict[str, float] = {}
+
+        last_losses: Dict[str, Any] = {}
         with dash_ctx as _dash:
             eval_interval = int(((self.cfg.get("trainer") or {}).get("eval_interval") or 100))
             # Checkpoint saving configuration (aligned with project directive)
@@ -424,6 +511,7 @@ class Trainer:
                 with torch.autocast(device_type=self.device, dtype=self.dtype, enabled=(self.dtype != torch.float32)):
                     outputs = self.model(input_ids=input_ids, output_hidden_states=True, return_dict=True)
                     logits = outputs.logits
+                _debug("forward_done", T=int(input_ids.shape[1]))
                 # Heads
                 from tina.metacog_heads import MetacogHeads as _MH, MetacogConfig as _MC
                 hidden_size = int(outputs.hidden_states[-1].shape[-1]) if isinstance(outputs.hidden_states, (list, tuple)) else int(getattr(self.model.config, 'hidden_size', 2048))
@@ -452,6 +540,7 @@ class Trainer:
                             heads.register_tap(int(ti), hs_list[int(ti)])
                 B_max_use = int(((self.cfg.get("schedule") or {}).get("budget_cap") or 16))
                 head_out = heads(B_max=B_max_use)
+                _debug("heads_done", B_max=int(B_max_use))
                 plan_logits = head_out.get("plan_logits")
                 budget_pred = head_out.get("budget")
                 conf_prob = head_out.get("confidence")
@@ -512,6 +601,24 @@ class Trainer:
                     quiet_star_w=float(phase.get("quiet_star_w", 0.0) or 0.0),
                     per_layer=per_layer,
                 )
+                # Stash for return in case we exit before another loss compute
+                last_losses = out_losses
+                # Aggregate windowed losses and emit every N steps
+                try:
+                    for k, v in out_losses.items():
+                        try:
+                            val = float(v.item()) if hasattr(v, 'item') else float(v)
+                        except Exception:
+                            continue
+                        _agg_sums[k] = _agg_sums.get(k, 0.0) + val
+                    _agg_cnt += 1
+                    if agg_every > 0 and (t + 1) % int(agg_every) == 0:
+                        avg = {k: (_agg_sums[k] / float(_agg_cnt)) for k in sorted(_agg_sums.keys())}
+                        print(json.dumps({"agg": {"window": [int(t + 2 - agg_every), int(t + 1)], "losses": avg}}))
+                        _agg_sums.clear(); _agg_cnt = 0
+                except Exception:
+                    pass
+                _debug("losses_done", total=(float(out_losses.get("total").item()) if isinstance(out_losses.get("total"), torch.Tensor) else None))
 
                 # Optional dashboard update
                 try:
@@ -591,6 +698,7 @@ class Trainer:
             if clip_norm and clip_norm > 0:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=float(clip_norm))
             opt.step()
+            _debug("opt_step_done", step=int(step))
 
             # Periodic tiny eval with logic-like prompts and record decoding params + batch metrics
             if eval_interval > 0 and (t % eval_interval == 0):
@@ -629,6 +737,7 @@ class Trainer:
                         torch.save(state, ckpt_dir / "state.pt")
                         # Log path of the checkpoint directory for CI tooling
                         print(json.dumps({"checkpoint": {"path": str(ckpt_dir)}}))
+                        _debug("ckpt_saved", path=str(ckpt_dir))
                     except Exception:
                         # Best-effort; do not crash training loop on checkpoint failure
                         pass
@@ -638,7 +747,11 @@ class Trainer:
             self.cfg = _copy.deepcopy(self._orig_cfg)
         except Exception:
             self.cfg = dict(self._orig_cfg)
-        return {"last_losses": {k: float(v.item()) if torch.is_tensor(v) else float(v) for k, v in out_losses.items()}}
+        try:
+            ll = {k: (float(v.item()) if torch.is_tensor(v) else float(v)) for k, v in (last_losses or {}).items()}
+        except Exception:
+            ll = {}
+        return {"last_losses": ll}
 
 
 class DummyTok:
@@ -1037,7 +1150,17 @@ def rl_phase_step(model: nn.Module, batch: Dict[str, Any], *, policy=None, opt=N
 
     # Prepare policy and optimizer
     from train.rl_loop import GaussianBudgetPolicy, reinforce_step
-    pol = policy or GaussianBudgetPolicy(in_dim=feats.shape[-1], max_budget=int(B_max))
+    # Initialize or reinitialize the GaussianBudgetPolicy to match feature dim
+    if policy is None:
+        pol = GaussianBudgetPolicy(in_dim=int(feats.shape[-1]), max_budget=int(B_max))
+    else:
+        pol = policy
+        try:
+            cur_in = getattr(getattr(pol, "linear", None), "in_features", None)
+            if (cur_in is None) or (int(cur_in) != int(feats.shape[-1])):
+                pol = GaussianBudgetPolicy(in_dim=int(feats.shape[-1]), max_budget=int(B_max))
+        except Exception:
+            pol = GaussianBudgetPolicy(in_dim=int(feats.shape[-1]), max_budget=int(B_max))
     try:
         pol = pol.to(feats.device)
     except Exception:
@@ -1490,6 +1613,23 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
         max_len_so_far = 1024
 
     last_rl_stats: Dict[str, Any] = {}
+    # ---- Aggregated loss logging (every N steps; default 5) ----
+    try:
+        agg_every = int(cfg.get('log_aggregate_every', 5) or 5)
+    except Exception:
+        agg_every = 5
+    _agg_cnt = 0
+    _agg_sums: Dict[str, float] = {}
+
+    # Optional debug logging controlled by env or config
+    _debug_on = bool(os.environ.get('TRAIN_DEBUG') or cfg.get('debug', False))
+    def _debug(tag: str, **kw):
+        if _debug_on:
+            try:
+                rec = {"debug": tag, **{k: (float(v) if isinstance(v, (int,float)) else v) for k,v in kw.items()}}
+                print(json.dumps(rec))
+            except Exception:
+                pass
     with dash_ctx as _dash:
         for t in range(int(steps)):
             step = t + 1
@@ -1596,6 +1736,7 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
                     B, T = input_ids.shape
                     h_list = [torch.zeros(B, T, 16, device=logits.device, dtype=logits.dtype)]
 
+            _debug("forward_done", T=int(input_ids.shape[1]))
             # Metacog heads on pooled taps (respect linked_all_layers / dump_per_layer)
             from tina.metacog_heads import MetacogHeads as _MH, MetacogConfig as _MC
             hidden_size = int(h_list[-1].shape[-1])
@@ -1628,6 +1769,7 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
             except Exception:
                 B_max_use = int(budget_cap)
             head_out = heads(B_max=B_max_use)
+            _debug("heads_done", B_max=B_max_use)
             plan_logits = head_out.get("plan_logits")
             budget_pred = head_out.get("budget")
             conf_prob = head_out.get("confidence")
@@ -1679,6 +1821,22 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
                 answer_mask=batch.get("answer_mask").to(device) if isinstance(batch.get("answer_mask"), torch.Tensor) else None,
                 rewrite_groups=(batch.get("batch_meta") or {}).get("rewrite_groups") if isinstance(batch.get("batch_meta"), dict) else None,
             )
+            # Aggregate losses for windowed logging
+            try:
+                for k, v in out_losses.items():
+                    try:
+                        val = float(v.item()) if hasattr(v, 'item') else float(v)
+                    except Exception:
+                        continue
+                    _agg_sums[k] = _agg_sums.get(k, 0.0) + val
+                _agg_cnt += 1
+                if agg_every > 0 and (t + 1) % int(agg_every) == 0:
+                    avg = {k: (_agg_sums[k] / float(_agg_cnt)) for k in sorted(_agg_sums.keys())}
+                    print(json.dumps({"agg": {"window": [int(t+2-agg_every), int(t+1)], "losses": avg}}))
+                    _agg_sums.clear(); _agg_cnt = 0
+            except Exception:
+                pass
+            _debug("losses_done", total=float(out_losses.get("total", 0.0).item()) if hasattr(out_losses.get("total", None), 'item') else None)
             # Step debug log for budget lambda and per-layer diagnostics
             try:
                 diag = {}
@@ -1721,6 +1879,7 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
                                                       visible_cot=False)
                             ans = res.get('text') or ''
                             print(f"[EVAL step {step}] {prompt} -> {ans}")
+                            _debug("eval_done", prompt=str(prompt)[:40])
                             try:
                                 if _dash is not None:
                                     _dash.update({'eval_output': f'{str(prompt)[:30]} -> {str(ans)[:30]}'})
@@ -1775,81 +1934,83 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
                     })
             except Exception:
                 pass
-            # Backprop and step
-            opt.zero_grad()
-            try:
-                tot = out_losses.get("total")
-                if torch.is_tensor(tot) and bool(getattr(tot, 'requires_grad', False)):
-                    tot.backward()
-                else:
-                        try:
-                            print(json.dumps({"warn": "total loss has no grad; skipping backward", "step": int(step)}))
-                        except Exception:
-                            pass
-            except Exception as _e:
+        # Backprop and step
+        opt.zero_grad()
+        try:
+            tot = out_losses.get("total")
+            if torch.is_tensor(tot) and bool(getattr(tot, 'requires_grad', False)):
+                tot.backward()
+            else:
                     try:
-                        print(json.dumps({"error": f"backward_failed: {type(_e).__name__}: {_e}", "step": int(step)}))
+                        print(json.dumps({"warn": "total loss has no grad; skipping backward", "step": int(step)}))
                     except Exception:
                         pass
-            opt.step()
-
-            # Periodic checkpoint saving
-            try:
-                # Debug trace for checkpoint cadence
+        except Exception as _e:
                 try:
-                    print(json.dumps({"ckpt_debug": {"step": int(step), "save_interval": int(save_interval)}}))
+                    print(json.dumps({"error": f"backward_failed: {type(_e).__name__}: {_e}", "step": int(step)}))
                 except Exception:
                     pass
-                if save_interval > 0 and (step % int(save_interval) == 0):
-                    ckpt = save_dir / f"checkpoint-{step}"
-                    ckpt.mkdir(parents=True, exist_ok=True)
-                    # Model
+        opt.step()
+        _debug("opt_step_done", step=int(step))
+
+        # Periodic checkpoint saving
+        try:
+            # Debug trace for checkpoint cadence
+            try:
+                print(json.dumps({"ckpt_debug": {"step": int(step), "save_interval": int(save_interval)}}))
+            except Exception:
+                pass
+            if save_interval > 0 and (step % int(save_interval) == 0):
+                ckpt = save_dir / f"checkpoint-{step}"
+                ckpt.mkdir(parents=True, exist_ok=True)
+                # Model
+                try:
+                    if hasattr(model, 'save_pretrained'):
+                        model.save_pretrained(str(ckpt))  # type: ignore[attr-defined]
+                    else:
+                        torch.save(getattr(model, 'state_dict')(), str(ckpt / 'pytorch_model.bin'))
+                except Exception:
                     try:
-                        if hasattr(model, 'save_pretrained'):
-                            model.save_pretrained(str(ckpt))  # type: ignore[attr-defined]
-                        else:
-                            torch.save(getattr(model, 'state_dict')(), str(ckpt / 'pytorch_model.bin'))
-                    except Exception:
-                        try:
-                            torch.save(getattr(model, 'state_dict')(), str(ckpt / 'pytorch_model.bin'))
-                        except Exception:
-                            pass
-                    # Tokenizer (optional)
-                    try:
-                        if tok is not None and hasattr(tok, 'save_pretrained'):
-                            tok.save_pretrained(str(ckpt))  # type: ignore[attr-defined]
+                        torch.save(getattr(model, 'state_dict')(), str(ckpt / 'pytorch_model.bin'))
                     except Exception:
                         pass
-                    print(f"[CKPT] saved at step {step} to {ckpt}")
-            except Exception:
-                pass
+                # Tokenizer (optional)
+                try:
+                    if tok is not None and hasattr(tok, 'save_pretrained'):
+                        tok.save_pretrained(str(ckpt))  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                print(f"[CKPT] saved at step {step} to {ckpt}")
+                _debug("ckpt_saved", path=str(ckpt))
+        except Exception:
+            pass
 
-            # Intermittent probe of longest sequence length during streaming
-            try:
-                if probe_interval > 0 and ((t + 1) % int(probe_interval) == 0):
-                    # sample a few upcoming examples from the iterator (cycle-safe)
-                    probe_examples = []
-                    if data_iter is not None:
-                        for _ in range(10):
-                            try:
-                                rec = next(data_iter)
-                                if isinstance(rec, dict) and rec.get('text'):
-                                    probe_examples.append(rec)
-                            except Exception:
-                                break
-                    # compute lengths and update max_len if needed
-                    for rec in probe_examples:
+        # Intermittent probe of longest sequence length during streaming
+        try:
+            if probe_interval > 0 and ((t + 1) % int(probe_interval) == 0):
+                # sample a few upcoming examples from the iterator (cycle-safe)
+                probe_examples = []
+                if data_iter is not None:
+                    for _ in range(10):
                         try:
-                            ids = tok.encode(rec['text'], add_special_tokens=False)
-                            L = len(ids) if isinstance(ids, list) else int(getattr(ids, 'shape', [0])[0])
-                            if int(L) + 32 > int(max_len_so_far):
-                                max_len_so_far = int(L) + 32
-                                cfg['max_len'] = int(max_len_so_far)
-                                print(f"[PROBE] New max_len updated to {int(max_len_so_far)}")
+                            rec = next(data_iter)
+                            if isinstance(rec, dict) and rec.get('text'):
+                                probe_examples.append(rec)
                         except Exception:
-                            pass
-            except Exception:
-                pass
+                            break
+                # compute lengths and update max_len if needed
+                for rec in probe_examples:
+                    try:
+                        ids = tok.encode(rec['text'], add_special_tokens=False)
+                        L = len(ids) if isinstance(ids, list) else int(getattr(ids, 'shape', [0])[0])
+                        if int(L) + 32 > int(max_len_so_far):
+                            max_len_so_far = int(L) + 32
+                            cfg['max_len'] = int(max_len_so_far)
+                            print(f"[PROBE] New max_len updated to {int(max_len_so_far)}")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     # Manifest: config hashes and service parity digest
     svc = load_service_config()

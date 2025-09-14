@@ -24,7 +24,15 @@ def _write_jsonl(tmp_path: Path, n: int, supervised: bool = False) -> Path:
 
 def _run_one_cycle(data_path: Path):
     p = subprocess.run(
-        [sys.executable, str(Path("train/one_cycle.py")), "--data", str(data_path), "--batch-size", "8"],
+        [
+            sys.executable,
+            str(Path("train/one_cycle.py")),
+            "--data",
+            str(data_path),
+            "--batch-size",
+            "8",
+            "--allow-missing-base",
+        ],
         capture_output=True,
         text=True,
     )
@@ -54,4 +62,3 @@ def test_nonzero_aux_losses(tmp_path):
     data = _write_jsonl(tmp_path, n=12, supervised=True)
     rec = _run_one_cycle(data)
     assert (rec.get("loss_plan_ce", 0.0) > 0.0) or (rec.get("loss_budget_reg", 0.0) > 0.0) or (rec.get("loss_conf_cal", 0.0) > 0.0)
-

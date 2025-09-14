@@ -1,6 +1,6 @@
 {
   "model": {
-    "base": "model/Tina"
+    "base": "model/Base"
   },
   "trainer": {
     "mode": "supervised",
@@ -10,6 +10,8 @@
   },
   "save_interval": 1000,
   "eval_interval": 100,
+  "sample_every": 0,
+  "budget_cap": 1000,
   "data": {
     "dataset_name": "glaive",
     "limit_train": 100000,

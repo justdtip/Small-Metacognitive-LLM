@@ -106,22 +106,51 @@ def run_one_cycle(args) -> Dict[str, Any]:
     adapter_path = adapter_root / "checkpoint-2000"
 
     device, dtype = _device_dtype()
-    # Load base on a single device (prefer GPU/MPS); avoid CPU/GPU sharding
-    model = AutoModelForCausalLM.from_pretrained(
-        str(base_path), device_map=None, torch_dtype=dtype,
-        trust_remote_code=True, local_files_only=True,
-    )
-    try:
-        model.to(device)
-    except Exception:
-        # Fallback to CPU if transfer fails for any reason
-        model.to("cpu")
+    # Load tokenizer first so we can size TinyLM fallback if base weights are missing
     tok = AutoTokenizer.from_pretrained(
         str(base_path), use_fast=True, trust_remote_code=True, local_files_only=True,
     )
     if getattr(tok, "pad_token", None) is None and getattr(tok, "eos_token", None) is not None:
         tok.pad_token = tok.eos_token
-    ensure_reasoning_tokens(tok, model)
+    # Register reasoning/stop tags before constructing model
+    ensure_reasoning_tokens(tok)
+    # Validate base weights exist unless fallback explicitly allowed
+    weight_ok = any(
+        (base_path / w).exists() for w in ("pytorch_model.bin", "model.safetensors")
+    )
+    if not weight_ok and not getattr(args, "allow_missing_base", False):
+        raise FileNotFoundError(
+            f"Base model weights not found under {base_path}. "
+            "Pass --allow-missing-base to run with a tiny fallback."
+        )
+    if weight_ok:
+        # Load base on a single device (prefer GPU/MPS); avoid CPU/GPU sharding
+        model = AutoModelForCausalLM.from_pretrained(
+            str(base_path), device_map=None, torch_dtype=dtype,
+            trust_remote_code=True, local_files_only=True,
+        )
+    else:
+        # Fall back to a tiny config-based model for tests or explicit allowance
+        try:
+            from transformers import GPT2Config, GPT2LMHeadModel
+            cfg = GPT2Config(
+                vocab_size=len(tok), n_embd=64, n_layer=2, n_head=2, n_positions=128
+            )
+            model = GPT2LMHeadModel(cfg)
+        except Exception:
+            # Last resort: tiny stub model
+            from train.runner import TinyLM
+            model = TinyLM(vocab_size=len(tok), hidden=64)
+    # Move model to target device
+    try:
+        model.to(device)
+    except Exception:
+        model.to("cpu")
+    # Resize embeddings for reasoning tokens (no-op for TinyLM)
+    try:
+        ensure_reasoning_tokens(tok, model)
+    except Exception:
+        pass
 
     # Load adapter via PEFT; sanitize adapter_config if necessary; fail soft if PEFT missing
     try:
@@ -302,6 +331,13 @@ def run_one_cycle(args) -> Dict[str, Any]:
     plan_targets = batch.get("plan_targets") if (torch.is_tensor(batch.get("plan_targets")) and (batch["plan_targets"] >= 0).any()) else None
     budget_target = batch.get("target_budget") if (torch.is_tensor(batch.get("target_budget")) and (batch["target_budget"] >= 0).any()) else None
     conf_labels = batch.get("correctness") if (torch.is_tensor(batch.get("correctness")) and (batch["correctness"] >= 0).any()) else None
+    # Align target shapes with logits if batch dimensions mismatch (Tiny models may collapse batch)
+    if torch.is_tensor(plan_targets) and torch.is_tensor(plan_logits) and plan_logits.shape[0] != plan_targets.shape[0]:
+        plan_targets = plan_targets[: plan_logits.shape[0]]
+    if torch.is_tensor(budget_target) and torch.is_tensor(budget_pred) and budget_pred.shape[0] != budget_target.shape[0]:
+        budget_target = budget_target[: budget_pred.shape[0]]
+    if torch.is_tensor(conf_labels) and torch.is_tensor(conf_logits) and conf_logits.shape[0] != conf_labels.shape[0]:
+        conf_labels = conf_labels[: conf_logits.shape[0]]
     # Ensure label tensors live on the same device as model/logits
     try:
         model_device = next(model.parameters()).device
@@ -470,6 +506,11 @@ def parse_args(argv=None):
     ap.add_argument("--batch-size", dest="batch_size", type=int, default=8)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--quiet-star", action="store_true", help="Enable Quiet-Star aux consistency during loss")
+    ap.add_argument(
+        "--allow-missing-base",
+        action="store_true",
+        help="Permit tiny-model fallback when base weights are absent",
+    )
     return ap.parse_args(argv)
 
 
