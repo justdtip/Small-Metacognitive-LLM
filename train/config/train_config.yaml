@@ -37,8 +37,9 @@ trainer:
 
 lm_adaptation:
   enabled: true
-  mode: ln_only           # restrict adaptation to LayerNorms by default
+  mode: lora           # restrict adaptation to LayerNorms by default
   last_k_layers: 2
+  
 
 losses:
   lambda_over: 0.2

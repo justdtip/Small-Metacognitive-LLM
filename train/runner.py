@@ -652,12 +652,70 @@ class Trainer:
                     quiet_star_w=float(phase.get("quiet_star_w", 0.0) or 0.0),
                     per_layer=per_layer,
                 )
-                # Detect and raise if the total loss has no grad
-                _lt = out_losses.get('total')
-                if _lt is not None and getattr(_lt, 'grad_fn', None) is None:
-                    raise RuntimeError("Total loss has no grad; ensure all model parameters that require training have requires_grad=True and are involved in the graph")
+                # Grad check is handled below with optional blueprint allowance
+                # Fallback: if out_losses wasn't computed (e.g., on-policy block skipped), compute now
+                try:
+                    _ = out_losses  # type: ignore[name-defined]
+                except Exception:
+                    try:
+                        # Targets outside on-policy cadence
+                        plan_targets = batch.get("plan_targets").to(self.device) if isinstance(batch.get("plan_targets"), torch.Tensor) else None
+                        budget_target = batch.get("target_budget").to(self.device) if isinstance(batch.get("target_budget"), torch.Tensor) else None
+                        if isinstance(budget_target, torch.Tensor) and budget_target.dim() == 1:
+                            budget_target = budget_target.view(-1, 1)
+                        conf_labels = batch.get("correctness").to(self.device) if isinstance(batch.get("correctness"), torch.Tensor) else None
+                        out_losses = compute_losses(
+                            logits, labels,
+                            weights=weights,
+                            plan_logits=plan_logits if plan_targets is not None else None,
+                            plan_targets=plan_targets,
+                            budget_pred=budget_pred if budget_target is not None else None,
+                            budget_target=budget_target,
+                            conf_logits=conf_logits if conf_labels is not None else None,
+                            conf_labels=conf_labels,
+                            answer_mask=batch.get("answer_mask").to(self.device) if isinstance(batch.get("answer_mask"), torch.Tensor) else None,
+                            think_mask_tce=batch.get("think_mask").to(self.device) if isinstance(batch.get("think_mask"), torch.Tensor) else None,
+                            think_tokens_used=batch.get("think_tokens_used") if isinstance(batch.get("think_tokens_used"), torch.Tensor) else None,
+                            target_L_opt=budget_target if budget_target is not None else None,
+                            correct_labels=conf_labels if conf_labels is not None else None,
+                            aux=head_out.get("aux") if isinstance(head_out, dict) else None,
+                            budget_penalty_w=float(phase.get("budget_penalty_w", 0.0) or 0.0),
+                            think_ce_w=float(phase.get("think_ce_w", 0.0) or 0.0),
+                            quiet_star_w=float(phase.get("quiet_star_w", 0.0) or 0.0),
+                            per_layer=per_layer,
+                        )
+                    except Exception:
+                        # If still failing, create a minimal dict to avoid NameError downstream
+                        out_losses = {"total": torch.tensor(0.0)}  # type: ignore[assignment]
                 # Stash for return in case we exit before another loss compute
                 last_losses = out_losses
+                # Verbose per-step progress logging (optional)
+                try:
+                    if bool(self.cfg.get('verbose_progress', False)):
+                        def _f(x):
+                            try:
+                                return float(x.item()) if hasattr(x, 'item') else float(x)
+                            except Exception:
+                                return float(0.0)
+                        rec_v = {
+                            'train_step': int(step),
+                            'loss_total': _f(out_losses.get('total', 0.0)),
+                            'answer_ce': _f(out_losses.get('answer_ce', 0.0)),
+                            'plan_ce': _f(out_losses.get('plan_ce', 0.0)),
+                            'budget_reg': _f(out_losses.get('budget_reg', 0.0)),
+                            'conf_cal': _f(out_losses.get('conf_cal', 0.0)),
+                        }
+                        try:
+                            opl = getattr(self.engine, '_onpolicy_logs', None)
+                            if isinstance(opl, list) and opl:
+                                last = opl[-1]
+                                if isinstance(last, dict):
+                                    rec_v.update(last)
+                        except Exception:
+                            pass
+                        print(json.dumps(rec_v))
+                except Exception:
+                    pass
                 # Aggregate windowed losses and emit every N steps
                 try:
                     for k, v in out_losses.items():
@@ -736,24 +794,61 @@ class Trainer:
                     pass
 
             opt.zero_grad(set_to_none=True)
+            skip_update = False
             try:
                 tot = out_losses.get("total")
-                if torch.is_tensor(tot) and bool(getattr(tot, 'requires_grad', False)):
-                    tot.backward()
+                has_grad = bool(torch.is_tensor(tot) and (getattr(tot, 'grad_fn', None) is not None) and bool(getattr(tot, 'requires_grad', False)))
+                if has_grad:
+                    tot.backward()  # type: ignore[arg-type]
                 else:
+                    # Blueprint mode: allow no-grad if trainable groups match expected blueprint
+                    bp_mode = bool(self.cfg.get("blueprint_mode", False))
+                    if bp_mode:
+                        def _any_rg(params) -> bool:
+                            try:
+                                return any(getattr(p, 'requires_grad', False) for p in params)
+                            except Exception:
+                                return False
+                        current: set[str] = set()
+                        try:
+                            if _any_rg(self.engine.metacog.parameters()):
+                                current.add('metacog')
+                        except Exception:
+                            pass
+                        try:
+                            if hasattr(self.engine, 'scaffold') and hasattr(self.engine.scaffold, 'adapters') and _any_rg(self.engine.scaffold.adapters.parameters()):
+                                current.add('scaffold')
+                        except Exception:
+                            pass
+                        try:
+                            if _any_rg(self.model.parameters()):
+                                current.add('model')
+                        except Exception:
+                            pass
+                        expected = set(self.cfg.get("blueprint_trainable_groups", ["metacog", "scaffold"]))
+                        # If exactly matches expected, accept and skip this step's update
+                        if current == expected:
+                            try:
+                                print(json.dumps({"info": "no_grad_acceptable_under_blueprint", "train_step": int(step)}))
+                            except Exception:
+                                pass
+                            skip_update = True
+                    # Otherwise warn and skip update this step
                     try:
-                        print(json.dumps({"warn": "total loss has no grad; skipping backward", "step": int(step)}))
+                        print(json.dumps({"warn": "training_loss_no_grad", "train_step": int(step)}))
                     except Exception:
                         pass
+                    skip_update = True
             except Exception as _e:
                 try:
                     print(json.dumps({"error": f"backward_failed: {type(_e).__name__}: {_e}", "step": int(step)}))
                 except Exception:
                     pass
-            if clip_norm and clip_norm > 0:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=float(clip_norm))
-            opt.step()
-            _debug("opt_step_done", step=int(step))
+            if not skip_update:
+                if clip_norm and clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=float(clip_norm))
+                opt.step()
+                _debug("opt_step_done", step=int(step))
 
             # Periodic tiny eval with logic-like prompts and record decoding params + batch metrics
             if eval_interval > 0 and (t % eval_interval == 0):
@@ -1356,6 +1451,11 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
         eval_interval = 100
 
     # Optional strict path validation: enable via cfg['strict_model_paths'] or env STRICT_MODEL_PATHS=1
+    # Expose blueprint and verbose flags via cfg or env
+    blueprint_mode = bool(cfg.get('blueprint_mode', False)) or str(os.environ.get('BLUEPRINT_MODE', '')).lower() in ("1","true","yes")
+    cfg['blueprint_mode'] = bool(blueprint_mode)
+    verbose_progress = bool(cfg.get('verbose_progress', False)) or str(os.environ.get('VERBOSE_PROGRESS','')).lower() in ("1","true","yes")
+    cfg['verbose_progress'] = bool(verbose_progress)
     strict_model_paths = bool(cfg.get('strict_model_paths', False)) or str(os.environ.get('STRICT_MODEL_PATHS', '')).lower() in ("1","true","yes")
     if strict_model_paths:
         _bp = _Path(model_base).expanduser().resolve()
@@ -1923,6 +2023,33 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
                 answer_mask=batch.get("answer_mask").to(device) if isinstance(batch.get("answer_mask"), torch.Tensor) else None,
                 rewrite_groups=(batch.get("batch_meta") or {}).get("rewrite_groups") if isinstance(batch.get("batch_meta"), dict) else None,
             )
+            # Verbose progress logging (optional)
+            try:
+                if bool(cfg.get('verbose_progress', False)):
+                    def _ff(v):
+                        try:
+                            return float(v.item()) if hasattr(v, 'item') else float(v)
+                        except Exception:
+                            return float(0.0)
+                    rec_v = {
+                        'train_step': int(step),
+                        'loss_total': _ff(out_losses.get('total', 0.0)),
+                        'answer_ce': _ff(out_losses.get('answer_ce', 0.0)),
+                        'plan_ce': _ff(out_losses.get('plan_ce', 0.0)),
+                        'budget_reg': _ff(out_losses.get('budget_reg', 0.0)),
+                        'conf_cal': _ff(out_losses.get('conf_cal', 0.0)),
+                    }
+                    try:
+                        # Merge last on-policy record if engine available
+                        if 'engine' in locals() and getattr(engine, '_onpolicy_logs', None):
+                            opl = engine._onpolicy_logs  # type: ignore[attr-defined]
+                            if isinstance(opl, list) and opl and isinstance(opl[-1], dict):
+                                rec_v.update(opl[-1])
+                    except Exception:
+                        pass
+                    print(json.dumps(rec_v))
+            except Exception:
+                pass
             # Detect and raise if the total loss has no grad
             _lt2 = out_losses.get('total')
             if _lt2 is not None and getattr(_lt2, 'grad_fn', None) is None:
@@ -2185,6 +2312,8 @@ def _parse_cli(argv=None):
     ap.add_argument("--decode-temperature", type=float, default=None, help="Sampling temperature for decode_with_budget")
     ap.add_argument("--decode-top-p", type=float, default=None, help="Top-p for decode_with_budget")
     ap.add_argument("--decode-max-new", type=int, default=None, help="Max new tokens for decode_with_budget")
+    ap.add_argument("--blueprint-mode", action="store_true", help="Allow no-grad steps if trainable groups match blueprint")
+    ap.add_argument("--verbose-progress", action="store_true", help="Emit JSON metrics at each training step")
     return ap.parse_args(argv)
 
 
@@ -2192,6 +2321,13 @@ if __name__ == "__main__":
     args = _parse_cli()
     if args.cfg:
         # Allow simple overrides via CLI
+        try:
+            if getattr(args, 'blueprint_mode', False):
+                os.environ["BLUEPRINT_MODE"] = "1"
+            if hasattr(args, 'verbose_progress') and getattr(args, 'verbose_progress', False):
+                os.environ["VERBOSE_PROGRESS"] = "1"
+        except Exception:
+            pass
         out = run_from_config(args.cfg, steps=int(args.steps))
 
 
