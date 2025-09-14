@@ -2,6 +2,9 @@ import os
 import io
 import datetime as _dt
 from typing import Any
+import sys
+import threading
+import os as _os
 
 
 def _default_log_path() -> str:
@@ -68,106 +71,187 @@ class _TeeStream:
         return getattr(self._main, name)
 
 
-def pytest_configure(config) -> None:  # noqa: D401 - pytest hook
-    """Install a tee on the terminal reporter so all console output is logged.
-
-    Keeps the console output unchanged and writes identical content to a log file.
-    """
-    # Allow opt-out via env var
+def _ensure_logging(config) -> None:
+    """Idempotently ensure tee logging is installed."""
     if os.getenv("PYTEST_DISABLE_OUTPUT_LOG"):
         return
 
+    state = getattr(config, "_pytest_output_log", None)
+    if state is None:
+        # Determine and open the log file (text mode to match terminal writes)
+        log_path = _default_log_path()
+        try:
+            log_fh = open(log_path, "w", encoding="utf-8", newline="")
+        except OSError:
+            # If logs dir not writable, fall back to cwd
+            fallback = os.path.join(os.getcwd(), "pytest-q.log")
+            log_fh = open(fallback, "w", encoding="utf-8", newline="")
+            log_path = fallback
+
+        # Debug breadcrumb file
+        try:
+            dbg_dir = os.path.dirname(log_path)
+            os.makedirs(dbg_dir, exist_ok=True)
+            with open(os.path.join(dbg_dir, "pytest-tee-debug.txt"), "a", encoding="utf-8") as _dbg:
+                _dbg.write("opened log at %s\n" % log_path)
+        except Exception:
+            pass
+
+        state = {
+            "log_fh": log_fh,
+            "log_path": log_path,
+            "tw": None,
+            "orig_write": None,
+            "orig_fullwrite": None,
+            "gtw_module": None,
+            "gtw_orig": None,
+            "sys_stdout_orig": None,
+            "sys_stderr_orig": None,
+            "installed": False,
+        }
+        config._pytest_output_log = state  # type: ignore[attr-defined]
+
+        # Install FD-level tee to capture very-early and low-level writes
+        try:
+            _install_fd_tee(state)
+        except Exception:
+            # Best-effort only
+            pass
+
+        # Patch global get_terminal_writer ASAP so any ad-hoc writers are wrapped
+        try:
+            try:
+                import _pytest._io.terminalwriter as _twmod  # type: ignore
+            except Exception:  # pragma: no cover - legacy fallback
+                import py._io.terminalwriter as _twmod  # type: ignore
+
+            gtw_orig = getattr(_twmod, "get_terminal_writer", None)
+            if gtw_orig is not None:
+                def _gtw_wrapper(file=None):  # type: ignore[override]
+                    tw2 = gtw_orig(file)
+                    try:
+                        _install_write_wrapper(tw2, state["log_fh"])  # type: ignore[index]
+                    except Exception:
+                        pass
+                    try:
+                        with open(os.path.join(state["log_path"].rsplit(os.sep, 1)[0], "pytest-tee-debug.txt"), "a", encoding="utf-8") as _dbg:  # type: ignore[index]
+                            _dbg.write("wrapped get_terminal_writer\n")
+                    except Exception:
+                        pass
+                    return tw2
+
+                state["gtw_module"] = _twmod
+                state["gtw_orig"] = gtw_orig
+                _twmod.get_terminal_writer = _gtw_wrapper  # type: ignore[assignment]
+        except Exception:
+            pass
+
+    # Attach to TerminalReporter if present and not yet installed
     tr = config.pluginmanager.getplugin("terminalreporter")
     if tr is None:
-        return  # no terminal output (e.g., -p no:terminal)
-
+        return
     tw = getattr(tr, "_tw", None)
     if tw is None:
         return
-
-    # Determine and open the log file (text mode to match terminal writes)
-    log_path = _default_log_path()
-    try:
-        log_fh = open(log_path, "w", encoding="utf-8", newline="")
-    except OSError:
-        # If logs dir not writable, fall back to cwd
-        fallback = os.path.join(os.getcwd(), "pytest-q.log")
-        log_fh = open(fallback, "w", encoding="utf-8", newline="")
-        log_path = fallback
-
-    # Resolve the underlying stream attribute used by TerminalWriter
-    # Prefer private _file when present (pytest >= 7), else fall back to file/stream.
-    underlying = None
-    for attr in ("_file", "file", "stream", "out"):
-        if hasattr(tw, attr):
-            underlying = getattr(tw, attr)
-            break
-    if underlying is None:
-        # As a last resort, give up quietly
-        log_fh.close()
+    if state.get("installed"):
         return
+    state["tw"] = tw
+    state["orig_write"] = getattr(tw, "write", None)
+    state["orig_fullwrite"] = getattr(tw, "fullwrite", None)
+    _install_write_wrapper(tw, state["log_fh"])  # type: ignore[index]
+    state["installed"] = True
 
-    tee = _TeeStream(underlying, log_fh)
+    # As a last line of defense, also tee sys.stdout and sys.stderr
+    # This helps capture very-early messages and error printing paths
+    if state.get("sys_stdout_orig") is None:
+        state["sys_stdout_orig"] = sys.stdout
+        sys.stdout = _TeeStream(sys.stdout, state["log_fh"])  # type: ignore[assignment,index]
+    if state.get("sys_stderr_orig") is None:
+        state["sys_stderr_orig"] = sys.stderr
+        sys.stderr = _TeeStream(sys.stderr, state["log_fh"])  # type: ignore[assignment,index]
 
-    # Store bookkeeping so we can restore on unconfigure
-    config._pytest_output_log = {  # type: ignore[attr-defined]
-        "log_fh": log_fh,
-        "log_path": log_path,
-        "tw": tw,
-        "underlying_attr": attr,
-        "underlying_stream": underlying,
-        "tee": tee,
-    }
 
-    # Attach tee to the terminal writer without changing console behavior
-    if hasattr(tw, "_file"):
-        tw._file = tee  # type: ignore[attr-defined]
-    elif hasattr(tw, "file"):
-        try:
-            setattr(tw, "file", tee)  # type: ignore[misc]
-        except Exception:
-            # Fallback: monkeypatch write method if assignment is not allowed
-            _install_write_wrapper(tw, log_fh)
-    else:
-        _install_write_wrapper(tw, log_fh)
+def pytest_configure(config) -> None:  # noqa: D401 - pytest hook
+    _ensure_logging(config)
+
+
+def pytest_sessionstart(session) -> None:  # noqa: D401 - pytest hook
+    _ensure_logging(session.config)
 
 
 def _install_write_wrapper(tw, log_fh) -> None:
-    """Fallback: wrap tw.write to duplicate text into the log file."""
+    """Wrap tw.write and tw.fullwrite to duplicate text into the log file."""
     orig_write = getattr(tw, "write", None)
-    if orig_write is None:
-        return
+    if orig_write is not None:
+        def _wrapped_write(s, *args, **kwargs):  # type: ignore[no-redef]
+            res = orig_write(s, *args, **kwargs)
+            try:
+                log_fh.write(s)
+            except Exception:
+                pass
+            return res
+        tw.write = _wrapped_write  # type: ignore[assignment]
 
-    def _wrapped_write(s: str, *args, **kwargs):
-        # Call original writer first to keep console timing/format intact
-        res = orig_write(s, *args, **kwargs)
-        try:
-            log_fh.write(s)
-        except Exception:
-            # Best-effort logging only; never interfere with pytest output
-            pass
-        return res
-
-    tw.write = _wrapped_write  # type: ignore[assignment]
+    orig_fullwrite = getattr(tw, "fullwrite", None)
+    if orig_fullwrite is not None:
+        def _wrapped_fullwrite(s, *args, **kwargs):  # type: ignore[no-redef]
+            res = orig_fullwrite(s, *args, **kwargs)
+            try:
+                log_fh.write(s)
+            except Exception:
+                pass
+            return res
+        tw.fullwrite = _wrapped_fullwrite  # type: ignore[assignment]
 
 
 def pytest_unconfigure(config) -> None:  # noqa: D401 - pytest hook
-    """Restore terminal writer and close the log file."""
+    """Restore streams and close the log at very end of pytest lifecycle."""
     state = getattr(config, "_pytest_output_log", None)
     if not state:
         return
 
     tw = state.get("tw")
-    underlying_attr = state.get("underlying_attr")
-    underlying_stream = state.get("underlying_stream")
     log_fh = state.get("log_fh")
+    orig_write = state.get("orig_write")
+    orig_fullwrite = state.get("orig_fullwrite")
+    gtw_module = state.get("gtw_module")
+    gtw_orig = state.get("gtw_orig")
+    sys_stdout_orig = state.get("sys_stdout_orig")
+    sys_stderr_orig = state.get("sys_stderr_orig")
 
     try:
-        if tw is not None and underlying_attr in ("_file", "file", "stream", "out"):
+        if tw is not None:
+            if orig_write is not None:
+                try:
+                    tw.write = orig_write  # type: ignore[assignment]
+                except Exception:
+                    pass
+            if orig_fullwrite is not None:
+                try:
+                    tw.fullwrite = orig_fullwrite  # type: ignore[assignment]
+                except Exception:
+                    pass
+        if gtw_module is not None and gtw_orig is not None:
             try:
-                setattr(tw, underlying_attr, underlying_stream)
+                gtw_module.get_terminal_writer = gtw_orig  # type: ignore[assignment]
             except Exception:
                 pass
+        # Restore sys streams
+        if sys_stdout_orig is not None:
+            try:
+                sys.stdout = sys_stdout_orig  # type: ignore[assignment]
+            except Exception:
+                pass
+        if sys_stderr_orig is not None:
+            try:
+                sys.stderr = sys_stderr_orig  # type: ignore[assignment]
+            except Exception:
+                pass
+        # Tear down FD-level tee
+        try:
+            _teardown_fd_tee(state)
+        except Exception:
+            pass
     finally:
         try:
             if log_fh is not None:
@@ -176,3 +260,81 @@ def pytest_unconfigure(config) -> None:  # noqa: D401 - pytest hook
         except Exception:
             pass
 
+
+def _install_fd_tee(state: dict) -> None:
+    """Duplicate writes to FDs 1/2 into the log file using a background pump.
+
+    This captures output paths that bypass Python (e.g., low-level writes during collection).
+
+    Stores resources in state for later teardown.
+    """
+    log_fh = state["log_fh"]
+
+    # Save originals
+    orig_out = _os.dup(1)
+    orig_err = _os.dup(2)
+
+    # Create pipes
+    out_r, out_w = _os.pipe()
+    err_r, err_w = _os.pipe()
+
+    # Redirect stdout/stderr to the pipe writers
+    _os.dup2(out_w, 1)
+    _os.dup2(err_w, 2)
+
+    # Close the write ends in our process (the FDs 1/2 now point to them)
+    _os.close(out_w)
+    _os.close(err_w)
+
+    # Pump threads: read from the pipes; write to original FD and log
+    def _pump(src_fd: int, dest_fd: int) -> None:
+        while True:
+            try:
+                chunk = _os.read(src_fd, 8192)
+            except Exception:
+                break
+            if not chunk:
+                break
+            try:
+                # mirror to original terminal
+                _os.write(dest_fd, chunk)
+            except Exception:
+                pass
+            try:
+                # write to log as text
+                log_fh.write(chunk.decode("utf-8", errors="replace"))
+                log_fh.flush()
+            except Exception:
+                pass
+        try:
+            _os.close(src_fd)
+        except Exception:
+            pass
+
+    t_out = threading.Thread(target=_pump, args=(out_r, orig_out), daemon=True)
+    t_err = threading.Thread(target=_pump, args=(err_r, orig_err), daemon=True)
+    t_out.start()
+    t_err.start()
+
+    state["fdtee"] = {
+        "orig_out": orig_out,
+        "orig_err": orig_err,
+        "out_r": out_r,
+        "err_r": err_r,
+    }
+
+
+def _teardown_fd_tee(state: dict) -> None:
+    info = state.get("fdtee")
+    if not info:
+        return
+    try:
+        # Restore original FDs to stdout/stderr
+        _os.dup2(info["orig_out"], 1)
+        _os.dup2(info["orig_err"], 2)
+    finally:
+        for key in ("orig_out", "orig_err", "out_r", "err_r"):
+            try:
+                _os.close(info[key])
+            except Exception:
+                pass
