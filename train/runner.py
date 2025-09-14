@@ -42,6 +42,7 @@ from train.schedules import build_loss_schedules, quiet_star_schedule, quiet_sta
 from train.eval_loop import decode_with_budget, load_service_config
 import hashlib, json, os
 from pathlib import Path
+import re
 try:
     import yaml  # type: ignore
 except Exception:  # pragma: no cover
@@ -402,6 +403,7 @@ class Trainer:
             eval_interval = int(((self.cfg.get("trainer") or {}).get("eval_interval") or 100))
             ckpt_interval = int(((self.cfg.get("trainer") or {}).get("ckpt_interval") or 1000))
             for t in range(int(steps)):
+                step = t + 1
                 input_ids = batch["input_ids"].to(self.device)
                 labels = input_ids.clone(); labels[:, :-1] = input_ids[:, 1:]; labels[:, -1] = -100
                 labels = torch.where(batch["loss_mask"].to(self.device).bool(), labels, torch.full_like(labels, -100))
@@ -538,7 +540,7 @@ class Trainer:
 
                 # Periodic evaluation on simple prompts (before backward)
                 try:
-                    if eval_prompts and eval_interval > 0 and ((t + 1) % int(eval_interval) == 0):
+                    if eval_prompts and eval_interval > 0 and (step % int(eval_interval) == 0):
                         for prompt in (eval_prompts or []):
                             try:
                                 enc = self.tok(str(prompt), return_tensors='pt', add_special_tokens=True)
@@ -550,14 +552,14 @@ class Trainer:
                                                           top_p=1.0,
                                                           visible_cot=False)
                                 ans = res.get('text') or ''
-                                print(f"[EVAL step {t+1}] {prompt} -> {ans}")
+                                print(f"[EVAL step {step}] {prompt} -> {ans}")
                                 try:
                                     if _dash is not None:
                                         _dash.update({'eval_output': f'{str(prompt)[:30]} -> {str(ans)[:30]}'})
                                 except Exception:
                                     pass
                             except Exception as _e:
-                                print(f"[EVAL ERROR step {t+1}] {_e}")
+                                print(f"[EVAL ERROR step {step}] {_e}")
                 except Exception:
                     pass
 
@@ -568,12 +570,12 @@ class Trainer:
                     tot.backward()
                 else:
                     try:
-                        print(json.dumps({"warn": "total loss has no grad; skipping backward", "step": int(t)}))
+                        print(json.dumps({"warn": "total loss has no grad; skipping backward", "step": int(step)}))
                     except Exception:
                         pass
             except Exception as _e:
                 try:
-                    print(json.dumps({"error": f"backward_failed: {type(_e).__name__}: {_e}", "step": int(t)}))
+                    print(json.dumps({"error": f"backward_failed: {type(_e).__name__}: {_e}", "step": int(step)}))
                 except Exception:
                     pass
             if clip_norm and clip_norm > 0:
@@ -595,24 +597,24 @@ class Trainer:
                     except Exception:
                         bstats, ews, ast = {}, {}, {}
                     # Emit a compact record for TUI/JSON logs
-                    print(json.dumps({"light_eval": {"step": int(t), "accuracy": float(le.get('accuracy') or 0.0), "n": len(le.get('results') or []), "batch_stats": {**bstats, **ews, **ast}}}))
+                    print(json.dumps({"light_eval": {"step": int(step), "accuracy": float(le.get('accuracy') or 0.0), "n": len(le.get('results') or []), "batch_stats": {**bstats, **ews, **ast}}}))
                     # Also dump full results once in a while
                     print(json.dumps({"light_eval_results": le}))
                 except Exception:
                     pass
 
                 # Periodic checkpoint saving
-                if ckpt_interval > 0 and (t > 0) and (t % ckpt_interval == 0):
+                if ckpt_interval > 0 and (step > 0) and (step % ckpt_interval == 0):
                     try:
                         ckpt_dir = Path(self.root) / "artifacts" / "checkpoints"
                         ckpt_dir.mkdir(parents=True, exist_ok=True)
                         state = {
                             'model': self.model.state_dict(),
                             'optimizer': opt.state_dict(),
-                            'step': int(t),
+                            'step': int(step),
                         }
-                        torch.save(state, ckpt_dir / f"step-{int(t):06d}.pt")
-                        print(json.dumps({"checkpoint": {"path": str(ckpt_dir / f'step-{int(t):06d}.pt')}}))
+                        torch.save(state, ckpt_dir / f"step-{int(step):06d}.pt")
+                        print(json.dumps({"checkpoint": {"path": str(ckpt_dir / f'step-{int(step):06d}.pt')}}))
                     except Exception:
                         pass
 
@@ -1370,6 +1372,26 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
             raise ValueError('Dataset yielded no examples—check dataset name/path and limit_train')
         batch = collate(examples_base[:bs])
 
+    # Adjust budget cap based on longest <think>...</think> segment
+    try:
+        pattern = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+        max_think = 0
+        for rec in examples_base:
+            txt = rec.get('text', '')
+            for seg in pattern.findall(txt):
+                try:
+                    ids = tok.encode(seg, add_special_tokens=False)
+                    L = len(ids) if isinstance(ids, list) else int(getattr(ids, 'shape', [0])[0])
+                    if L > max_think:
+                        max_think = int(L)
+                except Exception:
+                    continue
+        if max_think > 0:
+            budget_cap = max(int(budget_cap), int(max_think))
+            cfg['budget_cap'] = int(budget_cap)
+    except Exception:
+        pass
+
     # Report trainable parameters and probe max token length before loop
     try:
         summarize_trainable_params(model)
@@ -1452,6 +1474,7 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
     last_rl_stats: Dict[str, Any] = {}
     with dash_ctx as _dash:
         for t in range(int(steps)):
+            step = t + 1
             # Rebuild a small batch each step by cycling examples
             try:
                 cur = []
@@ -1507,7 +1530,7 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
                     exec_frac = (exec_tok/denom) if (denom and denom>0 and exec_tok is not None) else None
                     eval_frac = (eval_tok/denom) if (denom and denom>0 and eval_tok is not None) else None
                     print(json.dumps({
-                        "train_step": int(t),
+                        "train_step": int(step),
                         "rl": {
                             "think_tokens_used": int(used),
                             **{k: float(v) for k, v in stats.items() if isinstance(v, (int, float))},
@@ -1640,12 +1663,12 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
         )
         # Step debug log for budget lambda
         try:
-            print(json.dumps({"train_step": int(t), "lambda_budget_current": lam_budget_cur}))
+            print(json.dumps({"train_step": int(step), "lambda_budget_current": lam_budget_cur}))
         except Exception:
             pass
         # Periodic evaluation on simple prompts (before backward)
         try:
-            if eval_prompts and eval_interval > 0 and ((t + 1) % int(eval_interval) == 0):
+            if eval_prompts and eval_interval > 0 and (step % int(eval_interval) == 0):
                 for prompt in (eval_prompts or []):
                     try:
                         enc = tok(str(prompt), return_tensors='pt', add_special_tokens=True)
@@ -1657,14 +1680,14 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
                                                   top_p=1.0,
                                                   visible_cot=False)
                         ans = res.get('text') or ''
-                        print(f"[EVAL step {t+1}] {prompt} -> {ans}")
+                        print(f"[EVAL step {step}] {prompt} -> {ans}")
                         try:
                             if _dash is not None:
                                 _dash.update({'eval_output': f'{str(prompt)[:30]} -> {str(ans)[:30]}'})
                         except Exception:
                             pass
                     except Exception as _e:
-                        print(f"[EVAL ERROR step {t+1}] {_e}")
+                        print(f"[EVAL ERROR step {step}] {_e}")
         except Exception:
             pass
         # Dashboard update (best-effort)
@@ -1719,21 +1742,21 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
             if torch.is_tensor(tot) and bool(getattr(tot, 'requires_grad', False)):
                 tot.backward()
             else:
+                    try:
+                        print(json.dumps({"warn": "total loss has no grad; skipping backward", "step": int(step)}))
+                    except Exception:
+                        pass
+        except Exception as _e:
                 try:
-                    print(json.dumps({"warn": "total loss has no grad; skipping backward", "step": int(t)}))
+                    print(json.dumps({"error": f"backward_failed: {type(_e).__name__}: {_e}", "step": int(step)}))
                 except Exception:
                     pass
-        except Exception as _e:
-            try:
-                print(json.dumps({"error": f"backward_failed: {type(_e).__name__}: {_e}", "step": int(t)}))
-            except Exception:
-                pass
         opt.step()
 
         # Periodic checkpoint saving
         try:
-            if save_interval > 0 and ((t + 1) % int(save_interval) == 0):
-                ckpt = save_dir / f"checkpoint-{t+1}"
+            if save_interval > 0 and (step % int(save_interval) == 0):
+                ckpt = save_dir / f"checkpoint-{step}"
                 ckpt.mkdir(parents=True, exist_ok=True)
                 # Model
                 try:
@@ -1752,7 +1775,7 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
                         tok.save_pretrained(str(ckpt))  # type: ignore[attr-defined]
                 except Exception:
                     pass
-                print(f"[CKPT] saved at step {t+1} to {ckpt}")
+                print(f"[CKPT] saved at step {step} to {ckpt}")
         except Exception:
             pass
 
@@ -1851,6 +1874,7 @@ def onpolicy_sft_and_rl_smoke(steps: int = 2, sample_every: int = 1, budget_cap:
     rl_stats = []
     pol = None
     for t in range(int(steps)):
+        step = t + 1
         if sample_every > 0 and (t % int(sample_every) == 0):
             try:
                 # Decode on-policy using the current model if possible; else allow monkeypatched stub in tests
@@ -1913,7 +1937,7 @@ def main_train_loop(steps: int = 3, sample_every: int = 1, budget_cap: int = 16)
             rl_stats.append(stats)
             # Log a compact record per integration event
             try:
-                rec = {"step": int(t), "think_tokens_used": int(used), **{k: float(stats.get(k)) for k in ("mu_mean","mu_after","reward_mean") if k in stats}}
+                rec = {"step": int(step), "think_tokens_used": int(used), **{k: float(stats.get(k)) for k in ("mu_mean","mu_after","reward_mean") if k in stats}}
                 print(json.dumps({"onpolicy": rec}))
             except Exception:
                 pass

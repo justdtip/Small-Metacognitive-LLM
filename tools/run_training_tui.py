@@ -90,6 +90,8 @@ class RunConfigForm(Static):
     dump_per_layer = reactive(True)
     apply_all_layers = reactive(False)
     adapt_layers_list = reactive("")
+    sample_every = reactive(0)
+    budget_cap = reactive(16)
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="form"):
@@ -108,6 +110,10 @@ class RunConfigForm(Static):
             yield Input(id="save_interval", value=str(self.save_interval))
             yield Label("Eval Interval:")
             yield Input(id="eval_interval", value=str(self.eval_interval))
+            yield Label("Sample Every:")
+            yield Input(id="sample_every", value=str(self.sample_every))
+            yield Label("Budget Cap:")
+            yield Input(id="budget_cap", value=str(self.budget_cap))
             yield Label("Number of Experts:")
             yield Input(id="num_experts", value=str(self.num_experts))
             yield Checkbox(label="Enable Feedback", value=self.feedback, id="feedback_chk")
@@ -152,6 +158,10 @@ class RunConfigForm(Static):
                 self.save_interval = int(event.value)
             elif event.input.id == "eval_interval":
                 self.eval_interval = int(event.value)
+            elif event.input.id == "sample_every":
+                self.sample_every = int(event.value)
+            elif event.input.id == "budget_cap":
+                self.budget_cap = int(event.value)
             elif event.input.id == "num_experts":
                 self.num_experts = int(event.value)
             elif event.input.id == "model_path":
@@ -224,6 +234,8 @@ class RunConfigForm(Static):
             # Duplicate at top level for hooks used in runner
             "save_interval": int(self.save_interval),
             "eval_interval": int(self.eval_interval),
+            "sample_every": int(self.sample_every),
+            "budget_cap": int(self.budget_cap),
             "data": data_cfg,
             "metacog": {
                 "num_experts": int(self.num_experts),
