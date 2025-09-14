@@ -277,6 +277,7 @@ class Trainer:
         layer_indices = adapt_cfg.get("layer_indices")
         lr_scale = float(adapt_cfg.get("lr_scale", 0.05) or 0.05)
         lm_params: list = []
+        base_all_params: list = []
         if adapt_enabled:
             try:
                 dec = self.engine.scaffold._get_decoder_layers(self.model)
@@ -289,7 +290,14 @@ class Trainer:
                             target_idx = list(range(max(0, len(dec) - last_k), len(dec)))
                     else:
                         target_idx = list(range(max(0, len(dec) - last_k), len(dec)))
-                    if adapt_mode == 'ln_only':
+                    if adapt_mode == 'full':
+                        # Unfreeze entire base model; optimizer will include all base params
+                        for p in self.model.parameters():
+                            p.requires_grad = True
+                            base_all_params.append(p)
+                        # Don't also include base_top_params to avoid duplicates
+                        base_top_params = []
+                    elif adapt_mode == 'ln_only':
                         import torch.nn as _nn
                         for i in target_idx:
                             for name, mod in dec[i].named_modules():
@@ -332,8 +340,12 @@ class Trainer:
         groups = [
             {"params": [p for p in heads_params if p.requires_grad], "lr": heads_lr, "weight_decay": wd},
             {"params": [p for p in adapters_params if p.requires_grad], "lr": adapters_lr, "weight_decay": wd},
-            {"params": [p for p in base_top_params if p.requires_grad], "lr": base_top_lr, "weight_decay": wd},
         ]
+        # Full-mode: include all base model params as a group; else, include only the top layers
+        if base_all_params:
+            groups.append({"params": [p for p in base_all_params if p.requires_grad], "lr": base_top_lr, "weight_decay": wd})
+        else:
+            groups.append({"params": [p for p in base_top_params if p.requires_grad], "lr": base_top_lr, "weight_decay": wd})
         if lm_params:
             lm_lr = max(1e-8, float(heads_lr) * float(lr_scale))
             groups.append({"params": [p for p in lm_params if p.requires_grad], "lr": lm_lr, "weight_decay": wd})
@@ -350,11 +362,16 @@ class Trainer:
         return opt
 
     def _set_train_flags(self, phase: Dict[str, Any]):
-        # Freeze/unfreeze base respecting lm_adaptation.enabled
+        # Freeze/unfreeze base respecting lm_adaptation.enabled and 'full' mode
         adapt_cfg = (self.cfg.get("lm_adaptation") or {})
         adapt_enabled = bool(adapt_cfg.get("enabled", False))
-        # If adaptation is disabled, freeze base regardless of phase
-        freeze = bool(phase.get("freeze_base", False) or (not adapt_enabled))
+        adapt_mode = str(adapt_cfg.get("mode", "ln_only") or "ln_only").lower()
+        # If full-mode is requested, override and unfreeze base
+        if adapt_enabled and adapt_mode == 'full':
+            freeze = False
+        else:
+            # If adaptation is disabled, freeze base regardless of phase
+            freeze = bool(phase.get("freeze_base", False) or (not adapt_enabled))
         for p in self.model.parameters():
             p.requires_grad = not freeze
         # Always keep adapters/heads trainable per phase flags
@@ -368,7 +385,7 @@ class Trainer:
         # Re-enable tiny LM adaptation params even if base is frozen
         try:
             if adapt_enabled:
-                mode = str(adapt_cfg.get("mode", "ln_only") or "ln_only").lower()
+                mode = adapt_mode
                 last_k = int(adapt_cfg.get("last_k_layers", 2) or 2)
                 apply_all = bool(adapt_cfg.get("apply_to_all_layers", False))
                 layer_indices = adapt_cfg.get("layer_indices")
@@ -382,7 +399,11 @@ class Trainer:
                             target_idx = list(range(max(0, len(dec) - last_k), len(dec)))
                     else:
                         target_idx = list(range(max(0, len(dec) - last_k), len(dec)))
-                    if mode == 'ln_only':
+                    if mode == 'full':
+                        # Ensure all base params remain trainable
+                        for p in self.model.parameters():
+                            p.requires_grad = True
+                    elif mode == 'ln_only':
                         import torch.nn as _nn
                         for i in target_idx:
                             for name, mod in dec[i].named_modules():
@@ -527,6 +548,9 @@ class Trainer:
             save_dir = Path(self.cfg.get("save_dir", "checkpoints"))
             for t in range(int(steps)):
                 step = t + 1
+                # Ensure losses dict is defined for this iteration
+                out_losses: Dict[str, Any] = {}
+                _skip_iter = False
                 input_ids = batch["input_ids"].to(self.device)
                 labels = input_ids.clone(); labels[:, :-1] = input_ids[:, 1:]; labels[:, -1] = -100
                 labels = torch.where(batch["loss_mask"].to(self.device).bool(), labels, torch.full_like(labels, -100))
@@ -632,61 +656,35 @@ class Trainer:
                 w_correct = float(((self.cfg.get("trainer") or {}).get("w_correct") or 0.0) or 0.0)
                 weights = {"answer_ce": 1.0, "plan_ce": 0.5, "budget_reg": 0.1, "conf_cal": 0.1, "var_reg": var_reg,
                            "expert_entropy_reg": eent, "len_over": w_len_over, "len_under": w_len_under, "correct": w_correct}
-                out_losses = compute_losses(
-                    logits, labels,
-                    weights=weights,
-                    plan_logits=plan_logits if plan_targets is not None else None,
-                    plan_targets=plan_targets,
-                    budget_pred=budget_pred if budget_target is not None else None,
-                    budget_target=budget_target,
-                    conf_logits=conf_logits if conf_labels is not None else None,
-                    conf_labels=conf_labels,
-                    answer_mask=batch.get("answer_mask").to(self.device) if isinstance(batch.get("answer_mask"), torch.Tensor) else None,
-                    think_mask_tce=batch.get("think_mask").to(self.device) if isinstance(batch.get("think_mask"), torch.Tensor) else None,
-                    think_tokens_used=batch.get("think_tokens_used") if isinstance(batch.get("think_tokens_used"), torch.Tensor) else None,
-                    target_L_opt=budget_target if budget_target is not None else None,
-                    correct_labels=conf_labels if conf_labels is not None else None,
-                    aux=head_out.get("aux") if isinstance(head_out, dict) else None,
-                    budget_penalty_w=float(phase.get("budget_penalty_w", 0.0) or 0.0),
-                    think_ce_w=float(phase.get("think_ce_w", 0.0) or 0.0),
-                    quiet_star_w=float(phase.get("quiet_star_w", 0.0) or 0.0),
-                    per_layer=per_layer,
-                )
-                # Grad check is handled below with optional blueprint allowance
-                # Fallback: if out_losses wasn't computed (e.g., on-policy block skipped), compute now
                 try:
-                    _ = out_losses  # type: ignore[name-defined]
-                except Exception:
+                    out_losses = compute_losses(
+                        logits, labels,
+                        weights=weights,
+                        plan_logits=plan_logits if plan_targets is not None else None,
+                        plan_targets=plan_targets,
+                        budget_pred=budget_pred if budget_target is not None else None,
+                        budget_target=budget_target,
+                        conf_logits=conf_logits if conf_labels is not None else None,
+                        conf_labels=conf_labels,
+                        answer_mask=batch.get("answer_mask").to(self.device) if isinstance(batch.get("answer_mask"), torch.Tensor) else None,
+                        think_mask_tce=batch.get("think_mask").to(self.device) if isinstance(batch.get("think_mask"), torch.Tensor) else None,
+                        think_tokens_used=batch.get("think_tokens_used") if isinstance(batch.get("think_tokens_used"), torch.Tensor) else None,
+                        target_L_opt=budget_target if budget_target is not None else None,
+                        correct_labels=conf_labels if conf_labels is not None else None,
+                        aux=head_out.get("aux") if isinstance(head_out, dict) else None,
+                        budget_penalty_w=float(phase.get("budget_penalty_w", 0.0) or 0.0),
+                        think_ce_w=float(phase.get("think_ce_w", 0.0) or 0.0),
+                        quiet_star_w=float(phase.get("quiet_star_w", 0.0) or 0.0),
+                        per_layer=per_layer,
+                    )
+                except Exception as _e:
                     try:
-                        # Targets outside on-policy cadence
-                        plan_targets = batch.get("plan_targets").to(self.device) if isinstance(batch.get("plan_targets"), torch.Tensor) else None
-                        budget_target = batch.get("target_budget").to(self.device) if isinstance(batch.get("target_budget"), torch.Tensor) else None
-                        if isinstance(budget_target, torch.Tensor) and budget_target.dim() == 1:
-                            budget_target = budget_target.view(-1, 1)
-                        conf_labels = batch.get("correctness").to(self.device) if isinstance(batch.get("correctness"), torch.Tensor) else None
-                        out_losses = compute_losses(
-                            logits, labels,
-                            weights=weights,
-                            plan_logits=plan_logits if plan_targets is not None else None,
-                            plan_targets=plan_targets,
-                            budget_pred=budget_pred if budget_target is not None else None,
-                            budget_target=budget_target,
-                            conf_logits=conf_logits if conf_labels is not None else None,
-                            conf_labels=conf_labels,
-                            answer_mask=batch.get("answer_mask").to(self.device) if isinstance(batch.get("answer_mask"), torch.Tensor) else None,
-                            think_mask_tce=batch.get("think_mask").to(self.device) if isinstance(batch.get("think_mask"), torch.Tensor) else None,
-                            think_tokens_used=batch.get("think_tokens_used") if isinstance(batch.get("think_tokens_used"), torch.Tensor) else None,
-                            target_L_opt=budget_target if budget_target is not None else None,
-                            correct_labels=conf_labels if conf_labels is not None else None,
-                            aux=head_out.get("aux") if isinstance(head_out, dict) else None,
-                            budget_penalty_w=float(phase.get("budget_penalty_w", 0.0) or 0.0),
-                            think_ce_w=float(phase.get("think_ce_w", 0.0) or 0.0),
-                            quiet_star_w=float(phase.get("quiet_star_w", 0.0) or 0.0),
-                            per_layer=per_layer,
-                        )
+                        print(json.dumps({"error": f"compute_losses_failed: {type(_e).__name__}: {_e}", "step": int(step)}))
                     except Exception:
-                        # If still failing, create a minimal dict to avoid NameError downstream
-                        out_losses = {"total": torch.tensor(0.0)}  # type: ignore[assignment]
+                        pass
+                    out_losses = {}
+                    _skip_iter = True
+                # Grad check is handled below with optional blueprint allowance
                 # Stash for return in case we exit before another loss compute
                 last_losses = out_losses
                 # Verbose per-step progress logging (optional)
@@ -731,7 +729,12 @@ class Trainer:
                         _agg_sums.clear(); _agg_cnt = 0
                 except Exception:
                     pass
-                _debug("losses_done", total=(float(out_losses.get("total").item()) if isinstance(out_losses.get("total"), torch.Tensor) else None))
+                try:
+                    _tot = out_losses.get("total") if isinstance(out_losses, dict) else None
+                    _val = float(_tot.item()) if hasattr(_tot, 'item') else (float(_tot) if isinstance(_tot, (int, float)) else None)
+                except Exception:
+                    _val = None
+                _debug("losses_done", total=_val)
 
                 # Optional dashboard update
                 try:
@@ -748,9 +751,15 @@ class Trainer:
                         if isinstance(per_layer, dict):
                             alpha = per_layer.get("alpha")
                             per_pl = per_layer.get("plan_logits_pl")
+                    loss_total_val = None
+                    try:
+                        ot = out_losses.get("total") if isinstance(out_losses, dict) else None
+                        loss_total_val = float(ot.item()) if hasattr(ot, 'item') else (float(ot) if isinstance(ot, (int, float)) else None)
+                    except Exception:
+                        loss_total_val = None
                     _dash.update({
                         "step": t,
-                        "loss_total": float(out_losses["total"].item()),
+                        "loss_total": loss_total_val,
                         "loss_answer": float(out_losses.get("answer_ce", torch.tensor(0.0)).item()) if isinstance(out_losses.get("answer_ce"), torch.Tensor) else out_losses.get("answer_ce"),
                         "loss_rl": float(out_losses.get("budget_reg", torch.tensor(0.0)).item()) if isinstance(out_losses.get("budget_reg"), torch.Tensor) else out_losses.get("budget_reg"),
                         "reward_mean": None,
@@ -2010,19 +2019,30 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
                 "rewrite_consistency": _lam("rewrite", default=0.0),
                 "style_inv": _lam("style_inv", default=0.0),
             }
-            out_losses = compute_losses(
-                logits, labels,
-                gate_modules=None,
-                weights=weights,
-                plan_logits=plan_logits if plan_targets is not None else None,
-                plan_targets=plan_targets,
-                budget_pred=budget_pred if budget_target is not None else None,
-                budget_target=budget_target,
-                conf_logits=conf_logits if conf_labels is not None else None,
-                conf_labels=conf_labels,
-                answer_mask=batch.get("answer_mask").to(device) if isinstance(batch.get("answer_mask"), torch.Tensor) else None,
-                rewrite_groups=(batch.get("batch_meta") or {}).get("rewrite_groups") if isinstance(batch.get("batch_meta"), dict) else None,
-            )
+            out_losses: Dict[str, Any] = {}
+            _skip_iter2 = False
+            _skip_update2 = False
+            try:
+                out_losses = compute_losses(
+                    logits, labels,
+                    gate_modules=None,
+                    weights=weights,
+                    plan_logits=plan_logits if plan_targets is not None else None,
+                    plan_targets=plan_targets,
+                    budget_pred=budget_pred if budget_target is not None else None,
+                    budget_target=budget_target,
+                    conf_logits=conf_logits if conf_labels is not None else None,
+                    conf_labels=conf_labels,
+                    answer_mask=batch.get("answer_mask").to(device) if isinstance(batch.get("answer_mask"), torch.Tensor) else None,
+                    rewrite_groups=(batch.get("batch_meta") or {}).get("rewrite_groups") if isinstance(batch.get("batch_meta"), dict) else None,
+                )
+            except Exception as _e:
+                try:
+                    print(json.dumps({"error": f"compute_losses_failed: {type(_e).__name__}: {_e}", "step": int(step)}))
+                except Exception:
+                    pass
+                _skip_iter2 = True
+                _skip_update2 = True
             # Verbose progress logging (optional)
             try:
                 if bool(cfg.get('verbose_progress', False)):
@@ -2069,7 +2089,12 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
                     _agg_sums.clear(); _agg_cnt = 0
             except Exception:
                 pass
-            _debug("losses_done", total=float(out_losses.get("total", 0.0).item()) if hasattr(out_losses.get("total", None), 'item') else None)
+            try:
+                _tot2 = out_losses.get("total") if isinstance(out_losses, dict) else None
+                _val2 = float(_tot2.item()) if hasattr(_tot2, 'item') else (float(_tot2) if isinstance(_tot2, (int, float)) else None)
+            except Exception:
+                _val2 = None
+            _debug("losses_done", total=_val2)
             # Step debug log for budget lambda and per-layer diagnostics
             try:
                 diag = {}
@@ -2178,13 +2203,15 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
                         print(json.dumps({"warn": "total loss has no grad; skipping backward", "step": int(step)}))
                     except Exception:
                         pass
+                    _skip_update2 = True
         except Exception as _e:
                 try:
                     print(json.dumps({"error": f"backward_failed: {type(_e).__name__}: {_e}", "step": int(step)}))
                 except Exception:
                     pass
-        opt.step()
-        _debug("opt_step_done", step=int(step))
+        if not _skip_update2:
+            opt.step()
+            _debug("opt_step_done", step=int(step))
 
         # Periodic checkpoint saving
         try:

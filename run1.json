@@ -51,13 +51,13 @@
   "adapt_mode": "ln_only",
   "adapt_last_k_layers": 2,
   "adapt_layer_indices": [],
-  "adapt_apply_to_all": true,
+  "adapt_apply_to_all": false,
   "lm_adaptation_enabled": true,
   "lm_adaptation": {
     "enabled": true,
     "mode": "ln_only",
     "last_k_layers": 2,
-    "apply_to_all_layers": true,
+    "apply_to_all_layers": false,
     "layer_indices": []
   }
 }
