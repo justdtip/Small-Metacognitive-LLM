@@ -275,13 +275,14 @@ class RunConfigForm(Static):
             "adapt_apply_to_all": bool(self.apply_all_layers),
             "lm_adaptation_enabled": bool(self.lm_adapt),
         })
-        # Keep nested block for backward compatibility with runner internals
+        # Keep nested block for backward compatibility with runner internals —
+        # rebuild from top-level keys to ensure perfect sync
         cfg["lm_adaptation"] = {
-            "enabled": bool(self.lm_adapt),
-            "mode": (self.adapt_mode or "ln_only"),
-            "last_k_layers": int(self.adapt_layers),
-            "apply_to_all_layers": bool(self.apply_all_layers),
-            "layer_indices": [int(x) for x in self.adapt_layers_list.split(',') if x.strip().isdigit()],
+            "enabled": cfg.get("lm_adaptation_enabled", False),
+            "mode": cfg.get("adapt_mode", "ln_only"),
+            "last_k_layers": cfg.get("adapt_last_k_layers", 2),
+            "apply_to_all_layers": cfg.get("adapt_apply_to_all", False),
+            "layer_indices": cfg.get("adapt_layer_indices", []),
         }
         # Defensive normalization of numeric fields
         try:
@@ -321,7 +322,7 @@ class RunConfigForm(Static):
                     from train.runner import run_from_config as _run
                     try:
                         _run(path, steps=int(steps))
-                    except FileNotFoundError as e:
+                    except (FileNotFoundError, ValueError) as e:
                         q.put_nowait(json.dumps({"error": f"{type(e).__name__}: {e}", "trace": []}))
                         return
                 except Exception as _e:

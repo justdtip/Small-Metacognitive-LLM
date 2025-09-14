@@ -1,6 +1,6 @@
 {
   "model": {
-    "base": "model/Tina"
+    "base": "model/Base"
   },
   "trainer": {
     "mode": "supervised",
@@ -48,14 +48,14 @@
   "agg": "attn",
   "var_reg": 0.001,
   "dump_per_layer": true,
-  "adapt_mode": "lora",
+  "adapt_mode": "ln_only",
   "adapt_last_k_layers": 2,
   "adapt_layer_indices": [],
   "adapt_apply_to_all": true,
   "lm_adaptation_enabled": true,
   "lm_adaptation": {
     "enabled": true,
-    "mode": "lora",
+    "mode": "ln_only",
     "last_k_layers": 2,
     "apply_to_all_layers": true,
     "layer_indices": []

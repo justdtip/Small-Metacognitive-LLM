@@ -3,7 +3,10 @@ from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 import contextvars
 from contextvars import ContextVar
-import torch
+try:
+    import torch
+except Exception:  # pragma: no cover
+    torch = None  # type: ignore
 import torch.nn as nn
 
 @dataclass
@@ -292,11 +295,11 @@ class IntrospectionScaffold(nn.Module):
             for m in getattr(self, 'adapters', []):
                 a = getattr(m, "_last_gate_activity", None)
                 c = getattr(m, "_last_gate_coverage", None)
+                # Safely convert tensors to floats if torch is available
                 try:
-                    import torch as _t
-                    if _t.is_tensor(a):
+                    if (torch is not None) and hasattr(torch, 'is_tensor') and torch.is_tensor(a):
                         a = float(a.detach().cpu().item())
-                    if _t.is_tensor(c):
+                    if (torch is not None) and hasattr(torch, 'is_tensor') and torch.is_tensor(c):
                         c = float(c.detach().cpu().item())
                 except Exception:
                     pass

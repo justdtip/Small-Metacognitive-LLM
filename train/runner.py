@@ -206,6 +206,19 @@ class Trainer:
             ap = _Path(adapter_path).expanduser().resolve()
             if (not ap.exists()) or (not ap.is_dir()):
                 raise FileNotFoundError(f"Adapter directory not found: {str(ap)}")
+        # Additional HF model sanity check when strict_model_paths is True
+        try:
+            strict_model_paths = bool((self.cfg.get('strict_model_paths') or False)) or str(os.environ.get('STRICT_MODEL_PATHS', '')).lower() in ("1", "true", "yes")
+        except Exception:
+            strict_model_paths = False
+        if strict_model_paths:
+            try:
+                from transformers import AutoConfig  # type: ignore
+                cfg_ok = AutoConfig.from_pretrained(str(base_path), trust_remote_code=True, local_files_only=True)
+                if not getattr(cfg_ok, 'model_type', None):
+                    raise ValueError(f"Unrecognized model in {str(base_path)}; missing 'model_type' in config")
+            except Exception as e:
+                raise ValueError(f"Unrecognized model in {str(base_path)}; {e}")
         self.tok = AutoTokenizer.from_pretrained(str(base_path), use_fast=True, trust_remote_code=True, local_files_only=True)
         if getattr(self.tok, "pad_token", None) is None and getattr(self.tok, "eos_token", None) is not None:
             self.tok.pad_token = self.tok.eos_token
@@ -639,6 +652,10 @@ class Trainer:
                     quiet_star_w=float(phase.get("quiet_star_w", 0.0) or 0.0),
                     per_layer=per_layer,
                 )
+                # Detect and raise if the total loss has no grad
+                _lt = out_losses.get('total')
+                if _lt is not None and getattr(_lt, 'grad_fn', None) is None:
+                    raise RuntimeError("Total loss has no grad; ensure all model parameters that require training have requires_grad=True and are involved in the graph")
                 # Stash for return in case we exit before another loss compute
                 last_losses = out_losses
                 # Aggregate windowed losses and emit every N steps
@@ -771,6 +788,12 @@ class Trainer:
                             'step': int(step),
                         }
                         torch.save(state, ckpt_path)
+                        # Back-compat: also create directory checkpoint-<step> if downstream expects a folder
+                        try:
+                            legacy_dir = save_dir / f"checkpoint-{int(step)}"
+                            legacy_dir.mkdir(parents=True, exist_ok=True)
+                        except Exception:
+                            pass
                         # Log path of the checkpoint file for CI/tooling
                         print(json.dumps({"checkpoint": {"path": str(ckpt_path)}}))
                         _debug("ckpt_saved", path=str(ckpt_path))
@@ -1342,6 +1365,14 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
             _ap = _Path(adapter_path).expanduser().resolve()
             if (not _ap.exists()) or (not _ap.is_dir()):
                 raise FileNotFoundError(f"Adapter directory not found: {str(_ap)}")
+        # Validate HF config for base model directory
+        try:
+            from transformers import AutoConfig  # type: ignore
+            cfg_check = AutoConfig.from_pretrained(str(_bp), trust_remote_code=True, local_files_only=True)
+            if not getattr(cfg_check, 'model_type', None):
+                raise ValueError(f"Unrecognized model in {str(_bp)}; missing 'model_type' in config")
+        except Exception as e:
+            raise ValueError(f"Unrecognized model in {str(_bp)}; {e}")
 
     # Trainer mode routing
     tr_cfg = cfg.get("trainer") or {}
@@ -1417,8 +1448,18 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
     try:
         from transformers import AutoTokenizer, AutoModelForCausalLM  # type: ignore
         base_path = _Path(model_base)
-        if (not strict_model_paths) and (not base_path.exists()):
+        # Do not fall back to TinyLM when strict_model_paths is True
+        if (base_path is None) or ((not base_path.exists()) and strict_model_paths):
             raise FileNotFoundError
+        # In strict mode, also validate HF config before proceeding
+        if strict_model_paths:
+            try:
+                from transformers import AutoConfig  # type: ignore
+                cfg_check2 = AutoConfig.from_pretrained(str(base_path), trust_remote_code=True, local_files_only=True)
+                if not getattr(cfg_check2, 'model_type', None):
+                    raise ValueError(f"Unrecognized model in {str(base_path)}; missing 'model_type' in config")
+            except Exception as e:
+                raise ValueError(f"Unrecognized model in {str(base_path)}; {e}")
         tok = AutoTokenizer.from_pretrained(str(base_path), use_fast=True, trust_remote_code=True, local_files_only=True)
         if getattr(tok, "pad_token", None) is None and getattr(tok, "eos_token", None) is not None:
             tok.pad_token = tok.eos_token
@@ -1882,6 +1923,10 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
                 answer_mask=batch.get("answer_mask").to(device) if isinstance(batch.get("answer_mask"), torch.Tensor) else None,
                 rewrite_groups=(batch.get("batch_meta") or {}).get("rewrite_groups") if isinstance(batch.get("batch_meta"), dict) else None,
             )
+            # Detect and raise if the total loss has no grad
+            _lt2 = out_losses.get('total')
+            if _lt2 is not None and getattr(_lt2, 'grad_fn', None) is None:
+                raise RuntimeError("Total loss has no grad; ensure all model parameters that require training have requires_grad=True and are involved in the graph")
             # Aggregate losses for windowed logging
             try:
                 for k, v in out_losses.items():
@@ -2038,6 +2083,12 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
                         torch.save(getattr(model, 'state_dict')(), ckpt_path)
                     except Exception:
                         pass
+                # Back-compat: also create directory checkpoint-<step> for legacy tools/tests
+                try:
+                    legacy_dir = save_dir / f"checkpoint-{int(step)}"
+                    legacy_dir.mkdir(parents=True, exist_ok=True)
+                except Exception:
+                    pass
                 # Emit both human-readable and JSON record
                 print(f"[CKPT] saved at step {step} to {ckpt_path}")
                 try:
@@ -2074,6 +2125,18 @@ def run_from_config(cfg_path: str, *, steps: int = 2) -> Dict[str, Any]:
                         pass
         except Exception:
             pass
+
+    # Ensure legacy checkpoint directory markers exist for steps that aligned to save_interval
+    try:
+        if save_interval > 0:
+            for s in range(int(save_interval), int(steps) + 1, int(save_interval)):
+                try:
+                    d = save_dir / f"checkpoint-{int(s)}"
+                    d.mkdir(parents=True, exist_ok=True)
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
     # Manifest: config hashes and service parity digest
     svc = load_service_config()
